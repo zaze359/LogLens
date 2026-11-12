@@ -182,6 +182,7 @@ struct QuickFilter {
     levels: Vec<String>,
     tags: Vec<String>,
     pids: Vec<String>,
+    packages: Vec<String>,
     search: String,
     search_regex: Option<Regex>,
     case_sensitive: bool,
@@ -210,6 +211,7 @@ impl QuickFilter {
             levels: f.levels.iter().map(|s| s.to_uppercase()).collect(),
             tags: f.tags.clone(),
             pids: f.pids.clone(),
+            packages: f.packages.clone(),
             search: f.search.clone(),
             search_regex,
             case_sensitive: f.case_sensitive,
@@ -223,6 +225,7 @@ impl QuickFilter {
         !self.levels.is_empty()
             || !self.tags.is_empty()
             || !self.pids.is_empty()
+            || !self.packages.is_empty()
             || !self.search.is_empty()
             || !self.excludes.is_empty()
             || !self.time_from.is_empty()
@@ -237,6 +240,9 @@ impl QuickFilter {
             return false;
         }
         if !self.pids.is_empty() && !self.pids.iter().any(|p| p == &e.pid.to_string()) {
+            return false;
+        }
+        if !self.packages.is_empty() && !self.packages.iter().any(|p| p == &e.package) {
             return false;
         }
         if !self.time_from.is_empty()
@@ -376,6 +382,34 @@ mod tests {
         let compiled = CompiledFilter::compile(&f).unwrap();
         let hits = compute_matches(&entries, &compiled);
         assert_eq!(hits, vec![1]);
+    }
+
+    #[test]
+    fn quick_package_filter_matches_any_selected_app() {
+        let mut app = entry("D", "OkHttp", "GET /api/paper");
+        app.package = "com.hailiang.workcloud.student".to_string();
+        let mut other = entry("D", "OkHttp", "GET /api/home");
+        other.package = "com.tencent.mm".to_string();
+        let unnamed = entry("D", "logd", "audit");
+        let entries = vec![app, other, unnamed];
+
+        // Selecting several packages is an OR, matching the tag / pid behaviour.
+        let f = FilterSpec {
+            packages: vec![
+                "com.hailiang.workcloud.student".to_string(),
+                "com.tencent.mm".to_string(),
+            ],
+            ..Default::default()
+        };
+        let compiled = CompiledFilter::compile(&f).unwrap();
+        assert_eq!(compute_matches(&entries, &compiled), vec![0, 1]);
+
+        let single = FilterSpec {
+            packages: vec!["com.tencent.mm".to_string()],
+            ..Default::default()
+        };
+        let compiled = CompiledFilter::compile(&single).unwrap();
+        assert_eq!(compute_matches(&entries, &compiled), vec![1]);
     }
 
     #[test]

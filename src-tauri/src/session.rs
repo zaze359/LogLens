@@ -6,6 +6,7 @@
 
 use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult};
 use crate::rules::{compute_matches, CompiledFilter};
+use crate::stream::DeviceStream;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -26,6 +27,23 @@ impl LogSession {
             entries,
             cache: HashMap::new(),
         }
+    }
+
+    /// Append entries produced by a live capture. Indices are assigned here because only
+    /// the session knows the current offset; the match cache is invalidated because every
+    /// cached index list was computed against a shorter entry vector.
+    pub fn append_all(&mut self, pending: Vec<LogEntry>) -> u32 {
+        if pending.is_empty() {
+            return 0;
+        }
+        let base = self.entries.len() as u32;
+        self.entries.reserve(pending.len());
+        for (i, mut entry) in pending.into_iter().enumerate() {
+            entry.index = base + i as u32;
+            self.entries.push(entry);
+        }
+        self.cache.clear();
+        self.entries.len() as u32
     }
 
     pub fn matched_indices(&mut self, filter: &FilterSpec, compiled: &CompiledFilter) -> Vec<u32> {
@@ -111,6 +129,8 @@ impl LogSession {
 
 pub struct AppState {
     pub sessions: Mutex<HashMap<String, LogSession>>,
+    /// Live captures, keyed by the session they append to.
+    pub streams: Mutex<HashMap<String, DeviceStream>>,
     seq: AtomicU64,
 }
 
@@ -118,6 +138,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
         }
     }
@@ -126,5 +147,15 @@ impl Default for AppState {
 impl AppState {
     pub fn next_id(&self) -> String {
         format!("s{}", self.seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Kill every live capture. Called when the window is destroyed so `adb logcat`
+    /// children do not outlive the app.
+    pub fn stop_all_streams(&self) {
+        if let Ok(mut streams) = self.streams.lock() {
+            for (_, mut stream) in streams.drain() {
+                stream.stop();
+            }
+        }
     }
 }

@@ -20,6 +20,9 @@ pub struct LogEntry {
     pub tag: String,
     pub pid: u32,
     pub tid: u32,
+    /// Package reconstructed from the pid (`ps` snapshot + `am_proc_start` /
+    /// `Start proc` rows), or lifted out of an accessibility foreground event. Empty when
+    /// the pid is unknown or belongs to a non-application process.
     pub package: String,
     /// `AccessibilityEvent.className` extracted from foreground-app events such as
     /// `onTopAppChanged: <packageName>/<className>`. The part before `/` is the
@@ -92,6 +95,8 @@ pub struct FilterSpec {
     pub levels: Vec<String>,
     pub tags: Vec<String>,
     pub pids: Vec<String>,
+    /// Application packages (or the package part of a sub-process). Any of them matches.
+    pub packages: Vec<String>,
     pub search: String,
     pub is_regex: bool,
     pub case_sensitive: bool,
@@ -128,7 +133,54 @@ pub struct FileInfo {
     pub tags: Vec<String>,
     pub pids: Vec<String>,
     pub packages: Vec<String>,
+    /// Where the entries came from: `file` (imported log file) or `stream` (live device stream).
+    pub source: String,
+    /// Device serial for the `stream` source, empty for files.
+    pub device: String,
+    /// True while a live `adb logcat` stream is still appending to this session.
+    pub streaming: bool,
 }
+
+/// Options for attaching a live `adb logcat` stream to a connected device.
+///
+/// There is deliberately only one capture mode: a live stream that keeps appending
+/// until the user stops it. A one-shot dump looks identical in the UI and then silently
+/// freezes, which reads as "the app stopped updating" — and `adb logcat` already replays
+/// the existing buffer on start, so a live stream also covers "look at what already
+/// happened".
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeviceCaptureOptions {
+    pub serial: String,
+    /// `main` / `system` / `crash` / `events` / `all`. Empty = adb's default buffers.
+    pub buffers: Vec<String>,
+    /// Run `adb logcat -c` first, so the stream starts from a clean buffer. Default off:
+    /// wiping the device buffer destroys evidence and cannot be undone.
+    pub clear_before: bool,
+}
+
+/// Health of a live capture, polled by the UI while `streaming` is true.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StreamStatus {
+    pub session_id: String,
+    pub running: bool,
+    /// Entries already parsed into the session (including the ones appended by this poll).
+    pub entry_count: u32,
+    pub total_lines: u32,
+    pub unparsed_lines: u32,
+    /// Non-empty when the stream ended abnormally (`adb` error, device unplugged, ...).
+    pub error: String,
+    /// True when this poll appended entries, in which case the facet lists below are fresh.
+    /// The UI keeps its previous lists while this is false instead of clearing the filters.
+    pub facets_updated: bool,
+    pub levels: Vec<String>,
+    pub tags: Vec<String>,
+    pub pids: Vec<String>,
+    pub packages: Vec<String>,
+}
+
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]

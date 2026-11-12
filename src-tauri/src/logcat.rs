@@ -1,7 +1,8 @@
 //! Android Logcat parser.
 //!
 //! Supported `adb logcat -v` formats:
-//!   threadtime (with/without year, with/without package, with/without uid)
+//!   threadtime (`PID TID L Tag: msg` — what a real device prints — plus the older
+//!   `PID-TID/package L/Tag:` and uid variants, with/without year),
 //!   time, brief, tag, process, long
 //!
 //! Design decisions:
@@ -10,13 +11,16 @@
 //!   previous entry so a filter hit keeps its stack trace context.
 //! - `--------- beginning of ...` becomes a synthetic `S/logcat` entry instead of
 //!   polluting the previous message.
+//! - `-v threadtime` carries no package column, so the package is reconstructed from the
+//!   pid — see [`ProcessIndex`].
 
 use crate::model::LogEntry;
 use regex::{Captures, Regex};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::OnceLock;
 
 #[derive(Debug, Default)]
 pub struct ParseResult {
@@ -25,6 +29,9 @@ pub struct ParseResult {
     pub total_lines: u32,
     /// Standalone lines that could not be parsed into a known format.
     pub unparsed_lines: u32,
+    /// pid → package, learned while parsing. Lives here (not in `LogcatParser`) so the
+    /// parser itself stays immutable and shareable across concurrent sessions.
+    pub processes: ProcessIndex,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,6 +74,231 @@ fn to_u32(caps: &Captures, name: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/* ------------------------------------------------------------------ pid → package ---- */
+
+fn re_am_proc_start() -> &'static Regex {
+    // events: `am_proc_start: [userId, pid, uid, processName, type, component]`
+    //   11-12 17:57:17.386 19484 19519 I am_proc_start: [0,13800,10174,com.foo,next-top-activity,{...}]
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\[\s*\d+\s*,\s*(?P<pid>\d+)\s*,\s*\d+\s*,\s*(?P<name>[A-Za-z0-9_.]+(?::[A-Za-z0-9_.]+)?)")
+            .expect("valid am_proc_start pattern")
+    })
+}
+
+fn re_am_proc_end() -> &'static Regex {
+    // events: `am_proc_died: [userId, pid, processName, ...]`
+    //         `am_kill:      [userId, pid, processName, oomAdj, reason]`
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\[\s*\d+\s*,\s*(?P<pid>\d+)\s*,\s*(?P<name>[A-Za-z0-9_.]+(?::[A-Za-z0-9_.]+)?)")
+            .expect("valid am_proc_died pattern")
+    })
+}
+
+fn re_start_proc() -> &'static Regex {
+    // ActivityManager: `Start proc 13800:com.foo/u0a174 for next-top-activity {...}`
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"Start proc\s+(?P<pid>\d+):(?P<name>[A-Za-z0-9_.]+(?::[A-Za-z0-9_.]+)?)")
+            .expect("valid Start proc pattern")
+    })
+}
+
+fn re_killing() -> &'static Regex {
+    // ActivityManager: `Killing 13122:com.foo/u0a174 (adj 200): stop com.foo`
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"Killing\s+(?P<pid>\d+):(?P<name>[A-Za-z0-9_.]+)").expect("valid Killing pattern")
+    })
+}
+
+fn re_process_died() -> &'static Regex {
+    // ActivityManager: `Process com.foo (pid 1234) has died`
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"Process\s+(?P<name>[A-Za-z0-9_.]+(?::[A-Za-z0-9_.]+)?)\s*\(pid\s+(?P<pid>\d+)\)\s*has died")
+            .expect("valid has died pattern")
+    })
+}
+
+fn re_pid_pkg() -> &'static Regex {
+    // `<pid>:<package>/u0a174` — the shape ActivityManager / ProcessRecord dumps use
+    // wherever they mention an app process. Requiring the `u<user>a<appid>` tail keeps this
+    // from matching timestamps or random `12:34` text.
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?P<pid>\d{2,7}):(?P<name>[a-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+(?::[A-Za-z0-9_]+)?)/u\d+a\d+")
+            .expect("valid pid:package pattern")
+    })
+}
+
+/// `com.tencent.mm:push` → `com.tencent.mm`.
+///
+/// App sub-processes (push / remote / sandbox) are the same application, so filtering by a
+/// package must also catch them. The exact pid is still available through the pid filter.
+fn strip_subprocess(name: &str) -> String {
+    match name.find(':') {
+        Some(i) => name[..i].to_string(),
+        None => name.to_string(),
+    }
+}
+
+/// Whether a process name is an application package rather than a system process.
+///
+/// `adbd`, `logd`, `init`, `system_server` and vendor HAL services
+/// (`vendor.lenovo.hardware.battery@1.0-service`) do run app code, but they have no
+/// package. Keeping them out of `LogEntry.package` keeps the package filter about
+/// applications; those logs stay reachable through tag / pid.
+fn is_app_package(name: &str) -> bool {
+    name.contains('.')
+        && !name.starts_with("vendor.")
+        && !name.starts_with("android.hardware")
+        && !name.contains('@')
+}
+
+/// Split one `ps` row into `(pid, process name)`.
+///
+/// Handles both shapes seen in the wild:
+/// - `ps -A -o PID,NAME` → `<pid> <name>` (what the app asks for: one name column, no spaces)
+/// - classic `ps` → `<user> <pid> <ppid> ... <name>` (name is the last column)
+///
+/// Header rows fall through both branches because their second column is not a number.
+fn parse_ps_row(line: &str) -> Option<(u32, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let first = tokens.next()?;
+
+    if let Ok(pid) = first.parse::<u32>() {
+        let name = trimmed[first.len()..].trim();
+        return clean_process_name(name).map(|name| (pid, name));
+    }
+
+    // Classic `ps`: the user column comes first, so the pid is the first numeric column.
+    let mut rest = trimmed.split_whitespace();
+    rest.next()?;
+    let pid = rest.next()?.parse::<u32>().ok()?;
+    let name = trimmed.split_whitespace().last()?;
+    clean_process_name(name).map(|name| (pid, name))
+}
+
+fn clean_process_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    // `[kworker/0:1]` and friends are kernel threads, not applications.
+    if name.is_empty() || name.starts_with('[') {
+        return None;
+    }
+    Some(strip_subprocess(name))
+}
+
+/// pid → application package, reconstructed from the log stream itself.
+///
+/// `adb logcat -v threadtime` prints no package column, but the pid is always there and
+/// three cheap sources identify its owner:
+///
+/// 1. **`ps` snapshots** (`adb shell ps -A -o PID,NAME`) taken when a capture starts and
+///    refreshed while it runs. The process name of an app process *is* its package.
+/// 2. **`events` buffer rows** — `am_proc_start: [user, pid, uid, package, ...]` and
+///    `am_kill: [user, pid, package, ...]`. These stay in the ring buffer after the process
+///    is gone, which is exactly the crash case where a live process listing cannot help.
+/// 3. **`ActivityManager` text lines** — `Start proc 13800:com.foo/u0a174 for ...`,
+///    `Killing 13122:com.foo/u0a174 (...)`, `Process com.foo (pid 1234) has died`.
+///
+/// Death rows remove the mapping so a recycled pid does not inherit the dead app's name.
+#[derive(Debug, Default)]
+pub struct ProcessIndex {
+    by_pid: HashMap<u32, String>,
+}
+
+impl ProcessIndex {
+    /// Adopt a `ps` snapshot. Returns how many rows were stored.
+    pub fn merge_snapshot(&mut self, text: &str) -> usize {
+        let mut adopted = 0;
+        for line in text.lines() {
+            if let Some((pid, name)) = parse_ps_row(line) {
+                if pid > 0 {
+                    self.by_pid.insert(pid, name);
+                    adopted += 1;
+                }
+            }
+        }
+        adopted
+    }
+
+    /// Learn from one parsed entry, if it happens to name an app process.
+    pub fn observe(&mut self, entry: &LogEntry) {
+        let message = entry.message.as_str();
+        match entry.tag.as_str() {
+            "am_proc_start" => {
+                if let Some(caps) = re_am_proc_start().captures(message) {
+                    self.remember(&caps);
+                }
+                return;
+            }
+            "am_proc_died" | "am_kill" | "am_anr" | "am_crash" => {
+                if let Some(caps) = re_am_proc_end().captures(message) {
+                    self.forget(&caps);
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // Order matters: a `Killing 13122:com.foo/u0a174` row also matches the generic
+        // `pid:package/uid` shape, so deaths have to be handled before learning.
+        if let Some(caps) = re_killing().captures(message) {
+            self.forget(&caps);
+            return;
+        }
+        if let Some(caps) = re_process_died().captures(message) {
+            self.forget(&caps);
+            return;
+        }
+        if let Some(caps) = re_start_proc().captures(message) {
+            self.remember(&caps);
+            return;
+        }
+        if let Some(caps) = re_pid_pkg().captures(message) {
+            self.remember(&caps);
+        }
+    }
+
+    /// Fill `entry.package` when the line itself carried no package.
+    ///
+    /// A package spelled out in the line always wins: `1234-5678/com.foo` is authoritative,
+    /// and an accessibility foreground event (`onTopAppChanged: com.zui.launcher/...`)
+    /// describes the app on screen, not the process that printed the line.
+    pub fn fill(&self, entry: &mut LogEntry) {
+        if !entry.package.is_empty() || entry.pid == 0 {
+            return;
+        }
+        if let Some(name) = self.by_pid.get(&entry.pid) {
+            if is_app_package(name) {
+                entry.package = name.clone();
+            }
+        }
+    }
+
+    fn remember(&mut self, caps: &Captures<'_>) {
+        let pid = to_u32(caps, "pid");
+        let name = caps.name("name").map(|m| m.as_str()).unwrap_or("");
+        if pid == 0 || name.is_empty() {
+            return;
+        }
+        self.by_pid.insert(pid, strip_subprocess(name));
+    }
+
+    fn forget(&mut self, caps: &Captures<'_>) {
+        let pid = to_u32(caps, "pid");
+        if pid > 0 {
+            self.by_pid.remove(&pid);
+        }
+    }
+}
+
 /// Normalise a time value to `HH:MM:SS.mmm` so string comparison works as a range filter.
 /// Accepts `10:23`, `10:23:45`, `10:23:45.12`, `11-12 10:23:45,123`.
 pub fn normalize_time_value(raw: &str) -> String {
@@ -96,6 +328,23 @@ impl LogcatParser {
         let level = r"[VDIWEFASvdiwefas]";
 
         let mut formats = Vec::new();
+        // `-v threadtime` on a real device has NO package column and NO slash:
+        //   11-12 17:28:02.013  1080  1161 D PowerGuruService: message
+        // These two must be tried before the slash variants: a message that itself contains
+        // something like `E/http: 500` would otherwise be re-parsed as an entry whose tag is
+        // `http`, silently moving the real tag into `middle`.
+        formats.push(Format {
+            re: compile(&format!(
+                r"^(?P<date>\d{{4}}-\d{{2}}-\d{{2}}[ T])(?P<time>{time})\s+(?P<pid>\d{{1,7}})\s+(?P<tid>\d{{1,7}})\s+(?P<level>{level})\s+(?P<tag>[^:\s][^:]*?)\s*:\s?(?P<msg>.*)$"
+            ))?,
+            kind: FormatKind::Dated,
+        });
+        formats.push(Format {
+            re: compile(&format!(
+                r"^(?P<date>\d{{2}}-\d{{2}})\s+(?P<time>{time})\s+(?P<pid>\d{{1,7}})\s+(?P<tid>\d{{1,7}})\s+(?P<level>{level})\s+(?P<tag>[^:\s][^:]*?)\s*:\s?(?P<msg>.*)$"
+            ))?,
+            kind: FormatKind::Dated,
+        });
         // 2026-11-12 10:23:45.123  1234-5678/com.example D/Tag: message
         formats.push(Format {
             re: compile(&format!(
@@ -208,7 +457,15 @@ impl LogcatParser {
         let time_key = normalize_time_value(&time);
 
         let middle = caps.name("middle").map(|m| m.as_str()).unwrap_or("");
-        let (mut pid, tid, mut package) = self.parse_middle(middle);
+        let (mut pid, mut tid, mut package) = self.parse_middle(middle);
+        // Patterns that spell out pid/tid (plain threadtime, `-v process`) win over the
+        // heuristic extraction from `middle`.
+        if caps.name("pid").is_some() {
+            pid = to_u32(caps, "pid");
+        }
+        if caps.name("tid").is_some() {
+            tid = to_u32(caps, "tid");
+        }
         if format.kind == FormatKind::Process {
             pid = to_u32(caps, "pid");
         }
@@ -311,7 +568,12 @@ impl LogcatParser {
             return;
         }
 
-        if let Some(entry) = self.parse_line(line) {
+        if let Some(mut entry) = self.parse_line(line) {
+            // Learn first, then fill: an `am_proc_start` row announces a process that will
+            // print its own logs from the next line on, so the entry itself usually gains
+            // nothing while everything after it does.
+            result.processes.observe(&entry);
+            result.processes.fill(&mut entry);
             result.entries.push(entry);
             return;
         }
@@ -340,10 +602,9 @@ impl LogcatParser {
         });
     }
 
-    /// Line-iterator variant of the parser. Only the unit tests use it today; the app
-    /// reads files through `parse_file` so it can handle invalid UTF-8 byte by byte.
-    /// Keep it test-only until another log source (e.g. a pasted buffer or adb stream)
-    /// needs a line-based entry point.
+    /// Line-iterator variant of the parser, used by unit tests. Live captures go through
+    /// [`IncrementalParser`], which keeps the trailing entry back; files use `parse_file`
+    /// so invalid UTF-8 can be handled byte by byte.
     #[cfg(test)]
     pub fn parse_lines<I, S>(&self, lines: I) -> ParseResult
     where
@@ -402,6 +663,64 @@ fn append_continuation(result: &mut ParseResult, line: &str) {
 fn finish(result: &mut ParseResult) {
     for (i, entry) in result.entries.iter_mut().enumerate() {
         entry.index = i as u32;
+    }
+}
+
+/// Incremental parser for streaming sources (`adb logcat`).
+///
+/// Continuation lines (stack frames, `Caused by:`, long JSON payloads) arrive *after* the
+/// line that opened the entry, so the trailing entry is never final. Everything before it
+/// is, which is what [`take_ready`](Self::take_ready) hands to the session. Without this
+/// hold-back a live capture would split a stack trace away from its error line.
+pub struct IncrementalParser {
+    parser: LogcatParser,
+    result: ParseResult,
+}
+
+impl IncrementalParser {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self {
+            parser: LogcatParser::new()?,
+            result: ParseResult::default(),
+        })
+    }
+
+    pub fn push_line(&mut self, line: &str) {
+        self.parser.consume_line(&mut self.result, line);
+    }
+
+    /// Adopt a `ps` snapshot, so entries parsed from now on can resolve their package.
+    /// Returns how many pid → process rows were stored.
+    pub fn merge_process_snapshot(&mut self, text: &str) -> usize {
+        self.result.processes.merge_snapshot(text)
+    }
+
+    pub fn total_lines(&self) -> u32 {
+        self.result.total_lines
+    }
+
+    pub fn unparsed_lines(&self) -> u32 {
+        self.result.unparsed_lines
+    }
+
+    /// Entries that can no longer change: all but the trailing one.
+    pub fn take_ready(&mut self) -> Vec<LogEntry> {
+        if self.result.entries.len() <= 1 {
+            return Vec::new();
+        }
+        let tail = self.result.entries.pop();
+        let ready = std::mem::take(&mut self.result.entries);
+        if let Some(tail) = tail {
+            self.result.entries.push(tail);
+        }
+        ready
+    }
+
+    /// Close the stream and return the trailing entry together with the line counters.
+    /// `index` is assigned by the caller, which knows the session offset.
+    pub fn finish(mut self) -> (Vec<LogEntry>, u32, u32) {
+        let entries = std::mem::take(&mut self.result.entries);
+        (entries, self.result.total_lines, self.result.unparsed_lines)
     }
 }
 
@@ -556,9 +875,169 @@ mod tests {
     }
 
     #[test]
+    fn parses_plain_threadtime_without_package_column() {
+        // What `adb logcat -v threadtime` actually prints on a device: no `/`, no package.
+        let e = parse(&[
+            "11-12 17:28:02.013  1080  1161 D PowerGuruService: Already added to Heartbeat Alarms",
+            "11-12 17:28:02.014  1080  1161 D PowerGuruService: alarm info: packageName = com.hljzjx.edu.student.launch",
+        ])
+        .entries;
+        assert_eq!(e[0].level, "D");
+        assert_eq!(e[0].tag, "PowerGuruService");
+        assert_eq!(e[0].pid, 1080);
+        assert_eq!(e[0].tid, 1161);
+        assert_eq!(e[0].timestamp, "11-12 17:28:02.013");
+        assert_eq!(e[0].time_key, "17:28:02.013");
+        assert!(e[0].message.starts_with("Already added"));
+        // The colon inside the message must not be mistaken for the tag separator.
+        assert_eq!(e[1].tag, "PowerGuruService");
+        assert!(e[1].message.contains("packageName = com.hljzjx"));
+    }
+
+    #[test]
+    fn plain_threadtime_wins_over_a_slash_looking_message() {
+        // Without the plain pattern being tried first, the lazy `middle` of the slash
+        // pattern would swallow the real tag and report `http` as the tag.
+        let r = parse(&["11-12 17:28:02.013  1080  1161 E OkHttp: GET /api failed E/http: 500"]);
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].tag, "OkHttp");
+        assert_eq!(r.entries[0].pid, 1080);
+        assert!(r.entries[0].message.contains("E/http: 500"));
+    }
+
+    #[test]
     fn normalises_time_bounds() {
         assert_eq!(normalize_time_value("10:23:45.12"), "10:23:45.120");
         assert_eq!(normalize_time_value("10:23"), "10:23:00.000");
         assert_eq!(normalize_time_value("11-12 10:23:45,123"), "10:23:45.123");
+    }
+
+    #[test]
+    fn incremental_parser_holds_back_the_trailing_entry() {
+        let mut parser = IncrementalParser::new().unwrap();
+        parser.push_line("11-12 10:25:00.001  1234-5678/com.foo E/AndroidRuntime: FATAL EXCEPTION: main");
+        // The trailing entry may still receive stack frames, so nothing is ready yet.
+        assert!(parser.take_ready().is_empty());
+
+        parser.push_line("    at com.foo.MainActivity.onCreate(MainActivity.kt:42)");
+        // Still the same entry — the continuation must land on it, not on the caller.
+        assert!(parser.take_ready().is_empty());
+
+        parser.push_line("11-12 10:25:00.500  1234-5678/com.foo I/OkHttp: next event");
+        let ready = parser.take_ready();
+        assert_eq!(ready.len(), 1, "only the finished entry is released");
+        assert_eq!(ready[0].continuation, 1, "stack frame stays with its error line");
+        assert!(ready[0].message.contains("MainActivity.kt:42"));
+
+        let (tail, total, unparsed) = parser.finish();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].message, "next event");
+        assert_eq!(total, 3);
+        assert_eq!(unparsed, 0);
+    }
+
+    /* ---------------------------------------------------------- pid → package ---- */
+
+    /// `adb shell ps -A -o PID,NAME` on a real device, trimmed to the interesting rows.
+    const PS_SNAPSHOT: &str = "\
+  PID NAME
+    1 init
+   12 [kworker/0:1]
+  520 statsd
+  815 vendor.lenovo.hardware.battery@1.0-service
+ 3924 com.android.remoteprovisioner
+ 5000 com.tencent.mm:push
+ 6000 com.hailiang.workcloud.student
+";
+
+    #[test]
+    fn ps_snapshot_maps_app_pids_and_skips_kernel_threads() {
+        let mut index = ProcessIndex::default();
+        let adopted = index.merge_snapshot(PS_SNAPSHOT);
+        // 6 data rows: the header, `init` and the bracketed kernel thread contribute
+        // nothing; every other row is stored (filtering happens when a name is used).
+        assert_eq!(adopted, 6, "header / kernel thread must not be adopted");
+        assert_eq!(index.by_pid.get(&12), None, "kernel threads are not processes to name");
+
+        let mut entry = LogEntry { pid: 6000, ..Default::default() };
+        index.fill(&mut entry);
+        assert_eq!(entry.package, "com.hailiang.workcloud.student");
+
+        // A sub-process is the same application.
+        let mut push = LogEntry { pid: 5000, ..Default::default() };
+        index.fill(&mut push);
+        assert_eq!(push.package, "com.tencent.mm", "`:push` collapses to its package");
+
+        // System processes and vendor HAL services have no package, so they stay unnamed
+        // instead of polluting the package filter.
+        for pid in [1u32, 520, 815] {
+            let mut system = LogEntry { pid, ..Default::default() };
+            index.fill(&mut system);
+            assert!(system.package.is_empty(), "pid {pid} must not become a package");
+        }
+    }
+
+    #[test]
+    fn am_proc_start_names_every_following_line() {
+        // Real events-buffer rows: `[userId, pid, uid, processName, type, component]`.
+        let r = parse(&[
+            "11-12 17:57:17.386 19484 19519 I am_proc_start: [0,13800,10174,com.hailiang.workcloud.student,next-top-activity,{com.hailiang.workcloud.student/com.hailiang.workcloud.student.MainActivity}]",
+            "11-12 17:57:18.001 13800 13800 D OkHttp: GET /api/paper",
+            "11-12 17:57:19.002 13800 13999 D OkHttp: response 200",
+        ]);
+        // The announcement itself is written by system_server, so it has no package...
+        assert_eq!(r.entries[0].package, "");
+        // ...but every line from the announced pid resolves.
+        assert_eq!(r.entries[1].package, "com.hailiang.workcloud.student");
+        assert_eq!(r.entries[2].package, "com.hailiang.workcloud.student");
+    }
+
+    #[test]
+    fn activity_manager_text_rows_name_processes_and_forget_dead_ones() {
+        let r = parse(&[
+            "11-12 17:57:17.386 19484 19519 I ActivityManager: Start proc 13800:com.hailiang.workcloud.student/u0a174 for next-top-activity {com.hailiang.workcloud.student/com.hailiang.workcloud.student.MainActivity}",
+            "11-12 17:57:18.000 13800 13800 D OkHttp: first life",
+            // Killed, then a *new* app reuses the same pid.
+            "11-12 17:58:00.000 19484 19518 I ActivityManager: Killing 13800:com.hailiang.workcloud.student/u0a174 (adj 200): stop com.hailiang.workcloud.student due to installPackageLI",
+            "11-12 17:58:01.000 19484 19519 I ActivityManager: Start proc 13800:com.other.app/u0a200 for broadcast {com.other.app/.BootReceiver}",
+            "11-12 17:58:02.000 13800 13800 D OkHttp: second life",
+        ]);
+        assert_eq!(r.entries[1].package, "com.hailiang.workcloud.student");
+        assert_eq!(
+            r.entries[4].package, "com.other.app",
+            "a recycled pid must not inherit the dead app's name"
+        );
+    }
+
+    #[test]
+    fn a_package_spelled_out_in_the_line_wins_over_the_index() {
+        let mut index = ProcessIndex::default();
+        index.merge_snapshot(" 2108 com.android.systemui\n");
+
+        // Slash format: the package is authoritative, the index must not overwrite it.
+        let mut entry = LogEntry {
+            pid: 2108,
+            package: "com.zui.launcher".into(),
+            ..Default::default()
+        };
+        index.fill(&mut entry);
+        assert_eq!(entry.package, "com.zui.launcher");
+
+        // Same for an accessibility foreground event, whose package names the app on
+        // screen rather than the process that printed the line.
+        let r = parse(&["11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.zui.launcher/com.zui.quickstep.RecentsActivity"]);
+        assert_eq!(r.entries[0].package, "com.zui.launcher");
+        assert_eq!(r.entries[0].component, "com.zui.quickstep.RecentsActivity");
+    }
+
+    #[test]
+    fn file_sessions_learn_the_mapping_too() {
+        // No `ps` available for a file, so everything comes from the log itself.
+        let r = parse(&[
+            "11-12 10:00:00.000 19484 19519 I am_proc_start: [0,7001,10174,com.example.app,service,{com.example.app/.SyncService}]",
+            "11-12 10:00:01.000 7001 7001 E AndroidRuntime: FATAL EXCEPTION: main",
+        ]);
+        let (_, _, _, packages) = collect_facets(&r.entries);
+        assert!(packages.contains(&"com.example.app".to_string()), "facets: {packages:?}");
     }
 }

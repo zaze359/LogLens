@@ -1,12 +1,17 @@
 //! Tauri IPC commands. All file IO happens here in Rust, so no filesystem plugin scope
 //! has to be configured for arbitrary user-selected log files.
 
+use crate::adb;
 use crate::builtin;
 use crate::config_store::{self, RulesView};
 use crate::logcat::{self, LogcatParser};
-use crate::model::{FileInfo, FilterSpec, QueryResult, Rule, RuleCategory};
+use crate::model::{
+    DeviceCaptureOptions, FileInfo, FilterSpec, LogEntry, QueryResult, Rule, RuleCategory,
+    StreamStatus,
+};
 use crate::rules::CompiledFilter;
 use crate::session::{AppState, LogSession};
+use crate::stream::DeviceStream;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -16,6 +21,77 @@ use tauri::{AppHandle, State};
 
 const MAX_OPEN_SESSIONS: usize = 4;
 
+/// Unique-ish suffix for freshly generated rule / category ids.
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// Everything that identifies a session's origin, separate from the parsed content.
+struct SessionSeed {
+    path: String,
+    file_name: String,
+    size_bytes: u64,
+    /// `file` | `stream`
+    source: &'static str,
+    device: String,
+    streaming: bool,
+}
+
+fn register_session(
+    state: &State<'_, AppState>,
+    entries: Vec<LogEntry>,
+    total_lines: u32,
+    unparsed_lines: u32,
+    seed: SessionSeed,
+) -> Result<FileInfo, String> {
+    let (levels, tags, pids, packages) = logcat::collect_facets(&entries);
+    let info = FileInfo {
+        session_id: state.next_id(),
+        path: seed.path,
+        file_name: seed.file_name,
+        size_bytes: seed.size_bytes,
+        total_lines,
+        entry_count: entries.len() as u32,
+        unparsed_lines,
+        levels,
+        tags,
+        pids,
+        packages,
+        source: seed.source.to_string(),
+        device: seed.device,
+        streaming: seed.streaming,
+    };
+
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    if sessions.len() >= MAX_OPEN_SESSIONS {
+        // `HashMap` iteration order is arbitrary, so "the oldest" has to be derived from the
+        // id itself — ids come from a monotonic counter (`s0`, `s1`, ...). The UI caps tabs
+        // at the same number, so this is a safety net for leaked sessions (e.g. a webview
+        // reload that orphaned them), not a routine path.
+        let oldest = sessions
+            .keys()
+            .min_by_key(|id| id.trim_start_matches('s').parse::<u64>().unwrap_or(u64::MAX))
+            .cloned();
+        if let Some(oldest) = oldest {
+            sessions.remove(&oldest);
+            // An evicted session must not leave its `adb logcat` running.
+            if let Ok(mut streams) = state.streams.lock() {
+                if let Some(mut stream) = streams.remove(&oldest) {
+                    stream.stop();
+                }
+            }
+        }
+    }
+    sessions.insert(info.session_id.clone(), LogSession::new(entries));
+    Ok(info)
+}
+
 #[tauri::command]
 pub fn open_log_file(path: String, state: State<'_, AppState>) -> Result<FileInfo, String> {
     let file_path = Path::new(&path);
@@ -24,38 +100,223 @@ pub fn open_log_file(path: String, state: State<'_, AppState>) -> Result<FileInf
         return Err("所选路径不是文件".to_string());
     }
     let parsed = LogcatParser::parse_file(file_path)?;
-    let (levels, tags, pids, packages) = logcat::collect_facets(&parsed.entries);
+    register_session(
+        &state,
+        parsed.entries,
+        parsed.total_lines,
+        parsed.unparsed_lines,
+        SessionSeed {
+            path: path.clone(),
+            file_name: file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone()),
+            size_bytes: meta.len(),
+            source: "file",
+            device: String::new(),
+            streaming: false,
+        },
+    )
+}
 
-    let session_id = state.next_id();
-    let info = FileInfo {
-        session_id: session_id.clone(),
-        path: path.clone(),
-        file_name: file_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.clone()),
-        size_bytes: meta.len(),
-        total_lines: parsed.total_lines,
-        entry_count: parsed.entries.len() as u32,
-        unparsed_lines: parsed.unparsed_lines,
-        levels,
-        tags,
-        pids,
-        packages,
+/// `adb version` + resolved path. Never fails: a missing adb is reported in the payload so
+/// the UI can show install guidance instead of a red error banner.
+#[tauri::command]
+pub fn adb_status() -> adb::AdbStatus {
+    adb::status()
+}
+
+#[tauri::command]
+pub fn list_adb_devices() -> Result<Vec<adb::AdbDevice>, String> {
+    adb::devices()
+}
+
+fn require_serial(options: &DeviceCaptureOptions) -> Result<String, String> {
+    let serial = options.serial.trim().to_string();
+    if serial.is_empty() {
+        return Err("请先选择一台已授权的设备".to_string());
+    }
+    Ok(serial)
+}
+
+/// Best-effort model name for the captured session, so the top bar shows something more
+/// useful than a serial number.
+fn device_label(serial: &str) -> String {
+    adb::devices()
+        .ok()
+        .and_then(|devices| {
+            devices
+                .into_iter()
+                .find(|d| d.serial == serial)
+                .map(|d| d.label())
+        })
+        .unwrap_or_else(|| serial.to_string())
+}
+
+/// Refuse to start a capture against a device that is visibly not ready (unauthorized,
+/// offline, missing udev rules). If the device list itself cannot be read we stay out of
+/// the way and let `adb logcat` report the real problem.
+fn require_ready(serial: &str) -> Result<(), String> {
+    let Ok(devices) = adb::devices() else {
+        return Ok(());
+    };
+    match devices.into_iter().find(|d| d.serial == serial) {
+        Some(device) if device.is_ready() => Ok(()),
+        Some(device) => Err(format!(
+            "设备 {} 当前状态是「{}」。请先在手机上确认 USB 调试授权，或重新插拔数据线。",
+            device.serial, device.state
+        )),
+        None => Err(format!(
+            "设备 {serial} 已不在连接列表中，请刷新设备列表后重试"
+        )),
+    }
+}
+
+/// Refuse a second live capture of the same device.
+///
+/// Two `adb logcat` children would fight over one ring buffer (each replays and then
+/// follows the same lines, doubling the load), and `clear_before` on the second one would
+/// wipe the lines the first capture is in the middle of collecting. The UI checks this too
+/// so it can point at the existing tab, but the backend check is the authoritative one.
+fn ensure_device_not_streaming(state: &State<'_, AppState>, serial: &str) -> Result<(), String> {
+    let streams = state
+        .streams
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    if streams.values().any(|stream| stream.serial() == serial) {
+        return Err(format!(
+            "设备 {serial} 已经在一个会话里实时抓取了。同一台设备同时只能有一个实时抓取，请先在那个标签点「停止实时抓取」再重新开始。"
+        ));
+    }
+    Ok(())
+}
+
+/// Start following new device log lines until [`stop_device_stream`] is called.
+#[tauri::command]
+pub fn start_device_stream(
+    options: DeviceCaptureOptions,
+    state: State<'_, AppState>,
+) -> Result<FileInfo, String> {
+    let serial = require_serial(&options)?;
+    let adb_path = adb::locate().ok_or_else(|| adb::NOT_FOUND.to_string())?;
+    require_ready(&serial)?;
+    // Must run before `clear_before`: clearing the buffer of a device that another session
+    // is capturing would destroy that session's data.
+    ensure_device_not_streaming(&state, &serial)?;
+    if options.clear_before {
+        adb::clear_logcat(&adb_path, &serial, &options.buffers)?;
+    }
+
+    let label = device_label(&serial);
+    let info = register_session(
+        &state,
+        Vec::new(),
+        0,
+        0,
+        SessionSeed {
+            path: format!("adb://{serial}/logcat"),
+            file_name: format!("{label} · 实时 logcat"),
+            size_bytes: 0,
+            source: "stream",
+            device: serial.clone(),
+            streaming: true,
+        },
+    )?;
+
+    let args = adb::logcat_args(&serial, &options.buffers);
+    let mut stream = match DeviceStream::spawn(&adb_path, args, &serial, info.session_id.clone()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            remove_session(&state, &info.session_id);
+            return Err(e);
+        }
+    };
+    // `adb` fails fast for an unauthorized / offline device. Catching that here gives a
+    // real error instead of a session that silently stays empty forever.
+    if let Some(error) = stream.startup_error() {
+        stream.stop();
+        remove_session(&state, &info.session_id);
+        return Err(error);
+    }
+
+    // Re-check under the lock that actually publishes the stream: the earlier check ran
+    // before `spawn`, which takes long enough for a concurrent call to slip through.
+    {
+        let mut streams = state
+            .streams
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        if streams.values().any(|existing| existing.serial() == serial) {
+            drop(streams);
+            stream.stop();
+            remove_session(&state, &info.session_id);
+            return Err(format!(
+                "设备 {serial} 已经在一个会话里实时抓取了。同一台设备同时只能有一个实时抓取。"
+            ));
+        }
+        streams.insert(info.session_id.clone(), stream);
+    }
+    Ok(info)
+}
+
+#[tauri::command]
+pub fn poll_device_stream(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<StreamStatus, String> {
+    // Two short-lived locks, never nested: the reader thread only ever touches its own
+    // buffer, so holding both while parsing would buy nothing and risk a lock cycle.
+    let (pending, mut status) = {
+        let mut streams = state
+            .streams
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        let stream = streams
+            .get_mut(&session_id)
+            .ok_or_else(|| "实时抓取已停止".to_string())?;
+        stream.drain()
     };
 
     let mut sessions = state
         .sessions
         .lock()
         .map_err(|e| format!("状态锁异常: {e}"))?;
-    if sessions.len() >= MAX_OPEN_SESSIONS {
-        if let Some(oldest) = sessions.keys().next().cloned() {
-            sessions.remove(&oldest);
-        }
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| "日志会话已失效，请重新抓取".to_string())?;
+    let before = session.entries.len();
+    status.entry_count = session.append_all(pending);
+    // New tags / packages must show up in the filter dropdowns while the capture runs.
+    // Recomputing only on growth keeps idle polls cheap.
+    if session.entries.len() > before {
+        let (levels, tags, pids, packages) = logcat::collect_facets(&session.entries);
+        status.facets_updated = true;
+        status.levels = levels;
+        status.tags = tags;
+        status.pids = pids;
+        status.packages = packages;
     }
-    sessions.insert(session_id, LogSession::new(parsed.entries));
-    Ok(info)
+    Ok(status)
 }
+
+#[tauri::command]
+pub fn stop_device_stream(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut streams = state
+        .streams
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    if let Some(mut stream) = streams.remove(&session_id) {
+        stream.stop();
+    }
+    Ok(())
+}
+
+fn remove_session(state: &State<'_, AppState>, session_id: &str) {
+    if let Ok(mut sessions) = state.sessions.lock() {
+        sessions.remove(session_id);
+    }
+}
+
 
 #[tauri::command]
 pub fn query_logs(
@@ -77,6 +338,11 @@ pub fn query_logs(
 
 #[tauri::command]
 pub fn close_session(session_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    if let Ok(mut streams) = state.streams.lock() {
+        if let Some(mut stream) = streams.remove(&session_id) {
+            stream.stop();
+        }
+    }
     let mut sessions = state
         .sessions
         .lock()
@@ -175,10 +441,7 @@ pub fn save_rule_category(app: AppHandle, category: RuleCategory) -> Result<Rule
     if category.name.trim().is_empty() {
         return Err("分组名称不能为空".to_string());
     }
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    let millis = now_millis();
     let mut category = category;
     category.builtin = false;
     if category.id.trim().is_empty() {
@@ -240,10 +503,7 @@ pub fn import_rules_from_file(app: AppHandle, path: String) -> Result<RulesView,
 pub fn import_rules_json(app: AppHandle, json: String) -> Result<RulesView, String> {
     // Accepts the v2 document, the v1 document, and the bare rule array from older exports.
     let incoming = config_store::parse_document(&json)?;
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    let millis = now_millis();
     let builtin_ids = config_store::builtin_category_ids();
     let mut file = config_store::load(&app)?;
 
