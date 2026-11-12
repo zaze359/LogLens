@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+.vite/
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Local runtime data
+*.log
+setup-report.md
+*-report.md
+
+# AI 工具的脚手架副本：由 .trellis 规范生成，换机器重新生成即可，不进版本库
+.claude/
+.codebuddy/
+.cursor/
+.trae/
+.dsh/
+.agents/
+
+# WorkBuddy 本地会话记忆（个人笔记，不属于项目产物）
+.workbuddy/
