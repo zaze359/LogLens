@@ -180,7 +180,23 @@ pub struct StreamStatus {
     pub packages: Vec<String>,
 }
 
-
+/// Progress of a file import, emitted as `log-open-progress` while `open_log_file` runs.
+///
+/// Carries `requestId` because the frontend may have several imports in flight and must only
+/// apply the events belonging to the one it is displaying. `totalBytes` is 0 until the file
+/// has been stat'ed, which the UI treats as "size unknown, show an indeterminate bar".
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OpenProgress {
+    pub request_id: String,
+    pub bytes_read: u64,
+    pub total_bytes: u64,
+    /// Entries parsed so far (not lines): one entry may cover a whole stack trace.
+    pub entries: u32,
+    /// `parsing` while reading the file, `indexing` while building facet lists afterwards.
+    /// The second phase is what keeps the bar from sitting at 100% with no explanation.
+    pub phase: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]

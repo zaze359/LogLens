@@ -620,12 +620,39 @@ impl LogcatParser {
     }
 
     /// Stream a file line by line. Invalid UTF-8 is replaced rather than aborting the read.
+    ///
+    /// Test-only shortcut for [`parse_file_with_progress`](Self::parse_file_with_progress):
+    /// production imports always go through the progress-capable variant, and having both
+    /// would leave a second code path nobody exercises.
+    #[cfg(test)]
     pub fn parse_file(path: &Path) -> Result<ParseResult, String> {
+        match Self::parse_file_with_progress(path, |_, _| true)? {
+            ParseOutcome::Done(result) => Ok(result),
+            // Unreachable with the always-continue callback above, but mapping it to an
+            // error keeps the signature honest instead of `unreachable!()`-panicking.
+            ParseOutcome::Cancelled => Err("导入已取消".to_string()),
+        }
+    }
+
+    /// Same as [`parse_file`](Self::parse_file), but reports read progress and can be
+    /// aborted.
+    ///
+    /// `on_progress(bytes_read, lines_parsed)` fires every `PROGRESS_STRIDE` lines — frequent
+    /// enough to drive a smooth bar, rare enough that the callback (which crosses a thread
+    /// boundary through a Tauri event) never dominates the parse. Returning `false` stops
+    /// the read and yields [`ParseOutcome::Cancelled`]; nothing partial is returned, because a
+    /// half-parsed log is not something the UI should be able to display.
+    pub fn parse_file_with_progress(
+        path: &Path,
+        mut on_progress: impl FnMut(u64, u32) -> bool,
+    ) -> Result<ParseOutcome, String> {
         let file = File::open(path).map_err(|e| format!("无法打开文件 {}: {e}", path.display()))?;
         let mut reader = BufReader::with_capacity(128 * 1024, file);
         let parser = LogcatParser::new()?;
         let mut result = ParseResult::default();
         let mut buf: Vec<u8> = Vec::new();
+        let mut bytes_read: u64 = 0;
+        let mut since_report: u32 = 0;
 
         loop {
             buf.clear();
@@ -635,6 +662,7 @@ impl LogcatParser {
             if read == 0 {
                 break;
             }
+            bytes_read += read as u64;
             while let Some(&last) = buf.last() {
                 if last == b'\n' || last == b'\r' {
                     buf.pop();
@@ -644,10 +672,30 @@ impl LogcatParser {
             }
             let line = String::from_utf8_lossy(&buf).into_owned();
             parser.consume_line(&mut result, &line);
+
+            since_report += 1;
+            if since_report >= PROGRESS_STRIDE {
+                since_report = 0;
+                if !on_progress(bytes_read, result.total_lines) {
+                    return Ok(ParseOutcome::Cancelled);
+                }
+            }
         }
+        // Final report so the bar can reach 100% even for files below one stride.
+        on_progress(bytes_read, result.total_lines);
         finish(&mut result);
-        Ok(result)
+        Ok(ParseOutcome::Done(result))
     }
+}
+
+/// Lines between two `parse_file_with_progress` callbacks. At ~2M lines/s this is a few
+/// milliseconds apart, which is already smoother than the 100ms emit throttle above it.
+const PROGRESS_STRIDE: u32 = 4096;
+
+/// A file parse that the caller may abort part-way through.
+pub enum ParseOutcome {
+    Done(ParseResult),
+    Cancelled,
 }
 
 fn append_continuation(result: &mut ParseResult, line: &str) {
@@ -1039,5 +1087,77 @@ mod tests {
         ]);
         let (_, _, _, packages) = collect_facets(&r.entries);
         assert!(packages.contains(&"com.example.app".to_string()), "facets: {packages:?}");
+    }
+
+    /// Builds a file big enough to cross `PROGRESS_STRIDE`, since a callback-driven progress
+    /// bar that never fires for real-sized logs would be useless.
+    fn write_synthetic_log(tag: &str, lines: usize) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!(
+            "loglens-progress-{}-{tag}.log",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).expect("应能创建临时文件");
+        for i in 0..lines {
+            writeln!(
+                file,
+                "11-12 10:00:{:02}.{:03}  1000  1000 D/Progress: line {}",
+                i % 60,
+                i % 1000,
+                i
+            )
+            .expect("应能写入临时文件");
+        }
+        path
+    }
+
+    #[test]
+    fn parse_reports_progress_and_finishes_at_the_file_size() {
+        let lines = (PROGRESS_STRIDE as usize) * 2 + 10;
+        let path = write_synthetic_log("forward", lines);
+        let total_bytes = std::fs::metadata(&path).expect("能读取元数据").len();
+
+        let mut reports: Vec<(u64, u32)> = Vec::new();
+        let outcome = LogcatParser::parse_file_with_progress(&path, |bytes, entries| {
+            reports.push((bytes, entries));
+            true
+        })
+        .expect("解析应成功");
+        let _ = std::fs::remove_file(&path);
+
+        let ParseOutcome::Done(parsed) = outcome else {
+            panic!("未取消的解析不应返回 Cancelled");
+        };
+        assert_eq!(parsed.entries.len(), lines);
+
+        // The stride callback plus the final one: with 2*stride+10 lines that is 3 reports.
+        assert!(reports.len() >= 3, "进度回调次数过少: {reports:?}");
+        assert!(
+            reports.windows(2).all(|w| w[0].0 <= w[1].0),
+            "已读字节必须单调递增: {reports:?}"
+        );
+        // The last report is what the bar uses to reach 100%; it must be the real file size.
+        assert_eq!(reports.last().map(|r| r.0), Some(total_bytes));
+        assert_eq!(
+            reports.last().map(|r| r.1),
+            Some(parsed.total_lines),
+            "最终行数应与解析结果一致"
+        );
+    }
+
+    #[test]
+    fn cancelling_stops_the_parse_and_returns_nothing() {
+        let path = write_synthetic_log("cancel", (PROGRESS_STRIDE as usize) * 3);
+        let mut calls = 0;
+        let outcome = LogcatParser::parse_file_with_progress(&path, |_, _| {
+            calls += 1;
+            // Cancel on the first report, i.e. before the file has been read through.
+            false
+        })
+        .expect("取消不是错误");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(calls, 1, "取消后应立即停止上报，不再继续读");
+        assert!(matches!(outcome, ParseOutcome::Cancelled));
     }
 }

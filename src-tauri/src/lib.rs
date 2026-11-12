@@ -17,6 +17,7 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_log_file,
+            commands::cancel_open_log,
             commands::adb_status,
             commands::list_adb_devices,
             commands::start_device_stream,

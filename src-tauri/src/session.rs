@@ -8,8 +8,8 @@ use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult};
 use crate::rules::{compute_matches, CompiledFilter};
 use crate::stream::DeviceStream;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const MAX_CACHED_QUERIES: usize = 12;
@@ -131,6 +131,10 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<String, LogSession>>,
     /// Live captures, keyed by the session they append to.
     pub streams: Mutex<HashMap<String, DeviceStream>>,
+    /// Abort flags for in-flight file imports, keyed by the frontend's request id. The flag
+    /// is shared with the parsing thread because a cancelled import cannot use the session
+    /// lock (it has no session yet).
+    pub import_cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     seq: AtomicU64,
 }
 
@@ -139,6 +143,7 @@ impl Default for AppState {
         Self {
             sessions: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            import_cancels: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
         }
     }
