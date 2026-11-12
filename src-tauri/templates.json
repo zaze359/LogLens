@@ -1,0 +1,196 @@
+{
+  "categories": [
+    {
+      "id": "cat-general",
+      "name": "通用速查",
+      "description": "与具体业务无关的全局过滤，适合任何应用的日志",
+      "color": "#38bdf8",
+      "builtin": true
+    },
+    {
+      "id": "cat-stability",
+      "name": "稳定性排查",
+      "description": "崩溃、ANR、卡顿与内存问题",
+      "color": "#f87171",
+      "builtin": true
+    },
+    {
+      "id": "cat-feature",
+      "name": "功能链路",
+      "description": "网络、页面生命周期与权限安全",
+      "color": "#a78bfa",
+      "builtin": true
+    },
+    {
+      "id": "cat-launcher",
+      "name": "Launcher",
+      "description": "桌面 / 前台应用事件相关规则；消息里的包名来自 AccessibilityEvent，是被观测应用",
+      "color": "#22d3ee",
+      "builtin": true
+    }
+  ],
+  "templates": [
+    {
+      "id": "builtin-errors",
+      "name": "错误与致命",
+      "description": "只保留 E / F / A 级别日志",
+      "color": "#f87171",
+      "builtin": true,
+      "categoryId": "cat-general",
+      "group": {
+        "logic": "OR",
+        "conditions": [
+          { "id": "e1", "field": "level", "op": "in", "value": "E,F,A" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-crash",
+      "name": "崩溃与异常堆栈",
+      "description": "FATAL EXCEPTION / ANR / Caused by / tombstone / 进程死亡",
+      "color": "#fb7185",
+      "builtin": true,
+      "categoryId": "cat-stability",
+      "group": {
+        "logic": "OR",
+        "conditions": [
+          { "id": "c1", "field": "message", "op": "regex", "value": "(?i)(FATAL EXCEPTION|ANR |Caused by:|java[.]lang[.]|kotlin[.]|SIGSEGV|tombstone|has died|Force finishing|OutOfMemory)" },
+          { "id": "c2", "field": "tag", "op": "regex", "value": "(?i)^(AndroidRuntime|DEBUG|crash_dump|tombstoned|ActivityManager)$" },
+          { "id": "c3", "field": "level", "op": "regex", "value": "^[FA]$" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-anr-jank",
+      "name": "ANR 与卡顿",
+      "description": "ANR、掉帧、Choreographer、主线程阻塞",
+      "color": "#fbbf24",
+      "builtin": true,
+      "categoryId": "cat-stability",
+      "group": {
+        "logic": "OR",
+        "conditions": [
+          { "id": "a1", "field": "message", "op": "regex", "value": "(?i)(ANR|Skipped [0-9]+ frames|Choreographer|doFrame|jank|frozen|blocked|Slow delivery|slow operation)" },
+          { "id": "a2", "field": "tag", "op": "regex", "value": "(?i)^(ActivityManager|AnrManager|Choreographer|OpenGLRenderer)$" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-network",
+      "name": "网络请求",
+      "description": "URL、OkHttp / Retrofit、DNS、超时、HTTP 状态码",
+      "color": "#38bdf8",
+      "builtin": true,
+      "categoryId": "cat-feature",
+      "group": {
+        "logic": "OR",
+        "conditions": [
+          { "id": "n1", "field": "message", "op": "regex", "value": "(?i)(https?://|OkHttp|Retrofit|DNS|socket|ECONN|timeout|SSL|HTTP/[0-9]|[45][0-9]{2} |Connectivity)" },
+          { "id": "n2", "field": "tag", "op": "regex", "value": "(?i)(OkHttp|Network|Connectivity|Http|Retrofit|Netd)" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-lifecycle",
+      "name": "页面生命周期",
+      "description": "Activity / Fragment 创建、切换与销毁",
+      "color": "#a78bfa",
+      "builtin": true,
+      "categoryId": "cat-feature",
+      "group": {
+        "logic": "OR",
+        "conditions": [
+          { "id": "l1", "field": "message", "op": "regex", "value": "(?i)(onCreate|onStart|onResume|onPause|onStop|onDestroy|Displayed .*Activity|START u0)" },
+          { "id": "l2", "field": "tag", "op": "regex", "value": "(?i)^(ActivityManager|ActivityThread|Lifecycle|WindowManager|ActivityTaskManager)$" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-performance",
+      "name": "性能与内存",
+      "description": "GC、堆、帧率、内存与 OOM",
+      "color": "#34d399",
+      "builtin": true,
+      "categoryId": "cat-stability",
+      "group": {
+        "logic": "OR",
+        "conditions": [
+          { "id": "p1", "field": "message", "op": "regex", "value": "(?i)(GC|Heap|Skipped [0-9]+ frames|fps|jank|memory|OutOfMemory|OOM|Slow)" },
+          { "id": "p2", "field": "tag", "op": "regex", "value": "(?i)^(art|dalvikvm|Choreographer|Graphics|Memtrack|ActivityManager)$" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-no-noise",
+      "name": "去掉系统噪音",
+      "description": "排除渲染、Surface、GC 守护线程等高频 tag",
+      "color": "#94a3b8",
+      "builtin": true,
+      "categoryId": "cat-general",
+      "group": {
+        "logic": "AND",
+        "conditions": [
+          { "id": "z1", "field": "tag", "op": "regex", "value": "(?i)^(Choreographer|OpenGLRenderer|SurfaceFlinger|InputDispatcher|gralloc|ReferenceQueueDaemon|HeapTaskDaemon|FinalizerDaemon|hwservicemanager|BufferQueueProducer)$", "negate": true }
+        ]
+      }
+    },
+    {
+      "id": "builtin-package",
+      "name": "指定应用包名",
+      "description": "把 com.example 改成你的包名后另存为自己的规则",
+      "color": "#22d3ee",
+      "builtin": true,
+      "categoryId": "cat-general",
+      "group": {
+        "logic": "AND",
+        "conditions": [
+          { "id": "k1", "field": "package", "op": "contains", "value": "com.example" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-security",
+      "name": "权限与安全",
+      "description": "权限拒绝、证书、Keystore、生物识别",
+      "color": "#f472b6",
+      "builtin": true,
+      "categoryId": "cat-feature",
+      "group": {
+        "logic": "OR",
+        "conditions": [
+          { "id": "s1", "field": "message", "op": "regex", "value": "(?i)(Permission denied|SecurityException|KeyStore|Keystore|biometric|signature|certificate|SSLHandshake|AppOps)" },
+          { "id": "s2", "field": "tag", "op": "regex", "value": "(?i)^(PermissionManager|KeyStore|Biometric|Security|AppOps)$" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-launcher-top-app",
+      "name": "前台应用 / 页面变更",
+      "description": "onTopAppChanged：<包名>/<组件类名> 来自 AccessibilityEvent.packageName / className，不限应用与页面类型",
+      "color": "#22d3ee",
+      "builtin": true,
+      "categoryId": "cat-launcher",
+      "group": {
+        "logic": "AND",
+        "conditions": [
+          { "id": "lt1", "field": "message", "op": "regex", "value": "(?i)onTopAppChanged" }
+        ]
+      }
+    },
+    {
+      "id": "builtin-launcher-widget",
+      "name": "弹窗 / 非 Activity 组件",
+      "description": "前台变更目标是 android.widget.*、Dialog、Popup 等非 Activity 组件（按组件类名筛）",
+      "color": "#fbbf24",
+      "builtin": true,
+      "categoryId": "cat-launcher",
+      "group": {
+        "logic": "AND",
+        "conditions": [
+          { "id": "lw1", "field": "message", "op": "regex", "value": "(?i)onTopAppChanged" },
+          { "id": "lw2", "field": "component", "op": "regex", "value": "(?i)(android[.]widget[.]|Dialog|Popup|Toast|Window)" }
+        ]
+      }
+    }
+  ]
+}
