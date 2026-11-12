@@ -9,6 +9,7 @@ const timeFrom = ref(store.filter.timeFrom)
 const timeTo = ref(store.filter.timeTo)
 const tagChoice = ref('')
 const pidChoice = ref('')
+const packageChoice = ref('')
 
 // Keep local inputs in sync when a filter is reset or a rule changes the spec.
 watch(() => store.filter.search, (v) => { if (v !== search.value) search.value = v })
@@ -33,6 +34,17 @@ function onTagChange(e: Event): void {
   tagChoice.value = ''
   if (!tag || store.filter.tags.includes(tag)) return
   updateFilter({ tags: [...store.filter.tags, tag] })
+}
+
+function onPackageChange(e: Event): void {
+  const pkg = (e.target as HTMLSelectElement).value
+  packageChoice.value = ''
+  if (!pkg || store.filter.packages.includes(pkg)) return
+  updateFilter({ packages: [...store.filter.packages, pkg] })
+}
+
+function removePackage(pkg: string): void {
+  updateFilter({ packages: store.filter.packages.filter((p) => p !== pkg) })
 }
 
 function onPidChange(e: Event): void {
@@ -79,6 +91,16 @@ function toggleOrder(): void {
         :title="LEVEL_LABELS[level]"
         @click="toggleLevel(level)"
       >{{ level }}</button>
+
+      <div class="divider-v" />
+      <span class="filter-label">包名</span>
+      <select class="select" style="width: 186px" :value="packageChoice" @change="onPackageChange">
+        <option value="">+ 添加包名</option>
+        <option v-for="pkg in store.fileInfo?.packages ?? []" :key="pkg" :value="pkg">{{ pkg }}</option>
+      </select>
+      <span v-for="pkg in store.filter.packages" :key="pkg" class="chip on" :title="pkg">
+        {{ pkg }} <button class="btn btn-ghost btn-sm x" style="height:16px;padding:0 3px" @click="removePackage(pkg)">×</button>
+      </span>
 
       <div class="divider-v" />
       <span class="filter-label">Tag</span>

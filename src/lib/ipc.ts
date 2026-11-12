@@ -1,11 +1,15 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
+  AdbDevice,
+  AdbStatus,
+  DeviceCaptureOptions,
   FileInfo,
   FilterSpec,
   QueryResult,
   Rule,
   RuleCategory,
-  RulesView
+  RulesView,
+  StreamStatus
 } from '../types'
 
 export function isTauri(): boolean {
@@ -19,6 +23,15 @@ function plain<T>(value: T): T {
 
 export const ipc = {
   openLogFile: (path: string) => invoke<FileInfo>('open_log_file', { path }),
+
+  adbStatus: () => invoke<AdbStatus>('adb_status'),
+  listAdbDevices: () => invoke<AdbDevice[]>('list_adb_devices'),
+  startDeviceStream: (options: DeviceCaptureOptions) =>
+    invoke<FileInfo>('start_device_stream', { options: plain(options) }),
+  pollDeviceStream: (sessionId: string) =>
+    invoke<StreamStatus>('poll_device_stream', { sessionId }),
+  stopDeviceStream: (sessionId: string) =>
+    invoke<void>('stop_device_stream', { sessionId }),
 
   queryLogs: (sessionId: string, filter: FilterSpec, offset: number, limit: number) =>
     invoke<QueryResult>('query_logs', {

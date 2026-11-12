@@ -3,6 +3,7 @@ import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialo
 import { errorMessage, ipc, isTauri } from '../lib/ipc'
 import { UNCATEGORIZED } from '../types'
 import type {
+  DeviceCaptureOptions,
   FileInfo,
   FilterSpec,
   LogEntry,
@@ -10,16 +11,63 @@ import type {
   Rule,
   RuleCategory,
   RuleGroup,
-  RulesView
+  RulesView,
+  StreamStatus
 } from '../types'
 
 export const PAGE_SIZE = 400
+
+/** How often a live capture is polled. Fast enough to feel live, cheap enough to ignore. */
+const STREAM_POLL_MS = 800
+
+/**
+ * Tabs are capped to the backend's `MAX_OPEN_SESSIONS` (4). Going past it would make Rust
+ * evict the oldest session behind the UI's back, leaving a tab whose every query fails.
+ */
+export const MAX_TABS = 4
+
+/** A running `adb logcat` capture, mirrored in the UI. */
+export interface DeviceStreamInfo {
+  sessionId: string
+  serial: string
+  label: string
+  running: boolean
+  error: string
+}
+
+/**
+ * One open log source. Each tab owns a backend session (same id) plus its own view state,
+ * so switching tabs never mixes two logs' filters, scroll positions or live captures.
+ *
+ * `entries` / `result` are snapshots taken when the tab is switched **away**; a background
+ * tab keeps receiving log lines in its backend session, not here — see `catchUp()`.
+ */
+export interface SessionTab {
+  id: string
+  /** Tab label: the file name, or `<device> · 实时 logcat`. */
+  title: string
+  /** `file` | `stream` */
+  source: string
+  info: FileInfo
+  filter: FilterSpec
+  result: QueryResult | null
+  entries: LogEntry[]
+  selected: LogEntry | null
+  activeRuleId: string
+  testCount: number | null
+  scrollTop: number
+  /** Non-null while this tab's `adb logcat` child is still attached. */
+  stream: DeviceStreamInfo | null
+  /** Guards the 800ms tick against stacking two background polls on one tab. */
+  polling: boolean
+}
 
 export function emptyFilter(): FilterSpec {
   return {
     levels: [],
     tags: [],
     pids: [],
+    packages: [],
     search: '',
     isRegex: false,
     caseSensitive: false,
@@ -34,17 +82,15 @@ export function emptyFilter(): FilterSpec {
 
 export interface AppState {
   tauriReady: boolean
+  /** Open tabs, in strip order. Empty means "no log open". */
+  tabs: SessionTab[]
+  /** Session id of the tab whose state the flat mirror fields below currently hold. */
+  activeId: string
+  // ---- mirror of the active tab, so every component can keep reading `store.xxx` ----
   fileInfo: FileInfo | null
   filter: FilterSpec
   result: QueryResult | null
   entries: LogEntry[]
-  templates: Rule[]
-  rules: Rule[]
-  categories: RuleCategory[]
-  ruleSearch: string
-  /** Category id -> collapsed. Ignored while a search is active. */
-  collapsed: Record<string, boolean>
-  rulesPath: string
   activeRuleId: string
   selected: LogEntry | null
   loading: boolean
@@ -52,27 +98,49 @@ export interface AppState {
   error: string
   notice: string
   testCount: number | null
+  /** Scroll offset of the active tab's log table. */
+  scrollTop: number
+  /** Non-null while the active tab is still receiving live lines. */
+  deviceStream: DeviceStreamInfo | null
+  // ---- global (shared by every tab) ----
+  templates: Rule[]
+  rules: Rule[]
+  categories: RuleCategory[]
+  ruleSearch: string
+  /** Category id -> collapsed. Ignored while a search is active. */
+  collapsed: Record<string, boolean>
+  rulesPath: string
+  /** Device picker dialog visibility. */
+  devicePanel: boolean
+  /** Last used capture options, so reopening the panel does not start from scratch. */
+  lastCapture: DeviceCaptureOptions | null
 }
 
 export const store = reactive<AppState>({
   tauriReady: false,
+  tabs: [],
+  activeId: '',
   fileInfo: null,
   filter: emptyFilter(),
   result: null,
   entries: [],
-  templates: [],
-  rules: [],
-  categories: [],
-  ruleSearch: '',
-  collapsed: {},
-  rulesPath: '',
   activeRuleId: '',
   selected: null,
   loading: false,
   loadingMore: false,
   error: '',
   notice: '',
-  testCount: null
+  testCount: null,
+  scrollTop: 0,
+  deviceStream: null,
+  templates: [],
+  rules: [],
+  categories: [],
+  ruleSearch: '',
+  collapsed: {},
+  rulesPath: '',
+  devicePanel: false,
+  lastCapture: null
 })
 
 function clone<T>(value: T): T {
@@ -111,29 +179,151 @@ export async function init(): Promise<void> {
   }
 }
 
+/* --------------------------------------------------------------- tabs ---- */
+
+export const activeTab = computed<SessionTab | null>(
+  () => store.tabs.find((tab) => tab.id === store.activeId) ?? null
+)
+
+/** Copy the live view state into the tab being left, so nothing is lost on a switch. */
+function snapshotActive(): void {
+  const tab = activeTab.value
+  if (!tab) return
+  // `filter` is deep-cloned: `updateFilter` mutates `store.filter` in place, and two tabs
+  // must never end up sharing one object.
+  tab.filter = clone(store.filter)
+  tab.result = store.result
+  tab.entries = store.entries
+  tab.selected = store.selected
+  tab.activeRuleId = store.activeRuleId
+  tab.testCount = store.testCount
+  tab.scrollTop = store.scrollTop
+  tab.stream = store.deviceStream
+}
+
+function clearView(): void {
+  store.activeId = ''
+  store.fileInfo = null
+  store.filter = emptyFilter()
+  store.result = null
+  store.entries = []
+  store.selected = null
+  store.activeRuleId = ''
+  store.testCount = null
+  store.scrollTop = 0
+  store.deviceStream = null
+  store.error = ''
+  store.loading = false
+  store.loadingMore = false
+}
+
+/** Make `id` the visible tab. Cheap: everything it needs was snapshotted on the way out. */
+export function activateTab(id: string): void {
+  if (id === store.activeId) return
+  const tab = store.tabs.find((candidate) => candidate.id === id)
+  if (!tab) return
+
+  snapshotActive()
+  // Responses still in flight belong to the tab being left; make them unlandable.
+  requestSeq++
+  paging = false
+
+  store.fileInfo = tab.info
+  store.filter = clone(tab.filter)
+  store.result = tab.result
+  store.entries = tab.entries
+  store.selected = tab.selected
+  store.activeRuleId = tab.activeRuleId
+  store.testCount = tab.testCount
+  store.scrollTop = tab.scrollTop
+  store.deviceStream = tab.stream
+  store.error = ''
+  store.loading = false
+  store.loadingMore = false
+  // Set last: `LogTable` watches it to restore the scroll offset.
+  store.activeId = id
+
+  syncTimers()
+  if (tab.stream) {
+    // A background tab was not rendering its deltas, so pull them now — otherwise the
+    // user comes back to a list that stops mid-burst.
+    void syncStream().then(catchUp)
+  }
+}
+
+export function closeTab(id: string): void {
+  const index = store.tabs.findIndex((tab) => tab.id === id)
+  if (index < 0) return
+  const wasActive = id === store.activeId
+
+  // Drop the tab first so the strip reacts instantly; the backend session (and that tab's
+  // `adb logcat` child) is released in the background.
+  store.tabs.splice(index, 1)
+  void ipc.closeSession(id).catch(() => {})
+
+  if (!wasActive) {
+    syncTimers()
+    return
+  }
+  const next = store.tabs[index] ?? store.tabs[index - 1] ?? null
+  if (next) {
+    // `activeId` still points at the closed tab, so `activateTab` restores instead of
+    // early-returning.
+    activateTab(next.id)
+  } else {
+    clearView()
+    syncTimers()
+  }
+}
+
+/** Open a session as a new tab and focus it. `stream` is set for live captures. */
+async function openTab(info: FileInfo, stream: DeviceStreamInfo | null): Promise<void> {
+  const tab: SessionTab = {
+    id: info.sessionId,
+    title: info.fileName,
+    source: info.source,
+    info,
+    filter: emptyFilter(),
+    result: null,
+    entries: [],
+    selected: null,
+    activeRuleId: '',
+    testCount: null,
+    scrollTop: 0,
+    stream,
+    polling: false
+  }
+  store.tabs.push(tab)
+  activateTab(tab.id)
+  store.loading = true
+  await refresh()
+  store.loading = false
+}
+
 export async function loadFile(path: string): Promise<void> {
   if (!store.tauriReady) {
     setNotice('请在 Tauri 客户端中打开日志文件')
     return
   }
-  store.loading = true
+  // Same file already open? Focus that tab — a second session would show identical data
+  // and burn one of the four slots.
+  const existing = store.tabs.find((tab) => tab.source === 'file' && tab.info.path === path)
+  if (existing) {
+    activateTab(existing.id)
+    setNotice(`该文件已在新标签中打开：${existing.title}`)
+    return
+  }
+  if (store.tabs.length >= MAX_TABS) {
+    setNotice(`最多同时打开 ${MAX_TABS} 个日志，先关掉一个标签再打开`)
+    return
+  }
   store.error = ''
   try {
-    if (store.fileInfo) {
-      await ipc.closeSession(store.fileInfo.sessionId).catch(() => {})
-    }
     const info = await ipc.openLogFile(path)
-    store.fileInfo = info
-    store.entries = []
-    store.selected = null
-    store.activeRuleId = ''
-    store.filter = emptyFilter()
-    await refresh()
-    setNotice(`已载入 ${info.fileName}：${info.totalLines} 行 / ${info.entryCount} 条`)
+    await openTab(info, null)
+    setNotice(`已在新标签中载入 ${info.fileName}：${info.totalLines} 行 / ${info.entryCount} 条`)
   } catch (e) {
     store.error = errorMessage(e)
-  } finally {
-    store.loading = false
   }
 }
 
@@ -152,7 +342,246 @@ export async function pickAndLoadFile(): Promise<void> {
   }
 }
 
+/** Opens the capture dialog. */
+export function openDevicePanel(): void {
+  if (!store.tauriReady) {
+    setNotice('请在 Tauri 客户端中连接设备')
+    return
+  }
+  store.devicePanel = true
+}
+
+export function closeDevicePanel(): void {
+  store.devicePanel = false
+}
+
+/** Follow new device lines until the user stops or adb exits. Opens in its own tab. */
+export async function startDeviceStream(options: DeviceCaptureOptions): Promise<boolean> {
+  if (!store.tauriReady) {
+    setNotice('请在 Tauri 客户端中连接设备')
+    return false
+  }
+  // One device, one live capture. Two `adb logcat` children read the same ring buffer, and
+  // "先清空缓冲区" on the second would wipe what the first is still collecting. Point at the
+  // tab that already owns it instead of just refusing.
+  const busy = store.tabs.find(
+    (tab) => tab.stream && tab.info.source === 'stream' && tab.info.device === options.serial
+  )
+  if (busy) {
+    activateTab(busy.id)
+    setNotice(`设备 ${options.serial} 已在标签「${busy.title}」中实时抓取，先在那里停止再重新开始`)
+    return false
+  }
+  if (store.tabs.length >= MAX_TABS) {
+    setNotice(`最多同时打开 ${MAX_TABS} 个日志，先关掉一个标签再开始抓取`)
+    return false
+  }
+  store.error = ''
+  try {
+    store.lastCapture = { ...options }
+    const info = await ipc.startDeviceStream(options)
+    const stream: DeviceStreamInfo = {
+      sessionId: info.sessionId,
+      serial: options.serial,
+      label: info.fileName,
+      running: true,
+      error: ''
+    }
+    await openTab(info, stream)
+    syncTimers()
+    // `adb logcat` replays the existing buffer first, so a non-empty start is normal and
+    // means "these lines already happened" — worth saying out loud once.
+    const replayed = info.entryCount > 0 ? `（含设备缓冲区已有的 ${info.entryCount} 条）` : ''
+    setNotice(`已在新标签开始实时抓取${replayed}，切到别的标签也会继续接收`)
+    return true
+  } catch (e) {
+    store.error = errorMessage(e)
+    return false
+  }
+}
+
+let streamTimer: ReturnType<typeof setInterval> | null = null
+
+/** The poller exists exactly while at least one tab is still receiving live lines. */
+function syncTimers(): void {
+  const needed = store.tabs.some((tab) => tab.stream)
+  if (needed && !streamTimer) {
+    streamTimer = setInterval(tickStreams, STREAM_POLL_MS)
+  } else if (!needed && streamTimer) {
+    clearInterval(streamTimer)
+    streamTimer = null
+  }
+}
+
+/** One tick covers every tab: the visible one repaints, the hidden ones only drain. */
+function tickStreams(): void {
+  for (const tab of [...store.tabs]) {
+    if (!tab.stream) continue
+    if (tab.id === store.activeId) void syncStream()
+    else void pollInBackground(tab)
+  }
+}
+
+/** Guards the "fetch the next page" offset against two concurrent callers (stream poll
+ *  tick + scroll-triggered `loadMore`) both asking for the same offset. Shared by all tabs:
+ *  switching tabs resets it, and a stale call only ever sees its own discarded response. */
+let paging = false
+
+/** Bumped whenever the visible session or filter changes, so slow responses cannot land on
+ *  a tab they no longer belong to. */
 let requestSeq = 0
+
+/** Append newly matched entries. New lines always land at the end, so ascending order can
+ *  keep the already-loaded page and just continue from `entries.length`. Descending order
+ *  puts them on top, where a cheap re-query of page 0 is the correct move. */
+async function appendNewMatches(): Promise<void> {
+  const info = store.fileInfo
+  if (!info || paging) return
+  if (store.filter.order === 'desc') {
+    await refresh()
+    return
+  }
+  paging = true
+  const loaded = store.entries.length
+  const seq = requestSeq
+  try {
+    const result = await ipc.queryLogs(info.sessionId, store.filter, loaded, PAGE_SIZE)
+    // A filter change (or another page load) landed while this query was in flight.
+    if (seq !== requestSeq || store.entries.length !== loaded) return
+    if (result.matched > loaded) {
+      store.entries = store.entries.concat(result.entries)
+    }
+    store.result = result
+  } finally {
+    paging = false
+  }
+}
+
+/** Rebuild a returning tab's list when lines arrived while it was hidden.
+ *
+ *  Bounded on purpose: a long absence should not turn one tab switch into dozens of
+ *  queries. Whatever is left over is still reachable by scrolling (`loadMore`). */
+async function catchUp(): Promise<void> {
+  for (let round = 0; round < 12; round++) {
+    const matched = store.result?.matched ?? 0
+    const loaded = store.entries.length
+    if (loaded >= matched) return
+    await appendNewMatches()
+    if (store.entries.length === loaded) return
+  }
+}
+
+/** Mirror the counters (and, when they changed, the filter facets) onto the file info. */
+function applyStreamStatus(info: FileInfo, status: StreamStatus): void {
+  info.totalLines = status.totalLines
+  info.entryCount = status.entryCount
+  info.unparsedLines = status.unparsedLines
+  if (status.facetsUpdated) {
+    info.levels = status.levels
+    info.tags = status.tags
+    info.pids = status.pids
+    info.packages = status.packages
+  }
+}
+
+/** Pull the visible tab's live deltas into the table. */
+async function syncStream(): Promise<void> {
+  const info = store.fileInfo
+  const device = store.deviceStream
+  if (!info || !device) return
+  const sessionId = info.sessionId
+  try {
+    const status: StreamStatus = await ipc.pollDeviceStream(sessionId)
+    // `info` and `device` belong to this tab, so writing them is safe even if the user
+    // switched away mid-call. The flat mirror fields are not — those get a guard.
+    applyStreamStatus(info, status)
+    if (store.fileInfo?.sessionId !== sessionId) return
+    await appendNewMatches()
+
+    if (!status.running) {
+      device.running = false
+      info.streaming = false
+      const tab = store.tabs.find((candidate) => candidate.id === sessionId)
+      if (tab) tab.stream = null
+      store.deviceStream = null
+      await ipc.stopDeviceStream(sessionId).catch(() => {})
+      syncTimers()
+      // Always name the tab: with several open, "抓取已结束" alone is ambiguous.
+      setNotice(
+        status.error
+          ? `${device.label}：${status.error}`
+          : `${device.label} 实时抓取已结束，共 ${status.entryCount} 条`
+      )
+    }
+  } catch (e) {
+    // The tab was closed, or the backend already cleaned the stream up. Both poll errors
+    // mean the capture is over, so make sure no stale stream record blocks the device.
+    const tab = store.tabs.find((candidate) => candidate.id === sessionId)
+    if (tab) tab.stream = null
+    void ipc.stopDeviceStream(sessionId).catch(() => {})
+    if (store.fileInfo?.sessionId === sessionId) {
+      store.deviceStream = null
+      store.error = errorMessage(e)
+    }
+    syncTimers()
+  }
+}
+
+/** Drain a hidden tab's stream so its backend buffer never grows unbounded, without
+ *  touching the visible table. `activateTab` catches the table up on the way back in. */
+async function pollInBackground(tab: SessionTab): Promise<void> {
+  if (tab.polling || !tab.stream) return
+  tab.polling = true
+  try {
+    const status = await ipc.pollDeviceStream(tab.id)
+    applyStreamStatus(tab.info, status)
+    if (!status.running) {
+      tab.stream = null
+      tab.info.streaming = false
+      // Drop the backend entry as well: a device with a stale stream record would refuse
+      // to start a new capture ("同一台设备同时只能有一个实时抓取") until the tab is closed.
+      void ipc.stopDeviceStream(tab.id).catch(() => {})
+      setNotice(
+        status.error ? `${tab.title}：${status.error}` : `${tab.title} 实时抓取已结束`
+      )
+      syncTimers()
+    }
+  } catch (e) {
+    tab.stream = null
+    tab.info.streaming = false
+    void ipc.stopDeviceStream(tab.id).catch(() => {})
+    setNotice(`${tab.title}：${errorMessage(e)}`)
+    syncTimers()
+  } finally {
+    tab.polling = false
+  }
+}
+
+/** User-initiated stop for the visible tab: drain what is left, then kill the adb child. */
+export async function stopDeviceStream(): Promise<void> {
+  const info = store.fileInfo
+  const tab = activeTab.value
+  if (!info) {
+    store.deviceStream = null
+    return
+  }
+  try {
+    const status = await ipc.pollDeviceStream(info.sessionId).catch(() => null)
+    if (status) {
+      applyStreamStatus(info, status)
+      await appendNewMatches()
+    }
+    await ipc.stopDeviceStream(info.sessionId)
+  } catch (e) {
+    store.error = errorMessage(e)
+  } finally {
+    info.streaming = false
+    store.deviceStream = null
+    if (tab) tab.stream = null
+    syncTimers()
+    setNotice('已停止实时抓取，已收到的日志仍可继续筛选与导出')
+  }
+}
 
 export async function refresh(): Promise<void> {
   if (!store.fileInfo) {
@@ -178,7 +607,7 @@ export async function refresh(): Promise<void> {
 }
 
 export async function loadMore(): Promise<void> {
-  if (!store.fileInfo || store.loadingMore || store.loading) return
+  if (!store.fileInfo || store.loadingMore || store.loading || paging) return
   const loaded = store.entries.length
   const matched = store.result?.matched ?? 0
   if (loaded >= matched) return

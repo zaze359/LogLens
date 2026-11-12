@@ -2,11 +2,13 @@
 import { onBeforeUnmount, onMounted } from 'vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import TopBar from './components/TopBar.vue'
+import SessionTabs from './components/SessionTabs.vue'
 import RuleSidebar from './components/RuleSidebar.vue'
 import FilterBar from './components/FilterBar.vue'
 import StatsPanel from './components/StatsPanel.vue'
 import LogTable from './components/LogTable.vue'
 import LogDetail from './components/LogDetail.vue'
+import DevicePanel from './components/DevicePanel.vue'
 import { init, loadFile, store } from './stores/session'
 
 let unlistenDrop: (() => void) | null = null
@@ -35,6 +37,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="app-shell">
     <TopBar />
+    <SessionTabs />
 
     <div v-if="store.error" class="banner">
       <span>{{ store.error }}</span>
@@ -42,7 +45,7 @@ onBeforeUnmount(() => {
       <button class="btn btn-ghost btn-sm" @click="store.error = ''">关闭</button>
     </div>
     <div v-else-if="!store.tauriReady" class="banner info">
-      浏览器预览模式：界面可查看，本地文件读写与规则持久化请在 Tauri 客户端中运行（npm run tauri dev）。
+      浏览器预览模式：界面可查看，本地文件读写、设备抓取与规则持久化请在 Tauri 客户端中运行（npm run tauri dev）。
     </div>
 
     <div class="workspace">
@@ -57,13 +60,18 @@ onBeforeUnmount(() => {
             <b class="stat-num">{{ store.result?.total ?? 0 }}</b></span>
           <span v-if="store.result">耗时 {{ store.result.elapsedMs }} ms</span>
           <span v-if="store.fileInfo">未识别行 {{ store.fileInfo.unparsedLines }}</span>
+          <span v-if="store.deviceStream" class="live-hint">
+            <span class="live-dot" />实时抓取中 · 新日志自动追加
+          </span>
           <span v-if="store.loadingMore" class="muted">加载更多中…</span>
           <div class="spacer" />
-          <span class="muted">点击行查看完整内容 · 支持拖入日志文件</span>
+          <span class="muted">点击行查看完整内容 · 支持拖入日志文件 · 可直连 Android 设备</span>
         </div>
       </div>
       <LogDetail v-if="store.selected" />
     </div>
+
+    <DevicePanel v-if="store.devicePanel" />
 
     <div v-if="store.notice" class="toast">{{ store.notice }}</div>
   </div>

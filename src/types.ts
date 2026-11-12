@@ -63,6 +63,8 @@ export interface FilterSpec {
   levels: string[]
   tags: string[]
   pids: string[]
+  /** 应用包名（子进程归并到所属包）。多选取并集。 */
+  packages: string[]
   search: string
   isRegex: boolean
   caseSensitive: boolean
@@ -87,6 +89,57 @@ export interface FileInfo {
   totalLines: number
   entryCount: number
   unparsedLines: number
+  levels: string[]
+  tags: string[]
+  pids: string[]
+  packages: string[]
+  /** `file`（导入日志文件）| `stream`（设备实时抓取） */
+  source: string
+  /** 设备序列号；文件来源为空 */
+  device: string
+  /** 实时抓取是否仍在追加 */
+  streaming: boolean
+}
+
+/** `adb version` 探测结果。未安装 adb 时 available 为 false 且 error 带安装指引。 */
+export interface AdbStatus {
+  available: boolean
+  path: string
+  version: string
+  error: string
+}
+
+export interface AdbDevice {
+  serial: string
+  /** `device`（可抓取）| `unauthorized` | `offline` | `no permissions` | ... */
+  state: string
+  model: string
+  product: string
+  device: string
+  transportId: string
+}
+
+/**
+ * 设备抓取参数。只有一种模式：持续跟随的实时流。
+ * `adb logcat` 启动时本身会先回放设备现有缓冲区，所以「已经发生的问题」也看得到。
+ */
+export interface DeviceCaptureOptions {
+  serial: string
+  /** main / system / crash / events / all；空数组用 adb 默认缓冲区 */
+  buffers: string[]
+  /** 先执行 `adb logcat -c` 清空设备缓冲区；默认 false，清空不可恢复 */
+  clearBefore: boolean
+}
+
+export interface StreamStatus {
+  sessionId: string
+  running: boolean
+  entryCount: number
+  totalLines: number
+  unparsedLines: number
+  error: string
+  /** 本次轮询有新条目时，下面的候选列表才是最新的 */
+  facetsUpdated: boolean
   levels: string[]
   tags: string[]
   pids: string[]
