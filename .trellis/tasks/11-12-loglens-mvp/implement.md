@@ -132,6 +132,27 @@
       own (unplugged device), only the active-tab path called `stop_device_stream`; the
       backend kept the dead entry and the device became permanently un-capturable. Both the
       background success and failure paths now release it.
+- [x] **Import progress (user: "增加一个加载进度的效果，而不是什么反应都没有，卡在那")**: the
+      freeze was structural — `open_log_file` was a *synchronous* Tauri command, and Tauri runs
+      those on the main thread, so a 300k-line parse stopped the webview from painting at all.
+      Now an `async` command that does the read on `spawn_blocking`, emitting
+      `log-open-progress` with `{ requestId, bytesRead, totalBytes, entries, phase }` throttled
+      to 100ms (`parse_file_with_progress` calls back every 4096 lines). Progress is
+      **byte-based** because the line count is only known at EOF. `collect_facets` (a second
+      full pass) moved onto the same thread and reports `phase: "indexing"`, so the bar does
+      not stall at 100%. Cancellation is a per-request `AtomicBool` in
+      `AppState.import_cancels`, checked each chunk; the partial result is dropped and no
+      session is registered. UI: `ImportOverlay.vue` is a **bottom-right floating card** (a
+      modal would just be a prettier freeze), hidden for the first 250ms so small files do not
+      flash it, with read/total size, percent, entry count and a cancel button. The store
+      guards one import at a time and re-checks `MAX_TABS` after the (slow) import in case a
+      device capture took the last slot meanwhile.
+- [x] **Two bugs caught by measuring instead of assuming**: (a) `since_report` was never reset,
+      so after the first 4096 lines the progress callback fired on *every* line — 296k
+      callbacks for a 300k-line file; (b) the parse looked like 24k lines/s until I noticed
+      `cargo test` builds in the **dev** profile. Release: 29 MB / 300k lines in 1.03s
+      (~293k lines/s); dev profile ~12.6s. Both numbers are now in the README, because the
+      dev/release gap would otherwise read as "the import is slow".
 
 ## Validation commands
 
@@ -167,6 +188,9 @@ npm run tauri build               # run on macOS and Windows separately
 | `cd src-tauri && cargo test --lib -- --ignored` (after multi-tab + one live capture per device, device HA20ZD1H) | PASS — 6 passed in 2.44s: adb discovery, real `-v threadtime` parse, live stream drain, probe line within 1s, poll/append/query round trip, pid → package resolution |
 | `cd src-tauri && cargo build` + `npm run build` (final) | PASS — zero warnings; `index-Hmk2aMtm.js` 140.74 kB, `index-9k-XKqoh.css` 15.61 kB |
 | `bash scripts/setup.sh --test` (final) | PASS — 38 passed / 6 ignored, "全部验证通过" |
+| `cd src-tauri && cargo test --lib` (after import progress) | PASS — 40 passed, 6 ignored, 0 failed; new `parse_reports_progress_and_finishes_at_the_file_size` (byte reports monotonic, last report == file size) and `cancelling_stops_the_parse_and_returns_nothing` |
+| `cd src-tauri && cargo build` + `npm run build` (after import progress) | PASS — zero warnings; `index-DB7hAwB8.js` 150.71 kB, `index-hDeLLhey.css` 17.22 kB |
+| Release parse benchmark (29 MB / 300 420 lines) | PASS — 1.03s, ~293k lines/s, 74 progress callbacks (dev profile: 12.6s) |
 
 Environment: macOS arm64, Node v24.14.0, npm 11.9.0, rustc/cargo 1.99.1, rustup 1.29.3,
 adb 1.0.41 (platform-tools 35.0.2), one USB device attached.

@@ -56,6 +56,12 @@ Zhao Zhen asked for a client that analyses various collected logs:
 - Custom rules + categories persisted locally, importable/exportable as JSON.
 - Filtered results exportable as plain text.
 - Usable with large single files (virtual scrolling + backend paging + match cache).
+- **Import feedback**: reading and parsing a file happens off the UI thread, with a
+  byte-based progress card (percentage, read/total size, entries so far) that can be
+  cancelled mid-import. Two stages are reported (`parsing`, then `indexing` for the facet
+  lists) so the bar never sits at 100%. Imports shorter than 250ms show no card, and the
+  card is a floating panel rather than a modal, so other tabs stay usable while a large
+  file loads.
 
 ### Out of scope (this iteration)
 
@@ -111,6 +117,13 @@ Zhao Zhen asked for a client that analyses various collected logs:
 20. Real-device integration tests (`cargo test --lib -- --ignored`) cover adb discovery,
     `adb devices -l` parsing, a real `-v threadtime` stream parsed by the logcat parser,
     a probe line delivered within 1s, and package reconstruction from pids.
+21. Opening a multi-megabyte log shows a progress card whose percentage and byte counts
+    advance, and the window stays interactive throughout (tabs, scrolling and filters all
+    respond while the import runs). The bar reaches 100%, briefly shows `indexing`, then
+    the new tab opens.
+22. Cancelling mid-import removes the card, opens no tab and raises no error banner; the
+    same file can be imported again afterwards. A tiny file imports without the card
+    appearing at all.
 
 ## Constraints
 
