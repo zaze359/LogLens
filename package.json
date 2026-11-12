@@ -1,0 +1,29 @@
+{
+  "name": "log-analyse",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Desktop client for analysing collected logs, starting with Android Logcat",
+  "scripts": {
+    "dev": "node scripts/gen-icon.cjs && vite",
+    "build": "node scripts/gen-icon.cjs && vue-tsc --noEmit && vite build",
+    "postinstall": "node scripts/gen-icon.cjs",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "setup": "bash scripts/setup.sh",
+    "setup:win": "powershell -ExecutionPolicy Bypass -File scripts/setup.ps1",
+    "check": "bash scripts/setup.sh --check-only"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "vue": "^3.5"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@vitejs/plugin-vue": "^5",
+    "typescript": "~5.7",
+    "vite": "^6",
+    "vue-tsc": "^2.2"
+  }
+}

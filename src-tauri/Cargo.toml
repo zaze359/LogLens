@@ -1,0 +1,31 @@
+[package]
+name = "log-analyse"
+version = "0.1.0"
+description = "Desktop client for analysing collected logs"
+authors = ["Zhao Zhen"]
+edition = "2021"
+# tauri-plugin-dialog v2 requires Rust >= 1.90
+rust-version = "1.90"
+
+[lib]
+name = "log_analyse_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+
+[features]
+# This feature is used for production builds where `devUrl` points to the filesystem.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
