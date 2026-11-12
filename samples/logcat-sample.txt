@@ -1,0 +1,55 @@
+--------- beginning of main
+11-12 10:20:01.001  1024-1024/com.xingxueban.student D/AppStartup: Application.onCreate start
+11-12 10:20:01.084  1024-1024/com.xingxueban.student I/HomeworkRepo: loadHomeworkList page=1 size=20
+11-12 10:20:01.220  1024-1031/com.xingxueban.student D/OkHttp: --> GET https://api.example.com/v4/homework/list?page=1
+11-12 10:20:01.221  1024-1031/com.xingxueban.student D/OkHttp: User-Agent: okhttp/4.12.0
+11-12 10:20:01.640  1024-1031/com.xingxueban.student D/OkHttp: <-- 200 https://api.example.com/v4/homework/list (419ms)
+11-12 10:20:01.700  1024-1024/com.xingxueban.student I/HomeworkRepo: parsed 20 items, totalScore=100
+11-12 10:20:02.010   512-540/system_server I/Choreographer: Skipped 32 frames! The application may be doing too much work on its main thread.
+11-12 10:20:02.033   512-540/system_server D/OpenGLRenderer: RenderProxy::setFrameRate 60
+11-12 10:20:05.116  1024-1035/com.xingxueban.student I/art: Background partial concurrent mark sweep GC freed 24183(2MB)
+11-12 10:20:08.420  1024-1031/com.xingxueban.student W/OkHttp: retry scheduled after SocketTimeoutException: timeout
+11-12 10:20:08.900  1024-1024/com.xingxueban.student D/AppStartup: splash finished, enter MainActivity
+11-12 10:21:00.330   512-640/system_server W/PermissionManager: Permission denied: android.permission.CAMERA for uid 10123
+11-12 10:21:00.410  1024-1024/com.xingxueban.student E/CameraBridge: SecurityException while opening camera
+11-12 10:21:12.004  1024-1024/com.xingxueban.student E/ActivityManager: ANR in com.xingxueban.student
+    Reason: Input dispatching timed out (Waiting because the touched window has not finished processing)
+    Load: 8.2 / 6.1 / 4.4
+    CPU usage from 0ms to 5000ms later
+11-12 10:21:12.220  1024-1024/com.xingxueban.student W/Choreographer: Frame time delta 48ms, jank detected
+11-12 10:22:00.001  1024-1024/com.xingxueban.student I/HomeworkRepo: openPaperDraft paperId=88312 echo compositionType=argumentative totalScore=100
+--------- beginning of crash
+11-12 10:22:03.512  1024-1024/com.xingxueban.student E/AndroidRuntime: FATAL EXCEPTION: main
+    Process: com.xingxueban.student, PID: 1024
+    java.lang.NullPointerException: Attempt to invoke virtual method on a null object reference
+        at com.xingxueban.student.ui.HomeworkDetailActivity.onCreate(HomeworkDetailActivity.kt:88)
+        at android.app.Activity.performCreate(Activity.java:8051)
+        at android.app.Instrumentation.callActivityOnCreate(Instrumentation.java:1271)
+    Caused by: kotlin.UninitializedPropertyAccessException: lateinit property paperId has not been initialized
+        at com.xingxueban.student.ui.HomeworkDetailActivity.bindPaper(HomeworkDetailActivity.kt:61)
+        ... 12 more
+11-12 10:22:03.900   512-640/system_server W/ActivityManager: Force finishing activity com.xingxueban.student/.ui.HomeworkDetailActivity
+11-12 10:22:04.001   512-540/system_server I/Choreographer: Skipped 62 frames! The application may be doing too much work on its main thread.
+11-12 10:22:04.033   512-540/system_server D/OpenGLRenderer: RenderProxy::setFrameRate 60
+11-12 10:23:10.220   512-640/system_server I/ActivityTaskManager: START u0 {cmp=com.xingxueban.student/.ui.HomeworkDetailActivity}
+11-12 10:23:10.555  1024-1024/com.xingxueban.student D/Lifecycle: HomeworkDetailActivity onCreate
+11-12 10:23:10.610  1024-1024/com.xingxueban.student D/Lifecycle: HomeworkDetailActivity onResume
+11-12 10:23:11.002  1024-1024/com.xingxueban.student I/HomeworkRepo: restoreDraft paperId=88312, echo compositionType=argumentative
+11-12 10:23:30.700  1024-1031/com.xingxueban.student D/OkHttp: --> POST https://api.example.com/v4/homework/submit
+11-12 10:23:31.240  1024-1031/com.xingxueban.student D/OkHttp: <-- 500 https://api.example.com/v4/homework/submit (540ms)
+11-12 10:23:31.260  1024-1024/com.xingxueban.student E/SubmitUseCase: submit failed status=500 msg=gateway timeout
+11-12 10:24:01.001  1024-1035/com.xingxueban.student I/art: Background sticky concurrent mark sweep GC freed 51209(4MB)
+11-12 10:24:30.112   512-640/system_server W/AppOps: Operation not started: uid 10123 op CAMERA
+11-12 10:24:30.300  1024-1024/com.xingxueban.student I/KeyStore: key attestation finished with certificate chain
+11-12 10:24:45.000  1024-1024/com.xingxueban.student W/NetworkTracker: SSLHandshakeException: chain validation failed
+11-12 10:24:50.000  1024-1024/com.xingxueban.student D/Lifecycle: HomeworkDetailActivity onPause
+[metrics] frame_time_p95=18.6ms source=custom-collector (intentionally unparsed line)
+11-12 10:25:00.001  1024-1024/com.xingxueban.student W/SyncManager: retry scheduled in 30s
+2026-11-12 10:25:01.500 10123 1024-1031/com.xingxueban.student I/YearFormatTag: year-prefixed threadtime line
+[ 11-12 10:25:02.000  1024:1024 D/LongFormatTag ]
+    body line produced by -v long
+11-12 10:25:03.110 I/AccessibilityData( 2108): onTopAppChanged: com.zui.launcher/com.zui.launcher.Launcher
+11-12 10:25:04.220 I/AccessibilityData( 2108): onTopAppChanged: com.zui.launcher/com.zui.quickstep.RecentsActivity
+11-12 10:25:05.330 I/AccessibilityData( 2108): onTopAppChanged: com.xingxueban.student/com.xingxueban.student.ui.HomeworkDetailActivity
+11-12 10:25:06.830 I/AccessibilityData( 2108): onTopAppChanged: com.hljzjx.edu.student.launch/com.hljzjx.launch.ui.main.MainActivity
+11-12 10:25:07.005 I/AccessibilityData( 2108): onTopAppChanged: com.hailiang.xxb.web.app/android.widget.FrameLayout
