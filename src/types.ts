@@ -146,6 +146,18 @@ export interface StreamStatus {
   packages: string[]
 }
 
+/** One `log-open-progress` event from `open_log_file`. */
+export interface OpenProgress {
+  /** Echo of the id the caller passed to `openLogFile`, so parallel imports can't mix. */
+  requestId: string
+  bytesRead: number
+  totalBytes: number
+  /** Entries parsed so far — one entry may span a whole stack trace. */
+  entries: number
+  /** `parsing` while reading, `indexing` while building facets afterwards. */
+  phase: string
+}
+
 export interface QueryResult {
   total: number
   matched: number

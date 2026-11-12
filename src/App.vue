@@ -9,6 +9,7 @@ import StatsPanel from './components/StatsPanel.vue'
 import LogTable from './components/LogTable.vue'
 import LogDetail from './components/LogDetail.vue'
 import DevicePanel from './components/DevicePanel.vue'
+import ImportOverlay from './components/ImportOverlay.vue'
 import { init, loadFile, store } from './stores/session'
 
 let unlistenDrop: (() => void) | null = null
@@ -72,6 +73,10 @@ onBeforeUnmount(() => {
     </div>
 
     <DevicePanel v-if="store.devicePanel" />
+
+    <Transition name="fade">
+      <ImportOverlay v-if="store.importTask?.visible" />
+    </Transition>
 
     <div v-if="store.notice" class="toast">{{ store.notice }}</div>
   </div>

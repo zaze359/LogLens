@@ -1,10 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import type {
   AdbDevice,
   AdbStatus,
   DeviceCaptureOptions,
   FileInfo,
   FilterSpec,
+  OpenProgress,
   QueryResult,
   Rule,
   RuleCategory,
@@ -22,7 +24,15 @@ function plain<T>(value: T): T {
 }
 
 export const ipc = {
-  openLogFile: (path: string) => invoke<FileInfo>('open_log_file', { path }),
+  openLogFile: (path: string, requestId: string) =>
+    invoke<FileInfo>('open_log_file', { path, requestId }),
+
+  /** Stops an import started with the same `requestId`; safe to call after it finished. */
+  cancelOpenLog: (requestId: string) => invoke<void>('cancel_open_log', { requestId }),
+
+  /** Subscribe to import progress. Remember to call the returned unlisten fn. */
+  onOpenProgress: (handler: (progress: OpenProgress) => void) =>
+    listen<OpenProgress>('log-open-progress', (event) => handler(event.payload)),
 
   adbStatus: () => invoke<AdbStatus>('adb_status'),
   listAdbDevices: () => invoke<AdbDevice[]>('list_adb_devices'),

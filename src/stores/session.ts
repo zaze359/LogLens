@@ -21,6 +21,12 @@ export const PAGE_SIZE = 400
 const STREAM_POLL_MS = 800
 
 /**
+ * How long an import runs before the progress card appears. Below this, the import is faster
+ * than the card can be read, and flashing it reads as a glitch rather than as progress.
+ */
+const IMPORT_CARD_DELAY_MS = 250
+
+/**
  * Tabs are capped to the backend's `MAX_OPEN_SESSIONS` (4). Going past it would make Rust
  * evict the oldest session behind the UI's back, leaving a tab whose every query fails.
  */
@@ -60,6 +66,27 @@ export interface SessionTab {
   stream: DeviceStreamInfo | null
   /** Guards the 800ms tick against stacking two background polls on one tab. */
   polling: boolean
+}
+
+/**
+ * A file import in flight.
+ *
+ * It lives outside `tabs` because the tab does not exist until the parse finishes — the whole
+ * point is to show something during that wait. `visible` stays false for the first
+ * `IMPORT_CARD_DELAY_MS` so a small log does not flash a card for one frame.
+ */
+export interface ImportTask {
+  /** Echoed by every progress event; only matching events are applied. */
+  requestId: string
+  path: string
+  fileName: string
+  bytesRead: number
+  totalBytes: number
+  entries: number
+  /** `parsing` | `indexing` */
+  phase: string
+  visible: boolean
+  cancelling: boolean
 }
 
 export function emptyFilter(): FilterSpec {
@@ -102,6 +129,8 @@ export interface AppState {
   scrollTop: number
   /** Non-null while the active tab is still receiving live lines. */
   deviceStream: DeviceStreamInfo | null
+  /** Non-null while a log file is being read and parsed. */
+  importTask: ImportTask | null
   // ---- global (shared by every tab) ----
   templates: Rule[]
   rules: Rule[]
@@ -133,6 +162,7 @@ export const store = reactive<AppState>({
   testCount: null,
   scrollTop: 0,
   deviceStream: null,
+  importTask: null,
   templates: [],
   rules: [],
   categories: [],
@@ -317,14 +347,72 @@ export async function loadFile(path: string): Promise<void> {
     setNotice(`最多同时打开 ${MAX_TABS} 个日志，先关掉一个标签再打开`)
     return
   }
+  // One import at a time: two cards would share the screen and the second import would
+  // steal the tab the first one just opened.
+  if (store.importTask) {
+    setNotice(`正在导入 ${store.importTask.fileName}，等它完成再打开下一个`)
+    return
+  }
   store.error = ''
+  const requestId = `open-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  store.importTask = {
+    requestId,
+    path,
+    fileName: path.split(/[\\/]/).pop() || path,
+    bytesRead: 0,
+    totalBytes: 0,
+    entries: 0,
+    phase: 'parsing',
+    visible: false,
+    cancelling: false
+  }
+  // Small files finish before the card would even be readable, so hold it back briefly.
+  const revealTimer = setTimeout(() => {
+    const task = store.importTask
+    if (task && task.requestId === requestId) task.visible = true
+  }, IMPORT_CARD_DELAY_MS)
+  let unlisten: (() => void) | null = null
+  let cancelled = false
   try {
-    const info = await ipc.openLogFile(path)
+    // Subscribe before invoking, otherwise the first events (which carry the total size)
+    // are gone by the time the listener exists.
+    unlisten = await ipc.onOpenProgress((progress) => {
+      const task = store.importTask
+      if (!task || task.requestId !== progress.requestId) return
+      task.bytesRead = progress.bytesRead
+      task.totalBytes = progress.totalBytes || task.totalBytes
+      task.entries = progress.entries
+      task.phase = progress.phase
+    })
+    const info = await ipc.openLogFile(path, requestId)
+    // A device capture can take the last tab slot while a slow import runs. Opening it
+    // anyway would make the backend evict the oldest session behind the UI's back.
+    if (store.tabs.length >= MAX_TABS) {
+      void ipc.closeSession(info.sessionId).catch(() => {})
+      setNotice(`标签已达上限（${MAX_TABS}），${info.fileName} 未打开`)
+      return
+    }
     await openTab(info, null)
     setNotice(`已在新标签中载入 ${info.fileName}：${info.totalLines} 行 / ${info.entryCount} 条`)
   } catch (e) {
-    store.error = errorMessage(e)
+    cancelled = store.importTask?.cancelling ?? false
+    if (cancelled) setNotice(`已取消导入 ${store.importTask?.fileName ?? ''}`.trim())
+    else store.error = errorMessage(e)
+  } finally {
+    clearTimeout(revealTimer)
+    unlisten?.()
+    // Only clear the task we own: a cancelled import resolves after this one may have
+    // already been replaced.
+    if (store.importTask?.requestId === requestId) store.importTask = null
   }
+}
+
+/** Aborts the current import. The backend stops between chunks and registers no session. */
+export function cancelImport(): void {
+  const task = store.importTask
+  if (!task || task.cancelling) return
+  task.cancelling = true
+  void ipc.cancelOpenLog(task.requestId).catch(() => {})
 }
 
 export async function pickAndLoadFile(): Promise<void> {

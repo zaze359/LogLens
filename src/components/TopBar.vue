@@ -67,8 +67,13 @@ const sourceTitle = computed(() => {
     >
       连接设备
     </button>
-    <button class="btn btn-primary btn-sm" title="在新标签中打开日志文件（最多 4 个）" @click="pickAndLoadFile">
-      打开日志文件
+    <button
+      class="btn btn-primary btn-sm"
+      :disabled="!!store.importTask"
+      :title="store.importTask ? '正在导入另一个日志' : '在新标签中打开日志文件（最多 4 个）'"
+      @click="pickAndLoadFile"
+    >
+      {{ store.importTask ? '导入中…' : '打开日志文件' }}
     </button>
   </header>
 </template>
