@@ -566,6 +566,7 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 
 .net-detail { margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-1); }
 .net-detail-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.net-detail-head .btn.copied { color: var(--ok); border-color: rgba(52, 211, 153, .45); }
 .net-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 9px 11px; max-height: 200px; overflow: auto; }
 .net-detail-grid p { margin: 2px 0; font-size: 11px; word-break: break-all; }
 .net-detail-title { color: var(--accent); margin-top: 8px !important; }

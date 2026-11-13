@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
+import { toCurl } from '../lib/curl'
 import { errorMessage, ipc } from '../lib/ipc'
 import { closeNetworkPanel } from '../stores/session'
 import type {
@@ -27,10 +28,15 @@ const statuses = ref<Record<string, NetworkCaptureStatus>>({})
 const requests = ref<NetworkRequest[]>([])
 const fileMode = ref(false)
 const selected = ref<NetworkRequest | null>(null)
+const curlCopied = ref(false)
+let curlTimer: ReturnType<typeof setTimeout> | null = null
 
 const proxyInput = ref('')
 const proxyState = ref<ProxyState | null>(null)
 const showAdvanced = ref(false)
+
+/** Empty for CONNECT rows (undecrypted tunnels), which hide the copy button. */
+const curlText = computed(() => (selected.value ? toCurl(selected.value) : ''))
 
 let timer: ReturnType<typeof setInterval> | null = null
 
@@ -278,6 +284,19 @@ async function restoreProxy(): Promise<void> {
   }
 }
 
+async function copyCurl(): Promise<void> {
+  const text = curlText.value
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    curlCopied.value = true
+    if (curlTimer) clearTimeout(curlTimer)
+    curlTimer = setTimeout(() => (curlCopied.value = false), 1600)
+  } catch {
+    error.value = '复制失败，请手动选中请求详情文本'
+  }
+}
+
 async function close(): Promise<void> {
   // Do not leave a CDP forward, a LAN listener or a global proxy behind a closed dialog.
   await closeAll()
@@ -298,6 +317,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   stopPolling()
+  if (curlTimer) clearTimeout(curlTimer)
   // The component can be unmounted without going through close() (window close,
   // store reset). Best effort only: an IPC may not get out while the webview is
   // being torn down. The Rust CloseRequested/Exit hooks and the proxy journal are
@@ -455,6 +475,19 @@ onBeforeUnmount(() => {
               <b class="mono">{{ selected.method }} {{ selected.url }}</b>
               <div class="spacer" />
               <span v-if="selected.redacted" class="route-tag">敏感字段已隐藏</span>
+              <button
+                v-if="curlText"
+                class="btn btn-ghost btn-sm"
+                :class="{ copied: curlCopied }"
+                :title="
+                  selected.redacted
+                    ? '复制为 cURL 命令（token / Cookie 等为脱敏值）'
+                    : '复制为 cURL 命令'
+                "
+                @click="copyCurl"
+              >
+                {{ curlCopied ? '已复制' : '复制 cURL' }}
+              </button>
               <button class="btn btn-ghost btn-sm" @click="selected = null">×</button>
             </div>
             <div class="net-detail-grid">

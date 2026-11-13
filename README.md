@@ -262,6 +262,8 @@ LOGLENS_JSONL=~/capture.jsonl mitmdump -s scripts/mitmproxy_jsonl.py -p 8080
 
 需要原生 HTTPS 明文时只能走外部 MITM（可 root 装系统证书，或目标 APK 带 `debug-overrides`）；这一入口与内建原生采集互斥，避免两个代理互相打架。
 
+**复制 cURL**：选中任一请求，详情右上角「复制 cURL」会生成可直接粘贴到终端的命令（方法、URL、请求头、请求体）。自动跳过 `Host` / `Content-Length` / `Transfer-Encoding` / `Connection` / `Accept-Encoding` 这些由 curl 自行推导的字段；`CONNECT` 行（未解密的 HTTPS 隧道）不生成命令。请求头用的是**脱敏后的值**，token / Cookie 为占位符，不会把真实凭据带出去。
+
 - **Android 7+ 的硬门槛**：targetSdk ≥ 24 的 App 默认不信任用户安装的 CA，`DEBUGGABLE` 本身**不**等于放行；有证书固定时即使放行也失败。所以体检不会把 `mitm-debug` 标成「可看明文」。
 - **脱敏**：token / Cookie / Authorization / 密码等字段在**导入或采集落地时**就被替换（`network.rs::redact`），不会进入会话、缓存或导出文件；URL query 里的 token 同样处理。
 - **清理**：CDP 的 `adb forward` 由采集线程在停止 / 异常 / 窗口关闭时移除；内建代理停止时同步关闭监听并还原设备代理，不会留下占用端口或死代理。
@@ -556,3 +558,4 @@ npm run tauri dev
 35. H5 与原生采集同时开启时，两类请求按时间混排在同一张表，「来源」列可区分；点任一行能看到请求头 / 响应头，敏感字段显示为脱敏值。
 36. 点「停止采集」后 `adb shell "settings list global | grep -i proxy"` 应为 `http_proxy=:0`（或无输出），`lsof -nP -iTCP:18999` 无监听；**在平板上重新打开被测 App 触发一次请求，logcat 里不应再出现 `18999` / `ConnectException`**。只看 Settings 无输出不足以证明恢复——Java 层代理属性可能仍在生效。
 37. 模拟异常退出：开始原生采集后直接强杀应用（或先拔线再退出），重新打开客户端、或点一次「环境体检」，设备代理应被自动清除，面板显示「已自动修复设备代理」；`adb shell "settings get global http_proxy"` 返回 `:0`，设备恢复上网，重开被测 App 后请求成功。若设备当时不在线，重新连上后再打开面板应完成清理，期间不会出现 `failed to connect to /172.21.33.28 (port 18999)`。
+38. 选中任一条请求点「复制 cURL」：按钮短暂变「已复制」；粘贴到终端得到的命令含方法、URL、请求头与 `--data-raw` 请求体，`Host` / `Content-Length` / `Connection` / `Accept-Encoding` 不应出现；带 token 的请求复制出来是脱敏值；`CONNECT`（HTTPS 隧道）行没有该按钮。
