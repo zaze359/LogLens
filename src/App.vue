@@ -1,19 +1,55 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted } from 'vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import TopBar from './components/TopBar.vue'
 import SessionTabs from './components/SessionTabs.vue'
-import RuleSidebar from './components/RuleSidebar.vue'
-import FilterBar from './components/FilterBar.vue'
-import StatsPanel from './components/StatsPanel.vue'
-import LogTable from './components/LogTable.vue'
-import LogDetail from './components/LogDetail.vue'
-import DevicePanel from './components/DevicePanel.vue'
-import NetworkPanel from './components/NetworkPanel.vue'
+import LogPane from './components/LogPane.vue'
+import DevicePage from './components/device/DevicePage.vue'
+import DeviceToolRail from './components/device/DeviceToolRail.vue'
+import DeviceCaptureBar from './components/device/DeviceCaptureBar.vue'
+import DevicePickerDialog from './components/device/DevicePickerDialog.vue'
+import LogCaptureTab from './components/device/LogCaptureTab.vue'
 import ImportOverlay from './components/ImportOverlay.vue'
 import { init, loadFile, store } from './stores/session'
 
 let unlistenDrop: (() => void) | null = null
+
+/** 当前设备里选中的工具；不在设备工作区时为空。 */
+const currentOp = computed<string>(() =>
+  store.deviceView && store.activeSerial ? store.deviceOps[store.activeSerial] ?? 'log' : ''
+)
+
+/**
+ * 日志面板什么时候可见：本地文件工作区一直在看它；设备工作区里只有选中「日志」工具、
+ * 且这台设备已经有日志时看它。隐藏时只是 `v-show`，实时流与滚动位置都留着。
+ */
+const logVisible = computed<boolean>(() => {
+  if (!store.deviceView) return true
+  return currentOp.value === 'log' && !needCapture.value
+})
+
+const deviceHasLog = computed<boolean>(() =>
+  store.tabs.some((tab) => tab.info.device === store.activeSerial)
+)
+
+/** 选了「日志」工具但这台设备还没有日志：显示「抓一份」的入口。 */
+const needCapture = computed<boolean>(
+  () =>
+    store.deviceView &&
+    !!store.activeSerial &&
+    currentOp.value === 'log' &&
+    !deviceHasLog.value
+)
+
+const deviceReady = computed<boolean>(
+  () => store.devices.find((d) => d.serial === store.activeSerial)?.state === 'device'
+)
+
+/** 设备页只在选中非「日志」工具时显示；日志工具的内容是共用的日志面板。 */
+function deviceToolVisible(serial: string): boolean {
+  if (!store.deviceView || store.activeSerial !== serial) return false
+  return (store.deviceOps[serial] ?? 'log') !== 'log'
+}
 
 onMounted(async () => {
   await init()
@@ -50,31 +86,41 @@ onBeforeUnmount(() => {
       浏览器预览模式：界面可查看，本地文件读写、设备抓取与规则持久化请在 Tauri 客户端中运行（npm run tauri dev）。
     </div>
 
-    <div class="workspace">
-      <RuleSidebar />
-      <div class="main-pane">
-        <FilterBar />
-        <StatsPanel />
-        <LogTable />
-        <div class="statusbar">
-          <span>已加载 <b class="stat-num">{{ store.entries.length }}</b> / 命中
-            <b class="stat-num">{{ store.result?.matched ?? 0 }}</b> / 总计
-            <b class="stat-num">{{ store.result?.total ?? 0 }}</b></span>
-          <span v-if="store.result">耗时 {{ store.result.elapsedMs }} ms</span>
-          <span v-if="store.fileInfo">未识别行 {{ store.fileInfo.unparsedLines }}</span>
-          <span v-if="store.deviceStream" class="live-hint">
-            <span class="live-dot" />实时抓取中 · 新日志自动追加
-          </span>
-          <span v-if="store.loadingMore" class="muted">加载更多中…</span>
-          <div class="spacer" />
-          <span class="muted">点击行查看完整内容 · 支持拖入日志文件 · 可直连 Android 设备</span>
+    <!--
+      工作区内容。设备工作区左边多一条工具栏：日志 / 抓包都是这台设备的工具，不是另一个
+      并列的工作区，所以关掉设备时它们一起关闭。
+    -->
+    <div class="app-body">
+      <DeviceToolRail
+        v-if="store.deviceView && store.activeSerial"
+        :serial="store.activeSerial"
+      />
+
+      <div class="app-body-main">
+        <!-- 采集状态条：抓取是这台设备的事，状态和停止入口都留在「日志」工具里 -->
+        <DeviceCaptureBar v-show="store.deviceView && logVisible" :serial="store.activeSerial" />
+
+        <!-- 日志面板只有一份实例，两种来源共用 -->
+        <LogPane v-show="logVisible" />
+
+        <div v-show="needCapture" class="capture-empty">
+          <div class="capture-empty-card">
+            <p class="capture-empty-title">这台设备还没有日志</p>
+            <LogCaptureTab :serial="store.activeSerial" :device-ready="deviceReady" />
+          </div>
         </div>
+
+        <!-- 每台设备一个页面，常驻挂载（v-show 隐藏），切换工具不会打断正在跑的采集 -->
+        <DevicePage
+          v-for="serial in store.deviceWorkspaces"
+          :key="serial"
+          v-show="deviceToolVisible(serial)"
+          :serial="serial"
+        />
       </div>
-      <LogDetail v-if="store.selected" />
     </div>
 
-    <DevicePanel v-if="store.devicePanel" />
-    <NetworkPanel v-if="store.networkPanel" />
+    <DevicePickerDialog v-if="store.devicePicker" />
 
     <Transition name="fade">
       <ImportOverlay v-if="store.importTask?.visible" />

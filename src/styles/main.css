@@ -39,6 +39,9 @@ button { cursor: pointer; }
 
 /* ---------- layout ---------- */
 .app-shell { display: flex; flex-direction: column; height: 100vh; }
+/* 工作区内容：设备工作区左边多一条工具栏，右侧才是内容 */
+.app-body { display: flex; flex: 1; min-height: 0; }
+.app-body-main { position: relative; display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
 .workspace { position: relative; display: flex; flex: 1; min-height: 0; }
 .main-pane { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
 .panel { background: var(--bg-1); }
@@ -428,9 +431,125 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
   font-size: 12.5px; max-width: 70vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-/* ---------- device capture ---------- */
-.device-modal { width: min(620px, 94vw); }
-.device-modal .modal-body { max-height: 64vh; }
+/* ---------- device operation bodies (shared by every device function tab) ---------- */
+.device-tab-body { padding-top: 2px; }
+.device-op-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+
+/* ---------- device picker ---------- */
+.device-picker-modal { width: min(680px, 94vw); }
+.device-picker-modal .modal-body { max-height: 66vh; }
+.device-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.device-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 9px 11px; border-radius: 8px; text-align: left;
+  background: var(--bg-1); border: 1px solid var(--border); color: var(--text);
+  font-size: 12px; cursor: pointer;
+}
+.device-item:hover:not(.off) { border-color: var(--accent); background: var(--accent-soft); }
+.device-item.on { border-color: var(--accent); box-shadow: inset 2px 0 0 var(--accent); }
+.device-item.off { opacity: .6; cursor: not-allowed; }
+.device-item-name { font-weight: 600; }
+.device-item-state { font-size: 11px; color: var(--text-dim); }
+.device-item-state.warn { color: var(--warning); }
+.device-item-current {
+  padding: 1px 6px; border-radius: 8px; font-size: 10.5px;
+  color: var(--accent); border: 1px solid rgba(56, 189, 248, .35); background: var(--accent-soft);
+}
+
+/* ---------- device workspace page (its own tab in the tab strip) ---------- */
+.device-page {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--bg);
+}
+.device-page-head {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; background: var(--bg-1); border-bottom: 1px solid var(--border);
+}
+.device-page-name { font-size: 13px; font-weight: 600; }
+.device-page-icon { color: var(--accent); font-size: 11px; }
+.device-page-serial { font-size: 11.5px; }
+.device-page-state {
+  padding: 1px 7px; border-radius: 8px; font-size: 10.5px;
+  color: var(--ok); background: rgba(52, 211, 153, .1); border: 1px solid rgba(52, 211, 153, .32);
+}
+.device-page-state.warn {
+  color: var(--warning); background: rgba(251, 191, 36, .1); border-color: rgba(251, 191, 36, .38);
+}
+
+.device-page-body { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px 16px; }
+/* Cap the request table so the selected request's detail stays reachable below it. */
+.device-page .net-table-wrap { max-height: 48vh; }
+
+/* The device tab in the tab strip: same shape as a log tab, marked as a workspace. */
+.tab.device-tab-strip .tab-badge { color: var(--accent); }
+.tab.device-tab-strip .tab-title { font-family: inherit; font-weight: 600; }
+.device-tab-icon { flex: none; color: var(--accent); font-size: 10px; }
+
+/*
+ * 设备工作区左侧的工具栏：日志 / 抓包都是这台设备的工具。
+ * 形态对齐 DevTools 的工具条 —— 竖排图标、选中是实心蓝块，右侧看内容。
+ */
+.tool-rail {
+  flex: none; width: 46px; display: flex; flex-direction: column;
+  align-items: center; gap: 6px; padding: 8px 0;
+  background: var(--bg-1); border-right: 1px solid var(--border);
+}
+.tool-btn {
+  width: 32px; height: 32px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 8px; border: 1px solid transparent;
+  background: transparent; color: var(--text-dim);
+}
+.tool-btn svg {
+  width: 18px; height: 18px;
+  fill: none; stroke: currentColor; stroke-width: 1.5;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.tool-btn:hover { background: rgba(255, 255, 255, .06); color: var(--text); }
+.tool-btn.on { background: #2563eb; border-color: #3b82f6; color: #fff; }
+
+/* ---------- 日志工具的采集状态条 ---------- */
+.capture-bar {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  height: 30px; padding: 0 12px;
+  background: var(--bg-2); border-bottom: 1px solid var(--border);
+  font-size: 11.5px; color: var(--text-dim); overflow: hidden;
+}
+.capture-dot {
+  width: 7px; height: 7px; flex: none; border-radius: 50%;
+  background: var(--text-faint);
+}
+.capture-dot.live {
+  background: var(--ok);
+  box-shadow: 0 0 0 0 rgba(52, 211, 153, .6);
+  animation: live-pulse 1.6s ease-out infinite;
+}
+.capture-state { flex: none; font-weight: 600; color: var(--text-dim); }
+.capture-bar.live .capture-state { color: #6ee7b7; }
+.capture-stat {
+  flex: none; padding-left: 8px; margin-left: 2px;
+  border-left: 1px solid var(--border);
+  white-space: nowrap;
+}
+.capture-logs { flex: none; display: flex; align-items: center; gap: 6px; padding-left: 8px; border-left: 1px solid var(--border); }
+.capture-log-link {
+  padding: 1px 7px; border-radius: 8px; font-size: 10.5px;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-dim);
+}
+.capture-log-link:hover { color: var(--accent); border-color: var(--accent); }
+
+/* 「这台设备还没有日志」时的入口，占满内容区居中 */
+.capture-empty {
+  flex: 1; min-height: 0; display: grid; place-items: center;
+  padding: 24px; overflow-y: auto;
+}
+.capture-empty-card {
+  width: min(520px, 100%); padding: 18px 20px;
+  background: var(--bg-1); border: 1px solid var(--border); border-radius: 10px;
+}
+.capture-empty-title { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+
+/* Separates 设备工作区 from 本地文件工作区 without changing the tab shape. */
+.tab-sep { flex: none; width: 1px; height: 16px; margin: 0 4px; background: var(--border); }
 
 .adb-line {
   display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
@@ -513,9 +632,13 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
   50% { opacity: 1; }
 }
 
-/* ---------- device network capture panel ---------- */
-.network-modal { width: min(1080px, 96vw); }
-.network-modal .modal-body { max-height: 78vh; }
+/* ---------- device network capture panel (tab inside the device dialog) ---------- */
+.net-toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 10px; font-size: 11.5px; line-height: 1.6;
+}
+.net-toolbar .muted { max-width: 78ch; }
+.net-foot-note { margin: 14px 0 0; padding-top: 10px; border-top: 1px solid var(--border-soft); }
 
 .probe-summary {
   border: 1px solid var(--border); border-left: 3px solid var(--accent);
@@ -523,8 +646,8 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
   line-height: 1.65;
 }
 .probe-summary p { margin: 6px 0 0; }
-.probe-summary p.probe-healed { color: var(--ok); font-size: 12px; }
-.probe-summary-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
+/* The healed-proxy notice sits outside the collapsed block: it is a warning, always visible. */
+.probe-healed { margin: 0 0 8px; color: var(--ok); font-size: 12px; }
 .probe-badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
 .probe-badge.ok { color: var(--ok); border-color: rgba(52, 211, 153, .45); background: rgba(52, 211, 153, .1); }
 .probe-badge.muted { color: var(--text-dim); }

@@ -3,6 +3,8 @@ import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialo
 import { errorMessage, ipc, isTauri } from '../lib/ipc'
 import { UNCATEGORIZED } from '../types'
 import type {
+  AdbDevice,
+  AdbStatus,
   DeviceCaptureOptions,
   FileInfo,
   FilterSpec,
@@ -40,7 +42,15 @@ export interface DeviceStreamInfo {
   label: string
   running: boolean
   error: string
+  /** 开始抓取的时刻（epoch ms）。用来显示「已抓 03:21」，切工具来回也不会重置。 */
+  startedAt: number
 }
+
+/**
+ * 设备下能做的事。加一项功能 = 这里加一个值、`operations.ts` 加一条、`DevicePage` 加一个
+ * `v-show` 区块。
+ */
+export type DeviceOpId = 'log' | 'network'
 
 /**
  * One open log source. Each tab owns a backend session (same id) plus its own view state,
@@ -149,10 +159,26 @@ export interface AppState {
   /** Category id -> collapsed. Ignored while a search is active. */
   collapsed: Record<string, boolean>
   rulesPath: string
-  /** Device picker dialog visibility. */
-  devicePanel: boolean
-  /** Device network capture dialog visibility. */
-  networkPanel: boolean
+  /** Global adb state: whether adb exists, and every device it can see. */
+  adbStatus: AdbStatus | null
+  devices: AdbDevice[]
+  devicesLoading: boolean
+  /**
+   * Device workspaces, one per connected device — the same idea as one tab per log file.
+   * They live in the tab strip next to the log workspaces.
+   */
+  deviceWorkspaces: string[]
+  /** Serial of the device workspace on screen. '' when none. */
+  activeSerial: string
+  /** `true` while a device workspace is visible; the log area is hidden but stays mounted. */
+  deviceView: boolean
+  /**
+   * 每台设备当前选中的工具（日志 / 抓包…）。放在全局是因为它有两个读者：左侧工具栏显示
+   * 哪个图标亮着，内容区决定显示日志面板还是工具自己的页面。
+   */
+  deviceOps: Record<string, DeviceOpId>
+  /** The device picker: connect / switch device. Only needed when adding a device. */
+  devicePicker: boolean
   /** Last used capture options, so reopening the panel does not start from scratch. */
   lastCapture: DeviceCaptureOptions | null
 }
@@ -185,11 +211,16 @@ export const store = reactive<AppState>({
   ruleSearch: '',
   collapsed: {},
   rulesPath: '',
-  devicePanel: false,
-  networkPanel: false,
+  adbStatus: null,
+  devices: [],
+  devicesLoading: false,
+  activeSerial: '',
+  deviceWorkspaces: [],
+  deviceView: false,
+  deviceOps: {},
+  devicePicker: false,
   lastCapture: null
 })
-
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
@@ -221,6 +252,10 @@ export async function init(): Promise<void> {
     store.templates = templates
     applyRuleBundle(bundle)
     void ipc.rulesLocation().then((p) => (store.rulesPath = p)).catch(() => {})
+    // Learn which devices exist without blocking the UI: the top bar can then show the
+    // active device immediately, so connecting is a one-click affair instead of a detour.
+    // Quiet: no adb installed is a normal state for someone who only analyses log files.
+    void refreshDevices(true)
   } catch (e) {
     store.error = errorMessage(e)
   }
@@ -264,26 +299,48 @@ function clearView(): void {
   store.loadingMore = false
 }
 
-/** Make `id` the visible tab. Cheap: everything it needs was snapshotted on the way out. */
+/**
+ * 切到一份日志时，视图该落在哪里由**它属于谁**决定：
+ * · 设备的日志 —— 进那台设备的工作区、选中「日志」工具（日志是设备的一部分，不是隔壁标签）
+ * · 本地文件 —— 离开设备区
+ */
+function followTabOwner(tab: SessionTab): void {
+  const serial = tab.info.device
+  if (serial && store.deviceWorkspaces.includes(serial)) {
+    store.activeSerial = serial
+    store.deviceView = true
+    store.deviceOps[serial] = 'log'
+  } else {
+    store.deviceView = false
+  }
+}
+
+/**
+ * Focus a log tab. Cheap: everything it needs was snapshotted on the way out.
+ *
+ * 必须先算「它属于谁」再判断是否早退 —— 点当前已经在看的日志，也应当把视图带回它的
+ * 工作区（比如刚从设备页的「抓包」切回来）。
+ */
 export function activateTab(id: string): void {
+  const target = store.tabs.find((tab) => tab.id === id) ?? null
+  if (!target) return
+  followTabOwner(target)
   if (id === store.activeId) return
-  const tab = store.tabs.find((candidate) => candidate.id === id)
-  if (!tab) return
 
   snapshotActive()
   // Responses still in flight belong to the tab being left; make them unlandable.
   requestSeq++
   paging = false
 
-  store.fileInfo = tab.info
-  store.filter = clone(tab.filter)
-  store.result = tab.result
-  store.entries = tab.entries
-  store.selected = tab.selected
-  store.activeRuleId = tab.activeRuleId
-  store.testCount = tab.testCount
-  store.scrollTop = tab.scrollTop
-  store.deviceStream = tab.stream
+  store.fileInfo = target.info
+  store.filter = clone(target.filter)
+  store.result = target.result
+  store.entries = target.entries
+  store.selected = target.selected
+  store.activeRuleId = target.activeRuleId
+  store.testCount = target.testCount
+  store.scrollTop = target.scrollTop
+  store.deviceStream = target.stream
   store.error = ''
   store.loading = false
   store.loadingMore = false
@@ -295,7 +352,7 @@ export function activateTab(id: string): void {
 
   syncTimers()
   if (store.filter.searchMode === 'find' && store.filter.search) scheduleFind()
-  if (tab.stream) {
+  if (target.stream) {
     // A background tab was not rendering its deltas, so pull them now — otherwise the
     // user comes back to a list that stops mid-burst.
     void syncStream().then(catchUp)
@@ -305,6 +362,7 @@ export function activateTab(id: string): void {
 export function closeTab(id: string): void {
   const index = store.tabs.findIndex((tab) => tab.id === id)
   if (index < 0) return
+  const closing = store.tabs[index]
   const wasActive = id === store.activeId
 
   // Drop the tab first so the strip reacts instantly; the backend session (and that tab's
@@ -316,10 +374,22 @@ export function closeTab(id: string): void {
     syncTimers()
     return
   }
+
+  // 关掉的是当前设备里的一份日志：留在设备里（没有别的日志就显示「去抓一份」），不要把
+  // 用户甩到另一个工作区去。
+  const owner = closing.info.device
+  if (owner && store.deviceView && store.activeSerial === owner) {
+    const sibling = store.tabs.find((tab) => tab.info.device === owner) ?? null
+    if (sibling) activateTab(sibling.id)
+    else {
+      clearView()
+      syncTimers()
+    }
+    return
+  }
+
   const next = store.tabs[index] ?? store.tabs[index - 1] ?? null
   if (next) {
-    // `activeId` still points at the closed tab, so `activateTab` restores instead of
-    // early-returning.
     activateTab(next.id)
   } else {
     clearView()
@@ -451,30 +521,132 @@ export async function pickAndLoadFile(): Promise<void> {
   }
 }
 
-/** Opens the capture dialog. */
-export function openDevicePanel(): void {
+/** The device behind a workspace tab, or null when it has been unplugged. */
+export function deviceBySerial(serial: string): AdbDevice | null {
+  return store.devices.find((d) => d.serial === serial) || null
+}
+
+/**
+ * Reads adb status and the device list into the global store. Runs on startup and whenever
+ * the picker opens or `刷新设备` is clicked — never per workspace, so the list is always
+ * consistent with what adb actually sees.
+ *
+ * It never changes `activeSerial`: which workspace is on screen is the user's decision, not
+ * something a refresh may silently repoint (that would swap the content under their feet).
+ */
+export async function refreshDevices(quiet = false): Promise<void> {
+  if (!store.tauriReady) return
+  store.devicesLoading = true
+  try {
+    store.adbStatus = await ipc.adbStatus()
+    store.devices = store.adbStatus.available ? await ipc.listAdbDevices() : []
+  } catch (e) {
+    store.adbStatus = null
+    store.devices = []
+    if (!quiet) store.error = errorMessage(e)
+  } finally {
+    store.devicesLoading = false
+  }
+}
+
+/**
+ * 「设备」入口：选完设备就为它开一个工作区标签。
+ *
+ * One workspace per device, like one tab per log file. Picking a device that already has a
+ * workspace focuses it instead of opening a duplicate.
+ */
+export function openDeviceWorkspace(serial: string): void {
+  if (!serial) return
+  if (!store.deviceWorkspaces.includes(serial)) store.deviceWorkspaces.push(serial)
+  showDeviceWorkspace(serial)
+}
+
+/** Switch to an already open device workspace. */
+export function showDeviceWorkspace(serial: string): void {
+  if (!store.deviceWorkspaces.includes(serial)) return
+  store.activeSerial = serial
+  store.deviceView = true
+  if ((store.deviceOps[serial] ?? 'log') === 'log') focusDeviceLog(serial)
+}
+
+/**
+ * 让日志面板对准这台设备的日志。
+ *
+ * 没有日志时**不清空视图** —— 日志面板此刻是不可见的（界面显示「去抓一份」），而清空会
+ * 顺手把 `deviceStream` 置空，让顶栏的「停止实时抓取」在另一台设备还在抓的时候消失。
+ */
+function focusDeviceLog(serial: string): void {
+  const current = store.tabs.find((tab) => tab.id === store.activeId)
+  if (current?.info.device === serial) return
+  const tab = store.tabs.find((candidate) => candidate.info.device === serial)
+  if (tab) activateTab(tab.id)
+}
+
+/**
+ * 在当前设备里切工具（日志 / 抓包…）。左栏图标和设备页的内容共用这一个状态，所以从
+ * 别处点「抓包」能直接回到这台设备的那个工具，而不是两处各记一份。
+ */
+export function setDeviceOp(serial: string, op: DeviceOpId): void {
+  store.deviceOps[serial] = op
+  if (!store.deviceWorkspaces.includes(serial)) return
+  store.activeSerial = serial
+  store.deviceView = true
+  if (op === 'log') focusDeviceLog(serial)
+}
+
+/**
+ * Device workspaces register their cleanup per serial, because they can be closed from the
+ * tab strip, where no device component is reachable. Closing must stop captures and give the
+ * device its proxy back — not just hide a view.
+ */
+const deviceCleanups = new Map<string, () => Promise<void>>()
+
+export function registerDeviceCleanup(serial: string, fn: (() => Promise<void>) | null): void {
+  if (fn) deviceCleanups.set(serial, fn)
+  else deviceCleanups.delete(serial)
+}
+
+export async function closeDeviceWorkspace(serial: string): Promise<void> {
+  // 先记下来：下面关日志标签时 `activateTab` 可能把 `activeSerial` 挪到别的设备去。
+  const wasActive = store.activeSerial === serial
+  const stillShowing = store.deviceView && wasActive
+  // 日志属于这台设备，不是独立文件：关掉工作区就把它的日志一起关掉（停掉 adb 子进程、
+  // 释放后端会话）。否则标签条上会留下一条「设备已经没了」的日志。
+  for (const tab of store.tabs.filter((tab) => tab.info.device === serial)) closeTab(tab.id)
+
+  const cleanup = deviceCleanups.get(serial)
+  deviceCleanups.delete(serial)
+  if (cleanup) {
+    try {
+      await cleanup()
+    } catch {
+      // The Rust side (ProxyGuard::drop + journal) is the final safety net.
+    }
+  }
+  const index = store.deviceWorkspaces.indexOf(serial)
+  if (index < 0) return
+  store.deviceWorkspaces.splice(index, 1)
+  delete store.deviceOps[serial]
+  if (!wasActive) return
+  // Focus a neighbour, or fall back to the log view when no device workspace is left.
+  // `deviceView` is decided last: closing the tabs above may already have switched views.
+  const next = store.deviceWorkspaces[index] ?? store.deviceWorkspaces[index - 1] ?? ''
+  store.activeSerial = next
+  store.deviceView = stillShowing && !!next
+}
+
+/** Connect / switch device. The only place a device gets picked. */
+export function openDevicePicker(): void {
   if (!store.tauriReady) {
     setNotice('请在 Tauri 客户端中连接设备')
     return
   }
-  store.devicePanel = true
+  store.devicePicker = true
+  void refreshDevices()
 }
 
-export function closeDevicePanel(): void {
-  store.devicePanel = false
-}
-
-/** Opens the device network capture dialog. */
-export function openNetworkPanel(): void {
-  if (!store.tauriReady) {
-    setNotice('请在 Tauri 客户端中抓取设备网络请求')
-    return
-  }
-  store.networkPanel = true
-}
-
-export function closeNetworkPanel(): void {
-  store.networkPanel = false
+export function closeDevicePicker(): void {
+  store.devicePicker = false
 }
 
 /** Follow new device lines until the user stops or adb exits. Opens in its own tab. */
@@ -491,11 +663,11 @@ export async function startDeviceStream(options: DeviceCaptureOptions): Promise<
   )
   if (busy) {
     activateTab(busy.id)
-    setNotice(`设备 ${options.serial} 已在标签「${busy.title}」中实时抓取，先在那里停止再重新开始`)
+    setNotice(`设备 ${options.serial} 已经在实时抓取，先停掉再重新开始`)
     return false
   }
   if (store.tabs.length >= MAX_TABS) {
-    setNotice(`最多同时打开 ${MAX_TABS} 个日志，先关掉一个标签再开始抓取`)
+    setNotice(`最多同时打开 ${MAX_TABS} 个日志，先关掉一个再开始抓取`)
     return false
   }
   store.error = ''
@@ -507,14 +679,15 @@ export async function startDeviceStream(options: DeviceCaptureOptions): Promise<
       serial: options.serial,
       label: info.fileName,
       running: true,
-      error: ''
+      error: '',
+      startedAt: Date.now()
     }
     await openTab(info, stream)
     syncTimers()
     // `adb logcat` replays the existing buffer first, so a non-empty start is normal and
     // means "these lines already happened" — worth saying out loud once.
     const replayed = info.entryCount > 0 ? `（含设备缓冲区已有的 ${info.entryCount} 条）` : ''
-    setNotice(`已在新标签开始实时抓取${replayed}，切到别的标签也会继续接收`)
+    setNotice(`已在这台设备的「日志」工具里开始实时抓取${replayed}，切到别的工具也会继续接收`)
     return true
   } catch (e) {
     store.error = errorMessage(e)

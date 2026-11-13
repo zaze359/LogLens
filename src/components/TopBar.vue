@@ -2,11 +2,9 @@
 import { computed } from 'vue'
 import {
   exportFilteredFile,
-  openDevicePanel,
-  openNetworkPanel,
+  openDevicePicker,
   pickAndLoadFile,
   resetFilter,
-  stopDeviceStream,
   store
 } from '../stores/session'
 
@@ -52,29 +50,12 @@ const sourceTitle = computed(() => {
       </div>
     </template>
     <div v-else class="file-meta muted">
-      尚未载入日志 · 打开本地文件，或连上 Android 设备实时抓取 logcat
+      尚未载入日志 · 打开日志文件，或选择设备进入设备工作区
     </div>
-
     <div class="spacer" />
-    <button v-if="store.deviceStream" class="btn btn-sm btn-danger-ghost" @click="stopDeviceStream">
-      停止实时抓取
-    </button>
+    <!-- 抓取的开始 / 停止在设备工作区的「日志」工具里，顶栏不再有脱离设备的抓取按钮 -->
     <button class="btn btn-sm" @click="resetFilter">清空筛选</button>
     <button class="btn btn-sm" :disabled="!info" @click="exportFilteredFile">导出命中结果</button>
-    <button
-      class="btn btn-sm"
-      title="连接 Android 设备，在新标签中实时抓取 logcat"
-      @click="openDevicePanel()"
-    >
-      连接设备
-    </button>
-    <button
-      class="btn btn-sm"
-      title="检查设备抓包能力，实时采集 WebView 网络请求或导入 HAR"
-      @click="openNetworkPanel()"
-    >
-      网络抓包
-    </button>
     <button
       class="btn btn-primary btn-sm"
       :disabled="!!store.importTask"
@@ -83,5 +64,21 @@ const sourceTitle = computed(() => {
     >
       {{ store.importTask ? '导入中…' : '打开日志文件' }}
     </button>
+
+    <!--
+      Two symmetric shortcuts, each creating a workspace tab:
+      · 打开日志文件 → 本地文件工作区（多文件靠标签条切换）
+      · 设备        → 选择设备，创建设备工作区（抓日志 / 抓包 / 后续 adb 功能）
+    -->
+    <template v-if="store.tauriReady">
+      <div class="divider-v" />
+      <button
+        class="btn btn-sm"
+        title="选择一台 Android 设备，打开设备工作区（抓日志 / 抓包 / adb）"
+        @click="openDevicePicker"
+      >
+        设备
+      </button>
+    </template>
   </header>
 </template>

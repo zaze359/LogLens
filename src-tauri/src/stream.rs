@@ -202,20 +202,32 @@ fn spawn_reader(
         }
         let mut last_snapshot = Instant::now();
 
-        let reader = BufReader::with_capacity(64 * 1024, stdout);
+        let mut reader = BufReader::with_capacity(64 * 1024, stdout);
         let mut batch: Vec<LogEntry> = Vec::new();
         let mut since_flush = 0u32;
         let mut last_flush = Instant::now();
+        // Reused per line: `read_until` + `from_utf8_lossy` instead of `lines()`.
+        //
+        // `BufRead::lines()` fails the whole stream on the first invalid UTF-8 byte with
+        // "stream did not contain valid UTF-8". That is not a broken pipe — apps write raw
+        // bytes into logcat all the time (GBK text, protobuf blobs, binary `events`
+        // payloads), so a single such line killed a capture that was otherwise fine.
+        // Decode leniently: bad bytes become U+FFFD and the stream keeps going.
+        let mut raw: Vec<u8> = Vec::with_capacity(8 * 1024);
 
-        for line in reader.lines() {
-            let line = match line {
-                Ok(line) => line,
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw) {
+                Ok(0) => break, // EOF: adb exited or the device was unplugged
+                Ok(_) => {}
                 Err(e) => {
                     flush(&shared, &mut batch, parser.total_lines(), parser.unparsed_lines());
                     finish_with_error(&shared, format!("读取 adb 输出失败: {e}"));
                     return;
                 }
-            };
+            }
+            let line = decode_line(&raw);
+
             // Refresh before parsing, so the lines about to be read benefit from it. Only
             // runs while lines are arriving: a silent device needs no name resolution.
             if last_snapshot.elapsed() >= PS_REFRESH {
@@ -248,18 +260,41 @@ fn spawn_reader(
 
 fn spawn_stderr_reader(stderr: std::process::ChildStderr, shared: Arc<Mutex<StreamBuffer>>) {
     std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
+        let mut reader = BufReader::new(stderr);
         let mut text = String::new();
-        for line in reader.lines().map_while(Result::ok) {
+        let mut raw: Vec<u8> = Vec::with_capacity(512);
+        // Same reason as stdout: `lines()` would stop reading at the first invalid byte and
+        // leave the pipe unread, which can block the child process on a full buffer.
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
             if text.len() < 4000 {
-                text.push_str(&line);
-                text.push('\n');
+                text.push_str(&String::from_utf8_lossy(&raw));
             }
         }
         if let Ok(mut buffer) = shared.lock() {
             buffer.stderr = text;
         }
     });
+}
+
+/// 把一行原始字节解成文本：非法 UTF-8 字节替换成 U+FFFD，行尾的 CR/LF 去掉。
+///
+/// 单独抽出来是因为 `BufRead::lines()` 会在第一个非法字节上返回
+/// `stream did not contain valid UTF-8` 并让整个实时流停掉 —— 而 App 往 logcat 里写
+/// GBK 文本、protobuf 二进制、`events` 二进制 payload 都很常见，一行坏字节不该毁掉
+/// 整次抓取。
+fn decode_line(raw: &[u8]) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match String::from_utf8_lossy(raw) {
+        // 合法 UTF-8：借用原始缓冲区，不额外分配。
+        Cow::Borrowed(text) => Cow::Borrowed(text.trim_end_matches(['\n', '\r'])),
+        Cow::Owned(text) => Cow::Owned(text.trim_end_matches(['\n', '\r']).to_string()),
+    }
 }
 
 fn flush(shared: &Arc<Mutex<StreamBuffer>>, batch: &mut Vec<LogEntry>, lines: u32, unparsed: u32) {
@@ -288,6 +323,78 @@ fn finish_with_error(shared: &Arc<Mutex<StreamBuffer>>, error: String) {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// 一行坏字节不该毁掉整次抓取：这是「实时 logcat：读取 adb 输出失败: stream did not
+    /// contain valid UTF-8」的根因回归测试。
+    #[test]
+    fn invalid_utf8_lines_are_replaced_not_fatal() {
+        // 合法 UTF-8 + 行尾 CRLF：借原缓冲区，且 CR/LF 被去掉。
+        assert_eq!(decode_line(b"11-12 00:00:00.000  123  123 I Tag: hi\r\n"), "11-12 00:00:00.000  123  123 I Tag: hi");
+        assert_eq!(decode_line(b"no newline"), "no newline");
+
+        // 行首两个非法字节，后面是合法内容：坏字节变成 U+FFFD，正文保留。
+        let line = decode_line(&[0xff, 0xfe, b'o', b'k', b'\n']);
+        assert_eq!(line.chars().filter(|c| *c == '\u{fffd}').count(), 2);
+        assert!(line.ends_with("ok"), "合法部分必须保留: {line:?}");
+
+        // GBK「中文」的字节序列，整行非法：全部替换，不 panic、不返回错误。
+        let gbk = decode_line(&[0xd6, 0xd0, 0xce, 0xc4]);
+        assert_eq!(gbk.chars().count(), 4);
+        assert!(gbk.chars().all(|c| c == '\u{fffd}'));
+    }
+
+    /// 端到端回归：让一条真实管道吐出非法 UTF-8 字节，读线程必须继续往后读，
+    /// 而不是把 `stream did not contain valid UTF-8` 当致命错误终止整次抓取。
+    #[cfg(unix)]
+    #[test]
+    fn reader_survives_bytes_that_are_not_utf8() {
+        use std::process::{Command, Stdio};
+
+        // 第 1 行里嵌 GBK 字节（不是合法 UTF-8），第 2 行是正常文本。
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(concat!(
+                r"printf '11-12 00:00:00.000  42  42 I Tag: \xd6\xd0 ok\n';",
+                r"printf '11-12 00:00:00.001  42  42 I Tag: tail line\n'"
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("应能启动 sh");
+        let stdout = child.stdout.take().expect("stdout 应可读");
+
+        let shared = Arc::new(Mutex::new(StreamBuffer::default()));
+        // 快照留空：这个测试只关心解码容错，不需要 pid → 包名。
+        spawn_reader(
+            stdout,
+            shared.clone(),
+            std::path::PathBuf::from("adb"),
+            "test-serial".into(),
+            String::new(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if shared.lock().map(|b| b.finished).unwrap_or(true) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "读线程没有在 5 秒内读完管道");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
+
+        let buffer = shared.lock().unwrap();
+        assert!(
+            buffer.error.is_empty(),
+            "非法 UTF-8 不应变成致命错误: {}",
+            buffer.error
+        );
+        assert_eq!(buffer.total_lines, 2, "两行都应被读到");
+        assert!(
+            buffer.pending.iter().any(|e| e.message.contains("tail line")),
+            "坏字节之后的行必须仍然读得到"
+        );
+    }
 
     fn attached_device() -> (std::path::PathBuf, String) {
         let adb_path = crate::adb::locate().expect("应找到 adb");
