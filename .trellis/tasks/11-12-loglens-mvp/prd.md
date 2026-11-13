@@ -56,6 +56,10 @@ Zhao Zhen asked for a client that analyses various collected logs:
 - Custom rules + categories persisted locally, importable/exportable as JSON.
 - Filtered results exportable as plain text.
 - Usable with large single files (virtual scrolling + backend paging + match cache).
+- **Search vs. filter**: one keyword box with two modes. `筛选` narrows the result set like
+  every other quick filter; `查找` leaves it untouched and only reports where the term appears
+  (`3 / 27`, highlight, Enter / Shift+Enter to jump). Clearing the filters keeps a find term
+  and its mode, because finding is not a filter.
 - **Full lines in the list**: the message column widens to the longest first line in the
   result set and the table scrolls horizontally, so a long line can be read without opening
   the detail drawer. Rows stay one line tall (fixed height is what keeps virtual scrolling
@@ -131,6 +135,10 @@ Zhao Zhen asked for a client that analyses various collected logs:
 23. A log containing a very long single line (600+ characters) shows it in full: the table
     gains a horizontal scrollbar, the end of the line is reachable, the header scrolls with
     the rows, and short logs still show no horizontal scrollbar.
+24. Typing a term in `筛选` mode narrows the list and the matched count; switching to `查找`
+    restores the unfiltered-by-term list, shows `n / total`, and Enter / Shift+Enter move the
+    highlight without changing either list or counts. "清空筛选" keeps the find term, its mode
+    and its counter.
 
 ## Constraints
 

@@ -157,6 +157,20 @@
       so it is translated by `-scrollLeft` to stay above its columns. Verified the layout in a
       headless browser against an equivalent static page: `scrollWidth` 5253 vs `clientWidth`
       1200, and at max scroll the JSON tail (`"appVersion":"4.2.1"}`) is fully visible.
+- [x] **Search split from filtering (user: "搜索和过滤应该区分开，现在搜索包含了筛选"，细化后
+      "若是按消息筛选，那就是需要过滤…若是纯粹为了搜索查找，应该只是高亮")**: `search` used to be
+      one more quick filter AND-ed into `compute_matches`, so a find term narrowed the list and
+      "清空筛选" wiped it. Now `FilterSpec.searchMode` decides: `filter` keeps the old behaviour,
+      `find` is skipped entirely by `QuickFilter::compile` (no regex compiled, no match branch)
+      so `query_logs` / `export_filtered` are untouched by construction. A new `search_hits`
+      command returns positions inside the cached matched set, capped at 5000 with an exact
+      `total`; it scans `message` (stack lines included) because hits in the timestamp/tag
+      prefix could not be highlighted. The cache key drops the term in `find` mode, otherwise
+      every keystroke added another cached match list. UI: a 筛选/查找 segmented toggle, `n / 总`
+      counter, ↑↓ and Enter / Shift+Enter jump; the jumped row gets a left marker. Cursor is
+      preserved on refreshes triggered by filters or live appends (auto-jump only while typing),
+      or streaming would drag the viewport back to hit 1 every 800ms. Jumping first loads the
+      page containing the hit (`ensureIndexLoaded`), since only loaded pages are rendered.
 - [x] **Two bugs caught by measuring instead of assuming**: (a) `since_report` was never reset,
       so after the first 4096 lines the progress callback fired on *every* line — 296k
       callbacks for a 300k-line file; (b) the parse looked like 24k lines/s until I noticed
@@ -202,6 +216,8 @@ npm run tauri build               # run on macOS and Windows separately
 | `cd src-tauri && cargo build` + `npm run build` (after import progress) | PASS — zero warnings; `index-DB7hAwB8.js` 150.71 kB, `index-hDeLLhey.css` 17.22 kB |
 | Release parse benchmark (29 MB / 300 420 lines) | PASS — 1.03s, ~293k lines/s, 74 progress callbacks (dev profile: 12.6s) |
 | `npm run build` (after full-line display) | PASS — `index-DR3_n2fk.js` 151.44 kB, `index-B5DnUQsy.css` 17.34 kB |
+| `cd src-tauri && cargo test --lib` (after search/filter split) | PASS — 47 passed, 6 ignored, 0 failed; new coverage: find reports positions without narrowing, filter mode still narrows, hit list capped while `total` stays exact, stack lines are searched, empty term rejected, unknown `searchMode` falls back to filtering |
+| `npm run build` (after search/filter split) | PASS — `index-DMA6r5G6.js` 155.20 kB, `index-pBSiuOwp.css` 18.11 kB |
 | Headless browser layout check of the table (Edge, 1200px viewport, page mirroring `--msg-w` + header transform) | PASS — `scrollWidth` 5253 / `clientWidth` 1200 (horizontal scroll present), header labels aligned with data columns, line tail reachable at max scroll |
 
 Environment: macOS arm64, Node v24.14.0, npm 11.9.0, rustc/cargo 1.99.1, rustup 1.29.3,
