@@ -5,7 +5,7 @@
 //! large result set does not re-evaluate the rules.
 
 use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult, SearchHits};
-use crate::netcapture::{NetworkCapture, ProxyGuard};
+use crate::netcapture::{AnyCapture, ProxyGuard};
 use crate::network::NetworkRequest;
 use crate::rules::{compute_matches, CompiledFilter, TextMatcher};
 use crate::stream::DeviceStream;
@@ -182,7 +182,7 @@ pub struct AppState {
     /// Live captures, keyed by the session they append to.
     pub streams: Mutex<HashMap<String, DeviceStream>>,
     /// Live CDP captures and their collected requests.
-    pub network_captures: Mutex<HashMap<String, NetworkCapture>>,
+    pub network_captures: Mutex<HashMap<String, AnyCapture>>,
     pub network_sessions: Mutex<HashMap<String, NetworkSession>>,
     /// One proxy guard per device. Dropping the guard restores the previous setting.
     pub proxy_guards: Mutex<HashMap<String, ProxyGuard>>,
@@ -216,19 +216,30 @@ impl AppState {
     /// is destroyed: an `adb logcat` child, a CDP forward or a lingering global proxy
     /// must not outlive the app — the last one would leave the phone offline.
     pub fn stop_all_streams(&self) {
-        if let Ok(mut streams) = self.streams.lock() {
-            for (_, mut stream) in streams.drain() {
-                stream.stop();
-            }
+        // A poisoned lock must NOT stop cleanup: leaving the device pointing at a
+        // dead proxy is far worse than a panicked worker thread.
+        let mut streams = self.streams.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, mut stream) in streams.drain() {
+            stream.stop();
         }
-        if let Ok(mut captures) = self.network_captures.lock() {
-            for (_, mut capture) in captures.drain() {
-                capture.stop();
-            }
+        let mut captures = self
+            .network_captures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (_, mut capture) in captures.drain() {
+            capture.stop();
         }
-        if let Ok(mut guards) = self.proxy_guards.lock() {
-            guards.clear(); // ProxyGuard::drop restores the original value
-        }
+        let mut guards = self.proxy_guards.lock().unwrap_or_else(|p| p.into_inner());
+        guards.clear(); // ProxyGuard::drop restores the original proxy
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        // Last line of defence for a graceful shutdown that bypassed the window
+        // events. A kill -9 still skips this; `heal_stale_proxies()` on the next
+        // launch is what actually guarantees the device is never left offline.
+        self.stop_all_streams();
     }
 }
 

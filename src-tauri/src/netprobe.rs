@@ -78,6 +78,9 @@ pub struct ProbeReport {
     pub routes: Vec<CaptureRoute>,
     pub recommended: String,
     pub summary: String,
+    /// Non-empty when this probe automatically undid a proxy left by an earlier run.
+    #[serde(default)]
+    pub healed_proxy: String,
 }
 
 fn props_script() -> &'static str {
@@ -168,10 +171,59 @@ pub fn parse_devtools_sockets(text: &str) -> Vec<(u32, String)> {
 
 pub fn parse_proxy(text: &str) -> String {
     let value = text.trim();
-    if value.is_empty() || value == "null" || value == "0.0.0.0:0" {
+    // `:0` is Android's standard "no proxy" value. We write it explicitly when
+    // restoring (see restore_script), so it must read back as "no proxy" too.
+    if value.is_empty() || value == "null" || value == ":0" || value == "0.0.0.0:0" {
         String::new()
     } else {
         value.to_string()
+    }
+}
+
+/// AOSP splits `settings put global http_proxy <host>:<port>` into these keys, and
+/// `settings delete global http_proxy` does **not** remove the split ones — verified on
+/// an Android 15 tablet, where the device kept a dead proxy after the capture ended.
+/// Any code that sets or restores a proxy must handle the whole set.
+pub const PROXY_KEYS: &[&str] = &[
+    "http_proxy",
+    "global_http_proxy_host",
+    "global_http_proxy_port",
+    "global_http_proxy_exclusion_list",
+    "global_proxy_pac_url",
+];
+
+pub fn proxy_settings_script() -> String {
+    PROXY_KEYS
+        .iter()
+        .map(|key| format!("echo {key}=$(settings get global {key})"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+pub fn parse_proxy_settings(text: &str) -> HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.trim().split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), parse_proxy(value)))
+        .collect()
+}
+
+/// Human-readable current proxy, whether stored as `http_proxy` or as split host/port.
+pub fn proxy_from_settings(text: &str) -> String {
+    let values = parse_proxy_settings(text);
+    if let Some(direct) = values.get("http_proxy") {
+        if !direct.is_empty() {
+            return direct.clone();
+        }
+    }
+    let host = values.get("global_http_proxy_host").cloned().unwrap_or_default();
+    if host.is_empty() {
+        return String::new();
+    }
+    let port = values.get("global_http_proxy_port").cloned().unwrap_or_default();
+    if port.is_empty() {
+        host
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -300,7 +352,7 @@ pub fn assess(evidence: &DeviceEvidence) -> (Vec<CaptureRoute>, String, String) 
 pub fn probe(adb_path: &Path, serial: &str, packages: &[String]) -> Result<ProbeReport, String> {
     let props = parse_labeled(&adb::shell_probe(adb_path, serial, props_script()));
     let root = adb::shell_probe(adb_path, serial, "su -c id");
-    let proxy = adb::shell_probe(adb_path, serial, "settings get global http_proxy");
+    let proxy = adb::shell_probe(adb_path, serial, &proxy_settings_script());
 
     let mut probed = Vec::new();
     for package in packages {
@@ -353,7 +405,7 @@ pub fn probe(adb_path: &Path, serial: &str, packages: &[String]) -> Result<Probe
         debuggable_build: props.get("DBG").map(|s| s == "1").unwrap_or(false),
         root_shell: root.contains("uid=0"),
         adb_root_likely: secure == "0",
-        proxy: parse_proxy(&proxy),
+        proxy: proxy_from_settings(&proxy),
         packages: probed,
         devtools,
     };
@@ -363,12 +415,31 @@ pub fn probe(adb_path: &Path, serial: &str, packages: &[String]) -> Result<Probe
         routes,
         recommended,
         summary,
+        healed_proxy: String::new(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_split_proxy_keys_android_actually_writes() {
+        let text = "http_proxy=null\n\
+                    global_http_proxy_host=172.21.33.28\n\
+                    global_http_proxy_port=18999\n\
+                    global_http_proxy_exclusion_list=null\n\
+                    global_proxy_pac_url=null\n";
+        let values = parse_proxy_settings(text);
+        assert_eq!(values["global_http_proxy_host"], "172.21.33.28");
+        assert_eq!(values["http_proxy"], "");
+        assert_eq!(proxy_from_settings(text), "172.21.33.28:18999");
+        assert!(proxy_settings_script().contains("global_http_proxy_port"));
+        assert_eq!(
+            proxy_from_settings("http_proxy=null\nglobal_http_proxy_host=null"),
+            ""
+        );
+    }
 
     #[test]
     fn parses_props_packages_and_dumpsys() {

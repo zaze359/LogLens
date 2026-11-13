@@ -255,6 +255,14 @@ pub struct CdpCaptureOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
+pub struct ProxyCaptureOptions {
+    pub serial: String,
+    /// Local TCP port for the built-in proxy. 0 = pick the default.
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
 pub struct NetworkSessionInfo {
     pub id: String,
     pub label: String,

@@ -523,6 +523,7 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
   line-height: 1.65;
 }
 .probe-summary p { margin: 6px 0 0; }
+.probe-summary p.probe-healed { color: var(--ok); font-size: 12px; }
 .probe-summary-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; }
 .probe-badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
 .probe-badge.ok { color: var(--ok); border-color: rgba(52, 211, 153, .45); background: rgba(52, 211, 153, .1); }
@@ -573,3 +574,14 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .net-advanced { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 8px; }
 .net-advanced-body { margin-top: 8px; }
 .net-advanced input { min-width: 180px; }
+
+.net-native-note {
+  border: 1px solid var(--border); border-left: 3px solid var(--warning);
+  background: var(--bg-1); border-radius: 8px; padding: 8px 11px;
+  margin: 0 0 10px; font-size: 12px; line-height: 1.65; color: var(--text-dim);
+}
+.net-native-note b { color: var(--text); font-weight: 500; }
+.net-tunnel { color: var(--text-dim); }
+.net-source { font-size: 10px; padding: 1px 5px; border-radius: 7px; background: var(--bg-3); color: var(--text-dim); }
+.net-source.cdp { color: var(--ok); background: rgba(52, 211, 153, .12); }
+.net-source.proxy { color: var(--accent); background: var(--accent-soft); }

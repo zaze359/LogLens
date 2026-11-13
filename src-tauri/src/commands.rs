@@ -7,15 +7,16 @@ use crate::config_store::{self, RulesView};
 use crate::logcat::{self, LogcatParser, ParseOutcome};
 use crate::model::{
     CdpCaptureOptions, DeviceCaptureOptions, FileInfo, FilterSpec, LogEntry, NetworkPollResult,
-    NetworkSessionInfo, OpenProgress, ProxyState, QueryResult, Rule, RuleCategory, SearchHits,
-    StreamStatus,
+    NetworkSessionInfo, OpenProgress, ProxyCaptureOptions, ProxyState, QueryResult, Rule,
+    RuleCategory, SearchHits, StreamStatus,
 };
 use crate::rules::CompiledFilter;
 use crate::session::{AppState, LogSession, NetworkSession};
 use crate::stream::DeviceStream;
 use crate::{
-    netcapture::{self, NetworkCapture, ProxyGuard},
+    netcapture::{self, AnyCapture, NetworkCapture, ProxyGuard},
     netprobe, network,
+    proxy::ProxyCapture,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -726,6 +727,9 @@ pub fn import_rules_json(app: AppHandle, json: String) -> Result<RulesView, Stri
 /// Default local port for a CDP capture. Different from `netprobe::PROBE_PORT` so a
 /// one-shot capability probe never steals the port of a running capture.
 const CDP_PORT: u16 = 19333;
+/// Built-in proxy port. Distinct from CDP_PORT and netprobe::PROBE_PORT so the three
+/// channels can run at the same time without stealing each other's local port.
+const PROXY_PORT: u16 = 18999;
 
 fn require_adb() -> Result<std::path::PathBuf, String> {
     adb::locate().ok_or_else(|| adb::NOT_FOUND.to_string())
@@ -757,7 +761,12 @@ pub fn probe_network_capture(
     packages: Vec<String>,
 ) -> Result<netprobe::ProbeReport, String> {
     let adb_path = require_adb()?;
-    netprobe::probe(&adb_path, serial.trim(), &packages)
+    // Re-running a probe also heals a proxy left by a previous run, so reopening
+    // the panel recovers the device without needing an app restart.
+    let healed = netcapture::heal_stale_proxies();
+    let mut report = netprobe::probe(&adb_path, serial.trim(), &packages)?;
+    report.healed_proxy = healed;
+    Ok(report)
 }
 
 #[tauri::command]
@@ -818,7 +827,74 @@ pub fn start_cdp_capture(
         .network_captures
         .lock()
         .map_err(|e| format!("状态锁异常: {e}"))?
-        .insert(id, capture);
+        .insert(id, AnyCapture::Cdp(capture));
+    Ok(info)
+}
+
+/// Start the built-in proxy for native (OkHttp / Cronet / system) traffic.
+///
+/// The device proxy is set only after the listener is ready, and the returned capture
+/// owns the [`ProxyGuard`]: stopping it (or closing the window) restores the original
+/// setting, so a crash cannot leave the phone offline.
+#[tauri::command]
+pub fn start_proxy_capture(
+    options: ProxyCaptureOptions,
+    state: State<'_, AppState>,
+) -> Result<NetworkSessionInfo, String> {
+    let serial = options.serial.trim().to_string();
+    if serial.is_empty() {
+        return Err("请先选择一台已授权的设备".to_string());
+    }
+    let adb_path = require_adb()?;
+    let port = if options.port == 0 { PROXY_PORT } else { options.port };
+
+    {
+        let guards = state
+            .proxy_guards
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        if guards.contains_key(&serial) {
+            return Err("该设备已有手动设置的代理。请先在「MITM 代理设置」里点「还原」，再开始原生接口采集。".to_string());
+        }
+        let captures = state
+            .network_captures
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        if captures.values().any(|c| c.serial() == serial && c.is_proxy()) {
+            return Err("该设备的原生接口采集已经在运行".to_string());
+        }
+    }
+
+    let id = format!("net-{}", state.next_id());
+    let capture = ProxyCapture::start(
+        &adb_path,
+        &serial,
+        port,
+        netcapture::device_tz_offset(&adb_path, &serial),
+        id.clone(),
+    )?;
+    let endpoint = capture.info().endpoint.clone();
+    let session = NetworkSession {
+        requests: Vec::new(),
+        label: format!("{} · 原生接口", device_label(&serial)),
+        source: "proxy".to_string(),
+        device: serial,
+        streaming: true,
+    };
+    let info = NetworkSessionInfo {
+        label: format!("{}（{}）", session.label, endpoint),
+        ..network_info(&id, &session)
+    };
+    state
+        .network_sessions
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?
+        .insert(id.clone(), session);
+    state
+        .network_captures
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?
+        .insert(id, AnyCapture::Proxy(capture));
     Ok(info)
 }
 
@@ -975,13 +1051,49 @@ pub fn restore_device_proxy(
     state: State<'_, AppState>,
 ) -> Result<ProxyState, String> {
     let serial = serial.trim().to_string();
-    let mut guards = state
-        .proxy_guards
-        .lock()
-        .map_err(|e| format!("状态锁异常: {e}"))?;
-    if let Some(mut guard) = guards.remove(&serial) {
-        guard.restore()?;
+    let adb_path = require_adb()?;
+    let mut had_guard = false;
+    {
+        let mut guards = state
+            .proxy_guards
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        if let Some(mut guard) = guards.remove(&serial) {
+            had_guard = true;
+            guard.restore()?;
+        }
     }
+    if had_guard {
+        return Ok(ProxyState {
+            serial,
+            ..Default::default()
+        });
+    }
+
+    // No in-memory guard: this is the "app was killed / crashed / cable pulled"
+    // case. Fall back to the on-disk journal, then to any proxy still pointing at
+    // this machine. Never delete a proxy the user configured on the device.
+    let marker = netcapture::take_proxy_marker(&serial);
+    let current = adb::shell_probe(&adb_path, &serial, &netprobe::proxy_settings_script());
+    let current_proxy = netprobe::proxy_from_settings(&current);
+    if !current_proxy.is_empty() {
+        let ours = marker
+            .as_ref()
+            .map(|m| m.applied == current_proxy)
+            .unwrap_or(false)
+            || netcapture::proxy_points_to_this_machine(&current_proxy);
+        if !ours {
+            return Err(format!(
+                "设备当前代理 {current_proxy} 不是本应用设置的，未改动。如需清除请在 系统设置 → WLAN 中手动修改。"
+            ));
+        }
+    }
+    // Always run the restore, even when Settings reads clean: on Android 15 the
+    // effective proxy can survive a clean-looking `settings delete`, and only an
+    // explicit `:0` makes the system stop handing it to newly started apps.
+    let original = marker.map(|m| m.original).unwrap_or_default();
+    netcapture::restore_proxy_settings(&adb_path, &serial, &original)?;
+    netcapture::clear_proxy_marker(&serial);
     Ok(ProxyState {
         serial,
         ..Default::default()

@@ -57,7 +57,8 @@
 │       ├── network.rs            # 网络请求模型、HAR / JSONL 解析、敏感字段脱敏
 │       ├── cdp.rs                # 零依赖 HTTP/1.1 + WebSocket CDP 客户端、Network.* 事件组装
 │       ├── netprobe.rs           # 设备抓包能力体检与四条路线评估
-│       ├── netcapture.rs         # CDP 实时采集线程、设备代理 ProxyGuard（自动还原）
+│       ├── netcapture.rs         # CDP 实时采集线程、代理 ProxyGuard（自动还原）、统一采集抽象 AnyCapture
+│       ├── proxy.rs              # 内建 HTTP/CONNECT 代理：明文 HTTP 记录、HTTPS 隧道 + SNI
 │       ├── session.rs            # 日志会话、网络请求会话、分页查询、命中索引缓存
 │       ├── config_store.rs       # 自定义规则持久化
 │       ├── commands.rs           # Tauri IPC 命令
@@ -219,30 +220,51 @@ npm run tauri build
 
 > adb 本身没有「网络请求」这层语义，只有 logcat 文本、shell 命令和端口转发。所有抓包方案都是这三样的组合。这一节的能力全部建立在**不修改被测 App** 的前提上。
 
-面板打开时先做一次**只读环境体检**（`getprop` / `su -c id` / `dumpsys package` / `settings get global http_proxy` / `/proc/net/unix`），再给出四条路线的可用性与推荐顺序：
+面板打开时先做一次**只读环境体检**（`getprop` / `su -c id` / `dumpsys package` / 全部代理相关 `settings` 键 / `/proc/net/unix`），再给出四条路线的可用性与推荐顺序：
 
 | 路线 | HTTPS 明文 | 覆盖面 | 前提 |
 | --- | --- | --- | --- |
 | `cdp` WebView 调试通道 | ✅ | WebView 内的 H5 / 混合页面 | 设备上有 `webview_devtools_remote_<pid>` socket |
 | `mitm-root` MITM + 系统证书 | ✅ | 全设备，含原生 OkHttp | 可 root / 非生产构建 |
 | `mitm-debug` MITM + 用户证书 | ⚠️ 条件成立才有 | 取决于 APK 是否声明 `debug-overrides` | 目标包 debuggable |
-| `proxy-metadata` 代理元数据 | ❌ | 明文 HTTP + HTTPS 的 CONNECT 域名、耗时、失败原因 | 无条件 |
+| `proxy-metadata` 代理元数据 | ❌ | 明文 HTTP 全文 + HTTPS 的 CONNECT 域名、TLS SNI、耗时、字节数、失败原因 | 无条件，**已内建** |
 
 **为什么 CDP 是首选**：Android 允许 debuggable App 在 `user` 构建上保留 WebView 调试，此时 `adb forward tcp:<port> localabstract:webview_devtools_remote_<pid>` + `Network.enable` 就能读到 WebView 里 HTTPS 的**明文 URL、请求头、请求体、响应头、状态码和耗时**——不需要 root、不需要装 CA、不需要改 App。实现是零新增依赖的手写 HTTP/1.1 + WebSocket 客户端（`cdp.rs`）；注意 Android 的 devtools HTTP 服务**会静默丢弃 HTTP/1.0 请求**，必须用 1.1。
 
 局限：CDP 只看得到 WebView 发出的请求，原生接口走不到这个通道；响应体需要额外的 `Network.getResponseBody` 请求，当前版本只采集响应头与大小。App 没打开 H5 页面时 `/json/list` 为空，面板会提示先在 App 里进入一个页面。
 
-**原生接口与第三方工具结果**走导入：`导入 HAR / JSONL` 支持 HAR 1.2（Charles / Fiddler / DevTools / mitmproxy `har_dump.py`）和一行一个请求的 JSONL。仓库自带 `scripts/mitmproxy_jsonl.py`：
+#### 原生接口：内建 HTTP/CONNECT 代理
+
+点「开始原生采集」会在本机起一个零新增依赖的代理（默认 `18999` 端口，绑定本机 LAN IP），并临时把设备全局代理指向它。**H5 采集与原生采集可以同时开**，两个通道的请求按 `timeKey` 合并到同一张表，「来源」列区分 `H5` / `原生` / `文件`，方便和 logcat 时间轴对照。
+
+| 流量 | 能拿到什么 |
+| --- | --- |
+| 明文 HTTP | 完整请求行、请求头、请求体、响应头、响应体、状态码、耗时、大小 |
+| HTTPS | `CONNECT` 目标域名、TLS ClientHello 里的 **SNI**、连接耗时、上下行字节数、失败原因；隧道原样透传，**不解密** |
+
+**为什么不解密原生 HTTPS**：Android 7+（targetSdk ≥ 24）默认不信任用户安装的 CA；真机上目标包的 `network_security_config.xml` 只有 `<base-config cleartextTrafficPermitted="true"/>`，**没有 `<debug-overrides>` 放行用户 CA**，且 dex 里能查到 `CertificatePinner` 调用痕迹。设备是 `user` 构建、无 `su`、`adb root` 被拒、系统 CA 位于只读的 APEX conscrypt 内——在「不改 App、不 root、不装 CA」的前提下 MITM 走不通，所以这里明确只做元数据，不把「看见域名」伪装成「看见明文」。反过来，`cleartextTrafficPermitted=true` 让明文 HTTP 能拿到完整内容。
+
+- **代理安全**：绑定本机 LAN IP，只放行配对设备 IP、本机 LAN IP 与回环地址，同网段其他人借不了道；设置前记录原值，停止采集 / 关闭面板 / 退出应用（`ProxyGuard::drop`）都会还原。同一设备只允许一个原生采集（全局代理只有一个），H5 采集可与它并行。
+- **AOSP 拆键陷阱**：`settings put global http_proxy <host>:<port>` 在真机上会被拆成 `global_http_proxy_host` / `global_http_proxy_port` 存储，只 `settings delete global http_proxy` **清不干净**，会残留一个指向已停监听的死代理，让设备断网。因此还原时把 `http_proxy`、`global_http_proxy_host`、`global_http_proxy_port`、`global_http_proxy_exclusion_list`、`global_proxy_pac_url` 全部删除后再恢复原值，体检也读全套键。
+- **「看着干净」不等于「真的清了」（Android 15 实测）**：`settings delete global http_proxy` 之后 Settings 里读不到任何代理，但 `ConnectivityService` 持有的 Java 层 `http.proxyHost`（由 Zygote 继承）可能仍下发给**新启动**的 App 进程，表现为 `failed to connect to /172.21.33.28 (port 18999)`；force-stop 后重开 App 也一样。因此还原脚本删完所有键后会**显式写入 Android 标准无代理值 `settings put global http_proxy :0`**，触发真正的刷新，`:0` 也按「无代理」解析。**验证是否恢复要看 App 的实际请求日志，不能只看 `settings` 无输出。**
+- **崩溃安全（关键）**：设备全局代理是**持久设置**，桌面进程却是易失的——Cmd+Q、强杀、崩溃、先拔线再退出都可能跳过全部析构函数，设备会一直指向已停监听的端口，表现为 `failed to connect to /172.21.33.28 (port 18999)`。所以每次设置成功后都会把「设备 serial + adb 路径 + 原值」写入 `~/Library/Application Support/com.zaze.loglens/proxy-state.json`（Windows 为 `%APPDATA%\com.zaze.loglens\`），还原成功才删除；**应用启动和每次环境体检都会读这份记录自动清理残留**（面板会显示「已自动修复设备代理」）。设备离线时保留记录，等重新连上再清；代理若已被其他程序改写则保持原样，绝不误删用户自己配置的代理。
+- **手动兜底**：即使内存里的 guard 已随上次进程消失，面板「还原」仍会按记录恢复原值，并清理仍指向本机的死代理；指向其他主机的代理会明确报错且不改动。
+- 部分厂商 ROM 忽略 `settings put global http_proxy`，设置后会读回校验并明确报错，而不是假装成功。
+
+#### 导入第三方工具结果
+
+`导入 HAR / JSONL` 支持 HAR 1.2（Charles / Fiddler / DevTools / mitmproxy `har_dump.py`）和一行一个请求的 JSONL。仓库自带 `scripts/mitmproxy_jsonl.py`：
 
 ```bash
 LOGLENS_JSONL=~/capture.jsonl mitmdump -s scripts/mitmproxy_jsonl.py -p 8080
-# 在面板「MITM 代理设置」里填 <本机IP>:8080 → 复现问题 → 导入 capture.jsonl
+# 在面板「外部抓包工具」里填 <本机IP>:8080 → 复现问题 → 导入 capture.jsonl
 ```
 
-- **代理安全**：设置全局代理前会记录原值，点「还原」、关闭面板、退出应用（含 `ProxyGuard::drop`）都会恢复；部分厂商 ROM 忽略 `settings put global http_proxy`，设置后会读回校验并明确报错，而不是假装成功。
+需要原生 HTTPS 明文时只能走外部 MITM（可 root 装系统证书，或目标 APK 带 `debug-overrides`）；这一入口与内建原生采集互斥，避免两个代理互相打架。
+
 - **Android 7+ 的硬门槛**：targetSdk ≥ 24 的 App 默认不信任用户安装的 CA，`DEBUGGABLE` 本身**不**等于放行；有证书固定时即使放行也失败。所以体检不会把 `mitm-debug` 标成「可看明文」。
 - **脱敏**：token / Cookie / Authorization / 密码等字段在**导入或采集落地时**就被替换（`network.rs::redact`），不会进入会话、缓存或导出文件；URL query 里的 token 同样处理。
-- **清理**：CDP 的 `adb forward` 由采集线程在停止 / 异常 / 窗口关闭时移除，不会留下占用端口。
+- **清理**：CDP 的 `adb forward` 由采集线程在停止 / 异常 / 窗口关闭时移除；内建代理停止时同步关闭监听并还原设备代理，不会留下占用端口或死代理。
 
 ---
 
@@ -525,3 +547,12 @@ npm run tauri dev
 29. 「筛选」模式下输入关键字：列表只剩匹配的行，状态栏「命中」随之减少；切到「查找」：列表恢复成筛选后的全量，出现 `3 / 27` 与 ↑ ↓，Enter 跳下一条、Shift+Enter 上一条，跳到的行有左侧黄色标记并滚动到视口中间。
 30. 查找模式下点「清空筛选」：级别 / 包名 / Tag / 时间被清空，但关键字和查找模式保留，计数仍然显示；点「筛选」切回去，同一个关键字立刻收窄列表。
 31. 查找正则时列表不变、计数正确；正则写错时搜索框旁显示红色错误而不是整个列表报错。
+
+设备网络请求抓包：
+
+32. 点顶栏「网络抓包」：体检报告列出设备型号、Android 版本、root 状态与四条路线；锁定设备上推荐应为 `cdp`（有 WebView 调试 socket 时），且 `mitm-debug` 不应被标成「可看明文」。
+33. 点「开始 WebView 采集」后，在手机上打开一个 H5 页面：请求表出现 `H5` 来源的行，含方法、状态码、耗时、URL；没打开页面时应提示先进页面，而不是一片空白。
+34. 点「开始原生采集」：状态行显示代理端点；触发一次明文 HTTP 请求后，表中出现 `原生` 来源的完整请求 / 响应；HTTPS 行显示 `HTTPS 隧道（未解密）` 与 SNI，不算失败。
+35. H5 与原生采集同时开启时，两类请求按时间混排在同一张表，「来源」列可区分；点任一行能看到请求头 / 响应头，敏感字段显示为脱敏值。
+36. 点「停止采集」后 `adb shell "settings list global | grep -i proxy"` 应为 `http_proxy=:0`（或无输出），`lsof -nP -iTCP:18999` 无监听；**在平板上重新打开被测 App 触发一次请求，logcat 里不应再出现 `18999` / `ConnectException`**。只看 Settings 无输出不足以证明恢复——Java 层代理属性可能仍在生效。
+37. 模拟异常退出：开始原生采集后直接强杀应用（或先拔线再退出），重新打开客户端、或点一次「环境体检」，设备代理应被自动清除，面板显示「已自动修复设备代理」；`adb shell "settings get global http_proxy"` 返回 `:0`，设备恢复上网，重开被测 App 后请求成功。若设备当时不在线，重新连上后再打开面板应完成清理，期间不会出现 `failed to connect to /172.21.33.28 (port 18999)`。

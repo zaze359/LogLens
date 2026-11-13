@@ -295,12 +295,20 @@ export interface ProbeReport {
   routes: CaptureRoute[]
   recommended: string
   summary: string
+  /** 非空表示本次体检自动清理了上一次运行残留的设备代理 */
+  healedProxy: string
 }
 
 export interface CdpCaptureOptions {
   serial: string
   /** 留空则自动用体检找到的第一个 WebView 调试通道 */
   socket: string
+  /** 0 = 用默认端口 */
+  port: number
+}
+
+export interface ProxyCaptureOptions {
+  serial: string
   /** 0 = 用默认端口 */
   port: number
 }

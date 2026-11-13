@@ -8,12 +8,13 @@ mod model;
 mod netcapture;
 mod netprobe;
 mod network;
+mod proxy;
 mod rules;
 mod session;
 mod stream;
 
 use session::AppState;
-use tauri::Manager;
+use tauri::{Manager, RunEvent, WindowEvent};
 
 pub fn run() {
     tauri::Builder::default()
@@ -45,6 +46,7 @@ pub fn run() {
             commands::list_capture_packages,
             commands::probe_network_capture,
             commands::start_cdp_capture,
+            commands::start_proxy_capture,
             commands::poll_network_capture,
             commands::query_network_requests,
             commands::stop_network_capture,
@@ -53,12 +55,31 @@ pub fn run() {
             commands::configure_device_proxy,
             commands::restore_device_proxy
         ])
-        // A live `adb logcat` child must not outlive the window.
+        // A device-wide global proxy is persistent while this process is not. Clean
+        // up on *every* shutdown path, not just the one Tauri happens to deliver.
+        .setup(|_app| {
+            let healed = netcapture::heal_stale_proxies();
+            if !healed.is_empty() {
+                eprintln!("[proxy] 启动自愈: {healed}");
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
+            // `Destroyed` alone is not enough: on Cmd+Q / main-window close Tauri 2
+            // can go straight to RunEvent::Exit, and a forced quit runs no hook at
+            // all. The on-disk proxy journal covers that last case on next launch.
+            if matches!(
+                event,
+                WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+            ) {
                 window.state::<AppState>().stop_all_streams();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                app.state::<AppState>().stop_all_streams();
+            }
+        });
 }

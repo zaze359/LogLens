@@ -21,9 +21,11 @@ const probing = ref(false)
 const busy = ref(false)
 const error = ref('')
 
+/** WebView and native captures may run together and are merged into one request table. */
+const captures = ref<NetworkSessionInfo[]>([])
+const statuses = ref<Record<string, NetworkCaptureStatus>>({})
 const requests = ref<NetworkRequest[]>([])
-const captureInfo = ref<NetworkSessionInfo | null>(null)
-const captureStatus = ref<NetworkCaptureStatus | null>(null)
+const fileMode = ref(false)
 const selected = ref<NetworkRequest | null>(null)
 
 const proxyInput = ref('')
@@ -35,8 +37,27 @@ let timer: ReturnType<typeof setInterval> | null = null
 const readyDevices = computed(() => devices.value.filter((d) => d.state === 'device'))
 const cdpSocket = computed(() => report.value?.evidence.devtools[0]?.socket ?? '')
 const canProbe = computed(() => !!status.value?.available && !!serial.value && !probing.value)
+const cdpRunning = computed(() =>
+  captures.value.some((c) => c.source === 'cdp' && statuses.value[c.id]?.running)
+)
+const proxyRunning = computed(() =>
+  captures.value.some((c) => c.source === 'proxy' && statuses.value[c.id]?.running)
+)
+const running = computed(() => Object.values(statuses.value).some((s) => s.running))
+const events = computed(() =>
+  Object.values(statuses.value).reduce((sum, s) => sum + s.events, 0)
+)
+const targets = computed(() =>
+  Object.values(statuses.value)
+    .map((s) => s.target)
+    .filter(Boolean)
+    .join(' · ')
+)
 const canStartCdp = computed(
-  () => !!serial.value && !!cdpSocket.value && !captureStatus.value?.running && !busy.value
+  () => !!serial.value && !!cdpSocket.value && !cdpRunning.value && !busy.value
+)
+const canStartProxy = computed(
+  () => !!serial.value && !proxyRunning.value && !busy.value && !proxyState.value?.active
 )
 
 function formatSize(bytes: number): string {
@@ -45,11 +66,22 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024).toFixed(1)} KB`
 }
 
+function statusText(row: NetworkRequest): string {
+  return String(row.status || row.error || row.statusText || '—')
+}
+
 function statusClass(row: NetworkRequest): string {
   if (row.error) return 'net-fail'
+  if (row.method === 'CONNECT' && row.status === 0) return 'net-tunnel'
   if (row.status >= 400) return 'net-error'
   if (row.status >= 300) return 'net-redirect'
   return 'net-ok'
+}
+
+function sourceLabel(row: NetworkRequest): string {
+  if (row.source === 'cdp') return 'H5'
+  if (row.source === 'proxy') return '原生'
+  return '文件'
 }
 
 async function refreshDevices(): Promise<void> {
@@ -93,32 +125,42 @@ function stopPolling(): void {
   }
 }
 
-async function pollOnce(): Promise<void> {
-  const info = captureInfo.value
-  if (!info) return
-  try {
-    const result = await ipc.pollNetworkCapture(info.id)
-    requests.value = result.requests
-    captureStatus.value = result.status
-    if (!result.status.running) stopPolling()
-  } catch (e) {
-    error.value = errorMessage(e)
+/** Poll every live capture and merge by wall-clock key, so H5 and native traffic line up. */
+async function pollAll(): Promise<void> {
+  if (captures.value.length === 0 || fileMode.value) {
     stopPolling()
+    return
   }
+  const settled = await Promise.allSettled(
+    captures.value.map((c) => ipc.pollNetworkCapture(c.id))
+  )
+  const next = { ...statuses.value }
+  const merged: NetworkRequest[] = []
+  let ok = 0
+  for (const result of settled) {
+    if (result.status !== 'fulfilled') continue
+    ok += 1
+    next[result.value.id] = result.value.status
+    merged.push(...result.value.requests)
+  }
+  statuses.value = next
+  merged.sort((a, b) =>
+    (a.timeKey || '99:99:99.999').localeCompare(b.timeKey || '99:99:99.999')
+  )
+  requests.value = merged
+  if (ok === 0 || Object.values(next).every((s) => !s.running)) stopPolling()
 }
 
-async function startCapture(): Promise<void> {
-  if (!canStartCdp.value) return
-  busy.value = true
-  error.value = ''
-  try {
-    stopPolling()
-    if (captureInfo.value) await ipc.closeNetworkCapture(captureInfo.value.id)
-    const info = await ipc.startCdpCapture({ serial: serial.value, socket: cdpSocket.value, port: 0 })
-    captureInfo.value = info
+function beginLive(info: NetworkSessionInfo): void {
+  if (fileMode.value || captures.value.length === 0) {
     requests.value = []
     selected.value = null
-    captureStatus.value = {
+  }
+  fileMode.value = false
+  captures.value = [...captures.value, info]
+  statuses.value = {
+    ...statuses.value,
+    [info.id]: {
       sessionId: info.id,
       running: true,
       entryCount: 0,
@@ -126,7 +168,30 @@ async function startCapture(): Promise<void> {
       target: '',
       error: ''
     }
-    timer = setInterval(() => void pollOnce(), 800)
+  }
+  if (timer === null) timer = setInterval(() => void pollAll(), 800)
+}
+
+/**
+ * Starting the first channel (or restarting after a stop) begins a fresh table. Starting
+ * a second channel while one is live keeps both, which is the point of merging them.
+ */
+async function prepareLive(): Promise<void> {
+  if (!running.value) {
+    await closeAll()
+    requests.value = []
+    selected.value = null
+  }
+  fileMode.value = false
+}
+
+async function startCdp(): Promise<void> {
+  if (!canStartCdp.value) return
+  busy.value = true
+  error.value = ''
+  try {
+    await prepareLive()
+    beginLive(await ipc.startCdpCapture({ serial: serial.value, socket: cdpSocket.value, port: 0 }))
   } catch (e) {
     error.value = errorMessage(e)
   } finally {
@@ -134,16 +199,45 @@ async function startCapture(): Promise<void> {
   }
 }
 
-async function stopCapture(): Promise<void> {
-  stopPolling()
-  const info = captureInfo.value
-  if (!info) return
+async function startProxy(): Promise<void> {
+  if (!canStartProxy.value) return
+  busy.value = true
+  error.value = ''
   try {
-    await ipc.stopNetworkCapture(info.id)
+    await prepareLive()
+    beginLive(await ipc.startProxyCapture({ serial: serial.value, port: 0 }))
   } catch (e) {
     error.value = errorMessage(e)
+  } finally {
+    busy.value = false
   }
-  if (captureStatus.value) captureStatus.value.running = false
+}
+
+async function stopAll(): Promise<void> {
+  stopPolling()
+  for (const c of captures.value) {
+    try {
+      await ipc.stopNetworkCapture(c.id)
+    } catch {
+      // The app-level cleanup still runs on window close.
+    }
+  }
+  const next = { ...statuses.value }
+  for (const id of Object.keys(next)) next[id] = { ...next[id], running: false }
+  statuses.value = next
+}
+
+async function closeAll(): Promise<void> {
+  stopPolling()
+  for (const c of captures.value) {
+    try {
+      await ipc.closeNetworkCapture(c.id)
+    } catch {
+      // Best effort; ProxyGuard::drop is the final safety net.
+    }
+  }
+  captures.value = []
+  statuses.value = {}
 }
 
 async function pickCaptureFile(): Promise<void> {
@@ -156,12 +250,10 @@ async function pickCaptureFile(): Promise<void> {
       filters: [{ name: '抓包文件', extensions: ['har', 'json', 'jsonl', 'log', 'txt'] }]
     })
     if (typeof picked !== 'string' || picked.length === 0) return
-    stopPolling()
-    if (captureInfo.value) await ipc.closeNetworkCapture(captureInfo.value.id)
+    await closeAll()
     const info = await ipc.importNetworkCapture(picked)
-    captureInfo.value = info
     requests.value = await ipc.queryNetworkRequests(info.id)
-    captureStatus.value = null
+    fileMode.value = true
     selected.value = null
   } catch (e) {
     error.value = errorMessage(e)
@@ -187,16 +279,8 @@ async function restoreProxy(): Promise<void> {
 }
 
 async function close(): Promise<void> {
-  stopPolling()
-  const info = captureInfo.value
-  // Do not leave a CDP forward (or a global proxy) running behind a closed dialog.
-  if (info) {
-    try {
-      await ipc.closeNetworkCapture(info.id)
-    } catch {
-      // The backend also cleans up on window close; a failed IPC here is not fatal.
-    }
-  }
+  // Do not leave a CDP forward, a LAN listener or a global proxy behind a closed dialog.
+  await closeAll()
   if (proxyState.value?.active) {
     try {
       await ipc.restoreDeviceProxy(serial.value)
@@ -214,6 +298,14 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   stopPolling()
+  // The component can be unmounted without going through close() (window close,
+  // store reset). Best effort only: an IPC may not get out while the webview is
+  // being torn down. The Rust CloseRequested/Exit hooks and the proxy journal are
+  // the real guarantee that the device is never left pointing at a dead port.
+  void closeAll()
+  if (proxyState.value?.active) {
+    void ipc.restoreDeviceProxy(serial.value).catch(() => {})
+  }
 })
 </script>
 
@@ -258,6 +350,9 @@ onBeforeUnmount(() => {
               </span>
             </div>
             <p>{{ report.summary }}</p>
+            <p v-if="report.healedProxy" class="probe-healed">
+              已自动修复设备代理：{{ report.healedProxy }}
+            </p>
           </div>
 
           <div v-if="report" class="route-list">
@@ -283,40 +378,49 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- 采集控制 -->
+          <!-- 采集控制：WebView 与原生可同时开，请求合并到同一张表 -->
           <div class="net-controls">
-            <button class="btn btn-primary btn-sm" :disabled="!canStartCdp" @click="startCapture">
-              {{ busy ? '连接中…' : '开始 WebView 采集' }}
+            <button class="btn btn-primary btn-sm" :disabled="!canStartCdp" @click="startCdp">
+              {{ busy ? '连接中…' : '开始 H5 采集' }}
             </button>
-            <button class="btn btn-sm" :disabled="!captureStatus?.running" @click="stopCapture">
-              停止采集
+            <button class="btn btn-sm" :disabled="!canStartProxy" @click="startProxy">
+              开始原生接口采集
             </button>
+            <button class="btn btn-sm" :disabled="!running" @click="stopAll">停止采集</button>
             <button class="btn btn-sm" @click="pickCaptureFile">导入 HAR / JSONL</button>
             <div class="spacer" />
-            <span v-if="captureStatus?.running" class="live-hint">
-              <span class="live-dot" />采集中 · {{ captureStatus.events }} 个事件
+            <span v-if="running" class="live-hint">
+              <span class="live-dot" />采集中 · {{ events }} 个事件
             </span>
-            <span v-if="captureInfo" class="muted">{{ captureInfo.label }} · {{ requests.length }} 条</span>
+            <span class="muted">{{ requests.length }} 条请求</span>
           </div>
+
+          <p class="net-native-note">
+            <b>原生接口</b>走内建代理：明文 HTTP 可看到完整请求 / 响应；HTTPS 只能看到
+            CONNECT 域名、TLS SNI、耗时与字节数。原生 HTTPS 明文需要 App 信任 MITM 证书，
+            本机目标包未声明 <code class="mono">debug-overrides</code>，因此不做解密，也不会伪装成能看。
+            采集结束后自动还原设备代理。
+          </p>
 
           <p v-if="report && report.evidence.devtools.length && !report.evidence.devtools[0].pages" class="empty-hint warn">
             调试通道已就绪，但当前没有打开的 H5 页面。请在 App 里进入一个 WebView 页面，请求会自动出现在这里。
           </p>
-          <p v-if="captureStatus?.target" class="empty-hint mono">
-            当前页面：{{ captureStatus.target }}
+          <p v-if="targets" class="empty-hint mono">采集端点：{{ targets }}</p>
+          <p v-for="c in captures" :key="c.id" class="empty-hint mono">
+            {{ c.label }} · {{ statuses[c.id]?.error || (statuses[c.id]?.running ? '运行中' : '已停止') }}
           </p>
-          <p v-if="captureStatus?.error" class="empty-hint error-text">{{ captureStatus.error }}</p>
           <p v-if="error" class="empty-hint error-text">{{ error }}</p>
 
-          <!-- 请求列表 -->
+          <!-- 请求列表：H5 + 原生按时间合并 -->
           <div class="net-table-wrap">
             <table class="net-table">
               <thead>
                 <tr>
                   <th style="width: 96px">时间</th>
+                  <th style="width: 48px">来源</th>
                   <th style="width: 62px">方法</th>
                   <th>URL</th>
-                  <th style="width: 66px">状态</th>
+                  <th style="width: 190px">状态</th>
                   <th style="width: 76px">耗时</th>
                   <th style="width: 80px">大小</th>
                 </tr>
@@ -324,22 +428,21 @@ onBeforeUnmount(() => {
               <tbody>
                 <tr
                   v-for="row in requests"
-                  :key="row.index"
-                  :class="{ picked: selected?.index === row.index }"
+                  :key="row.source + '-' + row.index"
+                  :class="{ picked: selected?.index === row.index && selected?.source === row.source }"
                   @click="selected = row"
                 >
                   <td class="mono">{{ row.timeKey || row.startedAt || '—' }}</td>
+                  <td><span class="net-source" :class="row.source">{{ sourceLabel(row) }}</span></td>
                   <td class="mono">{{ row.method }}</td>
                   <td class="mono net-url" :title="row.url">{{ row.url }}</td>
-                  <td class="mono" :class="statusClass(row)">
-                    {{ row.status || row.error || '—' }}
-                  </td>
+                  <td class="mono" :class="statusClass(row)">{{ statusText(row) }}</td>
                   <td class="mono">{{ row.durationMs }} ms</td>
                   <td class="mono">{{ formatSize(row.responseSize) }}</td>
                 </tr>
                 <tr v-if="requests.length === 0">
-                  <td colspan="6" class="net-empty">
-                    {{ captureStatus?.running ? '等待 WebView 请求…（在 App 里打开一个 H5 页面）' : '暂无请求。可以先开始采集，或导入一份 HAR / JSONL 抓包文件。' }}
+                  <td colspan="7" class="net-empty">
+                    {{ running ? '等待设备请求…（在 App 里触发接口调用或打开 H5 页面）' : '暂无请求。可以开始 H5 / 原生接口采集，或导入一份 HAR / JSONL 抓包文件。' }}
                   </td>
                 </tr>
               </tbody>
@@ -376,10 +479,10 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- MITM 代理：高级，可还原 -->
+          <!-- 手动代理：供外部 MITM 工具使用，与内建代理采集互斥 -->
           <div class="net-advanced">
             <button class="btn btn-ghost btn-sm" @click="showAdvanced = !showAdvanced">
-              {{ showAdvanced ? '收起' : '展开' }} · MITM 代理设置（原生接口路线）
+              {{ showAdvanced ? '收起' : '展开' }} · 手动 MITM 代理设置（外部抓包工具）
             </button>
             <div v-if="showAdvanced" class="net-advanced-body">
               <div class="form-row">
@@ -389,8 +492,8 @@ onBeforeUnmount(() => {
                 <button class="btn btn-sm" :disabled="!proxyState?.active" @click="restoreProxy">还原</button>
               </div>
               <p class="empty-hint">
-                全局代理只覆盖走系统代理的流量；Android 7+ 的 release 包不信任用户 CA，HTTPS 明文仍取决于证书条件。
-                设置前会记录原值，点「还原」或关闭面板、退出应用时都会自动恢复，避免设备断网。
+                这里是给 Charles / mitmproxy 等外部工具手动指向设备用的；上面「原生接口采集」会自动设置并还原代理，两者不要同时用。
+                Android 7+ 的 release 包不信任用户 CA，HTTPS 明文仍取决于证书条件。
               </p>
               <p v-if="proxyState?.active" class="empty-hint warn mono">
                 当前生效：{{ proxyState.proxy }}（原值：{{ proxyState.original || '无' }}）
@@ -402,7 +505,7 @@ onBeforeUnmount(() => {
 
       <div class="modal-foot">
         <span class="empty-hint" style="margin-right: auto">
-          请求与响应中的 token / Cookie 在导入时即脱敏，不会进入导出文件
+          请求与响应中的 token / Cookie 在落地时即脱敏，不会进入导出文件
         </span>
         <button class="btn btn-sm" @click="close">关闭</button>
       </div>

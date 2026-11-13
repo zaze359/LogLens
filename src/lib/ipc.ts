@@ -18,6 +18,7 @@ import type {
   NetworkRequest,
   NetworkSessionInfo,
   ProbeReport,
+  ProxyCaptureOptions,
   ProxyState
 } from '../types'
 
@@ -92,6 +93,8 @@ export const ipc = {
     invoke<ProbeReport>('probe_network_capture', { serial, packages }),
   startCdpCapture: (options: CdpCaptureOptions) =>
     invoke<NetworkSessionInfo>('start_cdp_capture', { options: plain(options) }),
+  startProxyCapture: (options: ProxyCaptureOptions) =>
+    invoke<NetworkSessionInfo>('start_proxy_capture', { options: plain(options) }),
   pollNetworkCapture: (id: string) =>
     invoke<NetworkPollResult>('poll_network_capture', { id }),
   queryNetworkRequests: (id: string) =>
