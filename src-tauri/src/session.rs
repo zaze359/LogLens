@@ -4,8 +4,8 @@
 //! vector. The matched index list is cached by the serialised filter so paging through a
 //! large result set does not re-evaluate the rules.
 
-use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult};
-use crate::rules::{compute_matches, CompiledFilter};
+use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult, SearchHits};
+use crate::rules::{compute_matches, CompiledFilter, TextMatcher};
 use crate::stream::DeviceStream;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -50,6 +50,11 @@ impl LogSession {
         // `order` only affects paging, not the matched set, so keep it out of the key.
         let mut key_filter = filter.clone();
         key_filter.order.clear();
+        // In `find` mode the term never participates in matching, so leaving it in the key
+        // would add a fresh cached match list for every keystroke.
+        if key_filter.search_mode == "find" {
+            key_filter.search.clear();
+        }
         let key = serde_json::to_string(&key_filter).unwrap_or_default();
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
@@ -60,6 +65,39 @@ impl LogSession {
         }
         self.cache.insert(key, indices.clone());
         indices
+    }
+
+    /// Where `filter.search` appears inside the entries the filter already matched.
+    ///
+    /// `find` must not change the result set, so this reports positions and never feeds the
+    /// table. The cache key is built from a copy with the term cleared, so every keystroke
+    /// does not add a new cached match list. It scans `message` (what the table renders, stack
+    /// lines included) rather than `raw`: a hit inside the timestamp or tag prefix could not
+    /// be highlighted in the row, and "27 hits, none visible" is worse than not matching.
+    pub fn find(&mut self, filter: &FilterSpec, limit: usize) -> Result<SearchHits, String> {
+        let matcher = TextMatcher::new(&filter.search, filter.is_regex, filter.case_sensitive)?
+            .ok_or_else(|| "请先输入查找关键字".to_string())?;
+        let compiled = CompiledFilter::compile(filter)?;
+        let indices = self.matched_indices(filter, &compiled);
+
+        let mut hits: Vec<u32> = Vec::new();
+        let mut total: u32 = 0;
+        for index in indices {
+            let Some(entry) = self.entries.get(index as usize) else {
+                continue;
+            };
+            if matcher.is_match(&entry.message) {
+                total += 1;
+                if hits.len() < limit {
+                    hits.push(index);
+                }
+            }
+        }
+        Ok(SearchHits {
+            total,
+            truncated: (hits.len() as u32) < total,
+            indices: hits,
+        })
     }
 
     pub fn query(
@@ -162,5 +200,91 @@ impl AppState {
                 stream.stop();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(message: &str) -> LogEntry {
+        LogEntry {
+            message: message.to_string(),
+            raw: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn session() -> LogSession {
+        LogSession::new(vec![
+            entry("alpha one"),
+            entry("beta"),
+            entry("beta alpha two"),
+            entry("gamma"),
+        ])
+    }
+
+    fn find_filter(term: &str) -> FilterSpec {
+        FilterSpec {
+            search: term.to_string(),
+            search_mode: "find".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn find_reports_positions_without_narrowing_the_list() {
+        let mut s = session();
+        let filter = find_filter("alpha");
+
+        let hits = s.find(&filter, 100).expect("查找应成功");
+        assert_eq!(hits.total, 2);
+        assert_eq!(hits.indices, vec![0, 2]);
+        assert!(!hits.truncated);
+
+        // The whole point of the split: the same filter still lists every entry.
+        let result = s.query(&filter, 0, 50).expect("查询应成功");
+        assert_eq!(result.matched, 4, "find 模式不能改变结果集");
+        assert_eq!(result.total, 4);
+    }
+
+    #[test]
+    fn filter_mode_still_narrows() {
+        let mut s = session();
+        let filter = FilterSpec {
+            search: "alpha".to_string(),
+            search_mode: "filter".to_string(),
+            ..Default::default()
+        };
+        let result = s.query(&filter, 0, 50).expect("查询应成功");
+        assert_eq!(result.matched, 2);
+    }
+
+    #[test]
+    fn find_caps_the_index_list_but_keeps_the_count() {
+        let mut s = session();
+        let hits = s.find(&find_filter("beta"), 1).expect("查找应成功");
+        assert_eq!(hits.total, 2);
+        assert_eq!(hits.indices.len(), 1, "index 列表应被 limit 截断");
+        assert!(hits.truncated);
+    }
+
+    #[test]
+    fn find_scans_the_message_body_including_stack_lines() {
+        let mut s = LogSession::new(vec![
+            entry("FATAL EXCEPTION: main"),
+            entry("nothing here"),
+        ]);
+        // Stack frames live in `message`, not on the first line; a search has to reach them.
+        s.entries[0].message.push_str("\n\tat com.example.Crash.run(Crash.kt:42)");
+        let hits = s.find(&find_filter("Crash.kt"), 10).expect("查找应成功");
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.indices, vec![0]);
+    }
+
+    #[test]
+    fn find_rejects_an_empty_term() {
+        let mut s = session();
+        assert!(s.find(&find_filter(""), 10).is_err());
     }
 }

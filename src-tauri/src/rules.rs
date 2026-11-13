@@ -178,13 +178,60 @@ impl CompiledGroup {
     }
 }
 
+/// One search term, compiled once and reused for every entry.
+///
+/// Shared by the "filter" flavour of search (which narrows the result set) and by
+/// `search_hits` ("find", which only reports where the term appears).
+pub struct TextMatcher {
+    needle: String,
+    regex: Option<Regex>,
+    case_sensitive: bool,
+}
+
+impl TextMatcher {
+    /// `None` for a blank term, so callers can skip the scan instead of matching everything.
+    pub fn new(term: &str, is_regex: bool, case_sensitive: bool) -> Result<Option<Self>, String> {
+        if term.is_empty() {
+            return Ok(None);
+        }
+        let regex = if is_regex {
+            Some(
+                Regex::new(&with_case(term, case_sensitive))
+                    .map_err(|e| format!("搜索正则无效: {e}"))?,
+            )
+        } else {
+            None
+        };
+        Ok(Some(Self {
+            needle: if case_sensitive {
+                term.to_string()
+            } else {
+                term.to_lowercase()
+            },
+            regex,
+            case_sensitive,
+        }))
+    }
+
+    pub fn is_match(&self, text: &str) -> bool {
+        if let Some(re) = &self.regex {
+            return re.is_match(text);
+        }
+        if self.case_sensitive {
+            text.contains(&self.needle)
+        } else {
+            text.to_lowercase().contains(&self.needle)
+        }
+    }
+}
+
 struct QuickFilter {
     levels: Vec<String>,
     tags: Vec<String>,
     pids: Vec<String>,
     packages: Vec<String>,
-    search: String,
-    search_regex: Option<Regex>,
+    /// `None` in `find` mode: the term is a search, not a filter, so it must not narrow.
+    search: Option<TextMatcher>,
     case_sensitive: bool,
     excludes: Vec<String>,
     time_from: String,
@@ -193,13 +240,10 @@ struct QuickFilter {
 
 impl QuickFilter {
     fn compile(f: &FilterSpec) -> Result<Self, String> {
-        let search_regex = if f.is_regex && !f.search.trim().is_empty() {
-            Some(
-                Regex::new(&with_case(&f.search, f.case_sensitive))
-                    .map_err(|e| format!("搜索正则无效: {e}"))?,
-            )
-        } else {
+        let search = if f.search_mode == "find" {
             None
+        } else {
+            TextMatcher::new(&f.search, f.is_regex, f.case_sensitive)?
         };
         let excludes = f
             .exclude
@@ -212,8 +256,7 @@ impl QuickFilter {
             tags: f.tags.clone(),
             pids: f.pids.clone(),
             packages: f.packages.clone(),
-            search: f.search.clone(),
-            search_regex,
+            search,
             case_sensitive: f.case_sensitive,
             excludes,
             time_from: normalize_time_value(&f.time_from),
@@ -226,7 +269,7 @@ impl QuickFilter {
             || !self.tags.is_empty()
             || !self.pids.is_empty()
             || !self.packages.is_empty()
-            || !self.search.is_empty()
+            || self.search.is_some()
             || !self.excludes.is_empty()
             || !self.time_from.is_empty()
             || !self.time_to.is_empty()
@@ -255,39 +298,32 @@ impl QuickFilter {
         {
             return false;
         }
-        if self.search.is_empty() && self.excludes.is_empty() {
+        if self.search.is_none() && self.excludes.is_empty() {
             return true;
         }
-        let hay: Cow<'_, str> = if self.case_sensitive {
-            Cow::Borrowed(e.raw.as_str())
-        } else {
-            Cow::Owned(e.raw.to_lowercase())
-        };
-        let hay = hay.as_ref();
-        for keyword in &self.excludes {
-            let needle = if self.case_sensitive {
-                keyword.clone()
+        // `hay` is only needed for exclusions; a plain search term compares against the raw
+        // line directly and lets `TextMatcher` decide how to fold case.
+        if !self.excludes.is_empty() {
+            let hay: Cow<'_, str> = if self.case_sensitive {
+                Cow::Borrowed(e.raw.as_str())
             } else {
-                keyword.to_lowercase()
+                Cow::Owned(e.raw.to_lowercase())
             };
-            if hay.contains(&needle) {
-                return false;
+            for keyword in &self.excludes {
+                let needle = if self.case_sensitive {
+                    keyword.clone()
+                } else {
+                    keyword.to_lowercase()
+                };
+                if hay.contains(&needle) {
+                    return false;
+                }
             }
         }
-        if !self.search.is_empty() {
-            return match &self.search_regex {
-                Some(re) => re.is_match(hay),
-                None => {
-                    let needle = if self.case_sensitive {
-                        self.search.clone()
-                    } else {
-                        self.search.to_lowercase()
-                    };
-                    hay.contains(&needle)
-                }
-            };
+        match &self.search {
+            Some(matcher) => matcher.is_match(&e.raw),
+            None => true,
         }
-        true
     }
 }
 
@@ -440,6 +476,27 @@ mod tests {
         };
         let compiled = CompiledFilter::compile(&negated).unwrap();
         assert_eq!(compute_matches(&entries, &compiled), vec![1]);
+    }
+
+    #[test]
+    fn an_unknown_search_mode_still_filters() {
+        // `search_mode` defaults to "" for anything that predates the field; only the literal
+        // "find" opts out of filtering, so old payloads keep the old behaviour.
+        let entries = vec![entry("I", "T", "alpha"), entry("I", "T", "beta")];
+        let mut filter = FilterSpec::default();
+        filter.search = "alpha".to_string();
+        let compiled = CompiledFilter::compile(&filter).expect("默认模式应能编译");
+        assert_eq!(compute_matches(&entries, &compiled), vec![0u32]);
+    }
+
+    #[test]
+    fn find_mode_leaves_the_matched_set_untouched() {
+        let entries = vec![entry("I", "T", "alpha"), entry("I", "T", "beta")];
+        let mut filter = FilterSpec::default();
+        filter.search = "alpha".to_string();
+        filter.search_mode = "find".to_string();
+        let compiled = CompiledFilter::compile(&filter).expect("find 模式应能编译");
+        assert_eq!(compute_matches(&entries, &compiled), vec![0u32, 1u32]);
     }
 
     #[test]

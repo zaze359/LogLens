@@ -344,6 +344,15 @@ mod tests {
     /// `am_proc_start` / `Start proc` rows must name a decent share of the replayed lines.
     /// Before this existed, a live capture had no package values at all — only the rare
     /// accessibility foreground event carried one.
+    ///
+    /// Deliberately split in two, because the two halves fail for unrelated reasons:
+    ///   * the live half proves the wiring end to end (capture → parse → `entry.package`);
+    ///   * the resolved half proves the *mapping* does not degenerate into a single value.
+    /// Diversity is a property of the mapping, not of how chatty the phone happens to be: a
+    /// settled device can spend a whole minute printing only `systemui`, and asserting
+    /// `> 1` package against live traffic then fails on a correct build. So the second
+    /// assertion runs against the device's own `ps` output, which always names dozens of
+    /// apps, and checks that each pid keeps its own name instead of collapsing onto one.
     #[test]
     #[ignore = "需要本机安装 adb 并连接设备"]
     fn live_capture_resolves_packages_from_pids() {
@@ -351,6 +360,7 @@ mod tests {
         let snapshot = crate::adb::process_snapshot(&adb_path, &serial);
         assert!(!snapshot.trim().is_empty(), "ps 快照不应为空");
 
+        // --- live half: entries that reach the session carry a package -----------------
         let mut stream = attached_stream(&serial);
         assert!(stream.startup_error().is_none());
 
@@ -368,23 +378,65 @@ mod tests {
         stream.stop();
 
         let total = session.entries.len();
+        let labelled = session.entries.iter().filter(|e| !e.package.is_empty()).count();
         let mut packages: Vec<&str> = session
             .entries
             .iter()
             .map(|e| e.package.as_str())
             .filter(|p| !p.is_empty())
             .collect();
-        assert!(total > 0, "实时抓取没有拿到任何条目");
-        assert!(!packages.is_empty(), "{total} 条日志里没有一条解析出包名");
-        let labelled = packages.len();
         packages.sort_unstable();
         packages.dedup();
-        assert!(
-            packages.len() > 1,
-            "只解析出唯一一个包 {:?}，映射很可能退化成了单一值",
-            packages
+        assert!(total > 0, "实时抓取没有拿到任何条目");
+        assert!(labelled > 0, "{total} 条日志里没有一条解析出包名");
+
+        // --- resolved half: every app pid in the snapshot keeps its own package -------
+        // Same code path the reader thread uses: adopt the snapshot, then let each line
+        // resolve through `fill`. Synthesising the lines is what makes this deterministic;
+        // the *snapshot* is still the device's real, current `ps` output.
+        let apps: Vec<(u32, String)> = snapshot
+            .lines()
+            .filter_map(|line| {
+                // `ps -A -o PID,NAME` — two columns; the header and `[kworker/…]` rows drop out.
+                let mut cols = line.split_whitespace();
+                let pid = cols.next()?.parse::<u32>().ok()?;
+                let name = cols.next()?;
+                (name.contains('.') && !name.starts_with('[')).then(|| (pid, name.to_string()))
+            })
+            .collect();
+        assert!(apps.len() > 3, "ps 快照里应用进程太少（{} 个），无法验证映射", apps.len());
+
+        let mut parser = crate::logcat::IncrementalParser::new().expect("解析器应能初始化");
+        assert!(parser.merge_process_snapshot(&snapshot) > 0, "快照没有被采纳");
+        // Three distinct pids → three distinct packages. A mapping that collapsed onto one
+        // value shows up here immediately, whatever the phone is doing.
+        let probes: Vec<(u32, String)> = apps
+            .iter()
+            .filter(|(_, name)| name.starts_with("com.") || name.starts_with("cn."))
+            .take(3)
+            .cloned()
+            .collect();
+        for (pid, _) in &probes {
+            parser.push_line(&format!("11-12 00:00:00.000 {pid} {pid} I Probe: live probe"));
+        }
+        parser.push_line("11-12 00:00:00.001 0 0 I Probe: sentinel");
+        let resolved: Vec<crate::model::LogEntry> = parser.take_ready();
+
+        assert_eq!(resolved.len(), probes.len(), "探针行应有同样多的条目");
+        for ((pid, expected), entry) in probes.iter().zip(&resolved) {
+            assert_eq!(entry.pid, *pid, "探针行的 pid 解析错了");
+            assert_eq!(
+                &entry.package, expected,
+                "pid {pid} 解析成了 {:?}，应为 {expected} —— 映射共享了同一个名字",
+                entry.package
+            );
+        }
+
+        eprintln!(
+            "{total} 条日志中 {labelled} 条带包名，实时看到 {} 个包: {packages:?}；快照验证 {} 个 pid 各自独立",
+            packages.len(),
+            probes.len()
         );
-        eprintln!("{total} 条日志中 {labelled} 条带包名，涉及 {} 个包: {packages:?}", packages.len());
     }
 
     /// The property that makes a live capture feel live.

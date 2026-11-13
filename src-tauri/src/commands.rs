@@ -7,7 +7,7 @@ use crate::config_store::{self, RulesView};
 use crate::logcat::{self, LogcatParser, ParseOutcome};
 use crate::model::{
     DeviceCaptureOptions, FileInfo, FilterSpec, LogEntry, OpenProgress, QueryResult, Rule,
-    RuleCategory, StreamStatus,
+    RuleCategory, SearchHits, StreamStatus,
 };
 use crate::rules::CompiledFilter;
 use crate::session::{AppState, LogSession};
@@ -450,6 +450,25 @@ fn remove_session(state: &State<'_, AppState>, session_id: &str) {
     }
 }
 
+
+#[tauri::command]
+pub fn search_hits(
+    session_id: String,
+    filter: FilterSpec,
+    limit: usize,
+    state: State<'_, AppState>,
+) -> Result<SearchHits, String> {
+    // "Find" is deliberately a separate command from `query_logs`: it must not be able to
+    // change which rows are listed, only report where the term sits among them.
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| "日志会话已失效，请重新打开文件".to_string())?;
+    session.find(&filter, limit)
+}
 
 #[tauri::command]
 pub fn query_logs(

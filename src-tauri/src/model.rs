@@ -98,6 +98,14 @@ pub struct FilterSpec {
     /// Application packages (or the package part of a sub-process). Any of them matches.
     pub packages: Vec<String>,
     pub search: String,
+    /// What `search` means: `filter` (default) narrows the result set like every other
+    /// quick filter; `find` is a *search* — it leaves the result set untouched and the hits
+    /// come from `search_hits`, which the UI turns into "3 / 27" plus jump-to-next.
+    ///
+    /// The distinction matters because the two are used differently: filtering is "only show
+    /// me what matches", finding is "where does this string appear in what I am already
+    /// looking at". Export follows the filter, so `find` never changes what gets written out.
+    pub search_mode: String,
     pub is_regex: bool,
     pub case_sensitive: bool,
     /// Comma separated keywords; any hit removes the entry.
@@ -178,6 +186,20 @@ pub struct StreamStatus {
     pub tags: Vec<String>,
     pub pids: Vec<String>,
     pub packages: Vec<String>,
+}
+
+/// Result of a `find` query: where the search term appears inside the *filtered* set.
+///
+/// `total` counts every hit while `indices` is capped (a term like `e` can match hundreds of
+/// thousands of entries; the UI only needs enough to jump around, and `truncated` says the
+/// exact counts stop here).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SearchHits {
+    pub total: u32,
+    /// Entry indices, in display order, capped at the requested limit.
+    pub indices: Vec<u32>,
+    pub truncated: bool,
 }
 
 /// Progress of a file import, emitted as `log-open-progress` while `open_log_file` runs.
