@@ -4,8 +4,17 @@ import { loadMore, store } from '../stores/session'
 import type { LogEntry } from '../types'
 
 const ROW_H = 26
+/** Cell padding plus a little breathing room, so the last glyph never touches the edge. */
+const MSG_PADDING = 26
+/** Room for the "+N 行" chip on entries that collapsed a stack trace. */
+const CONT_BADGE = 70
+/** Sanity cap: one 50k-char JSON payload must not make the table 400 000px wide. */
+const MAX_MSG_PX = 20000
+
 const viewport = ref<HTMLElement | null>(null)
 const scrollTop = ref(0)
+/** Horizontal offset, mirrored onto the header so the labels stay above their columns. */
+const scrollLeft = ref(0)
 const viewportHeight = ref(600)
 /** Live tail: keep the newest rows in view unless the user scrolled up on purpose. */
 const follow = ref(true)
@@ -18,6 +27,53 @@ const endIndex = computed(() =>
 const visible = computed(() => store.entries.slice(startIndex.value, endIndex.value))
 const offsetY = computed(() => startIndex.value * ROW_H)
 const spacerHeight = computed(() => Math.max(store.entries.length * ROW_H, viewportHeight.value))
+
+/* ------------------------------------------------------- message column ---- */
+
+let measureCtx: CanvasRenderingContext2D | null = null
+
+/**
+ * Real glyph width for the table font. `1ch` is only correct for characters that render at
+ * the monospace advance, and log payloads mix CJK, emoji and ASCII; measuring the actual
+ * string avoids a column that is too narrow (still ellipsising) or absurdly wide.
+ */
+function measure(text: string): number {
+  if (!measureCtx) {
+    measureCtx = document.createElement('canvas').getContext('2d')
+    if (measureCtx) {
+      measureCtx.font =
+        '12px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace'
+    }
+  }
+  if (!measureCtx) return text.length * 7.2
+  return measureCtx.measureText(text).width
+}
+
+/**
+ * Width of the message column: the widest **first line** among the loaded entries.
+ *
+ * Rows are single-line by design (fixed 26px height is what makes virtual scrolling cheap),
+ * so the only way to show a long line in full is to let the table scroll sideways. Sizing the
+ * column from the data — instead of a per-row `max-content` — keeps the width stable while
+ * scrolling, since the browser would otherwise recompute it from whichever rows happen to be
+ * rendered and the horizontal scrollbar would jump on every scroll.
+ */
+const msgWidth = computed(() => {
+  let worst = 0
+  for (const entry of store.entries) {
+    const nl = entry.message.indexOf('\n')
+    const line = nl < 0 ? entry.message : entry.message.slice(0, nl)
+    const width = measure(line) + (entry.continuation > 0 ? CONT_BADGE : 0)
+    if (width > worst) worst = width
+  }
+  const needed = Math.ceil(worst) + MSG_PADDING
+  // Never narrower than what is left of the viewport, so short logs still fill the width.
+  return Math.min(Math.max(needed, 240), MAX_MSG_PX)
+})
+
+const tableStyle = computed(
+  () => ({ '--msg-w': `${msgWidth.value}px` }) as Record<string, string>
+)
 
 onMounted(() => {
   const el = viewport.value
@@ -34,6 +90,9 @@ onBeforeUnmount(() => observer?.disconnect())
 function onScroll(e: Event): void {
   const el = e.target as HTMLElement
   scrollTop.value = el.scrollTop
+  // The header is a sibling of the scroll container, so it has to be translated by hand to
+  // stay above its columns while the table is scrolled sideways.
+  scrollLeft.value = el.scrollLeft
   // Remembered per tab, so switching away and back lands on the same line.
   store.scrollTop = el.scrollTop
   const distance = el.scrollHeight - el.scrollTop - el.clientHeight
@@ -72,6 +131,9 @@ watch(
     const top = Math.min(store.scrollTop, max)
     el.scrollTop = top
     scrollTop.value = top
+    // A narrower tab clamps the offset without emitting a scroll event; resync so the
+    // header does not stay shifted by the previous tab's horizontal position.
+    scrollLeft.value = el.scrollLeft
     follow.value = max - top < 48
   }
 )
@@ -108,18 +170,20 @@ function segments(entry: LogEntry): Segment[] {
 </script>
 
 <template>
-  <div class="table-head">
-    <span style="text-align:right">#</span>
-    <span>级别</span>
-    <span>时间</span>
-    <span>PID</span>
-    <span>TID</span>
-    <span>包名</span>
-    <span>Tag</span>
-    <span>消息（点击行查看完整内容与堆栈）</span>
+  <div class="table-head" :style="tableStyle">
+    <div class="table-head-inner" :style="{ transform: `translateX(${-scrollLeft}px)` }">
+      <span style="text-align:right">#</span>
+      <span>级别</span>
+      <span>时间</span>
+      <span>PID</span>
+      <span>TID</span>
+      <span>包名</span>
+      <span>Tag</span>
+      <span>消息 · 左右滚动看全文</span>
+    </div>
   </div>
 
-  <div ref="viewport" class="table-body" @scroll="onScroll">
+  <div ref="viewport" class="table-body" :style="tableStyle" @scroll="onScroll">
     <div v-if="store.entries.length === 0" class="table-empty">
       <template v-if="store.loading">正在解析并筛选日志…</template>
       <template v-else-if="!store.fileInfo">尚未打开日志文件。点击右上角「打开日志文件」，或直接把文件拖进窗口。</template>

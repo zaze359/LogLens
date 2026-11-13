@@ -234,16 +234,24 @@ button { cursor: pointer; }
 .top-tags { display: flex; gap: 6px; }
 
 /* ---------- log table ---------- */
-.table-head, .log-row {
+/* The message column is sized from the data (`--msg-w`, set by LogTable from the widest
+   first line) instead of `1fr`: lines are single-row by design, so the only way to read a
+   long one in full is to let the table scroll sideways. `minmax(...)` keeps short logs
+   filling the viewport. */
+.table-head-inner, .log-row {
   display: grid;
-  grid-template-columns: 58px 32px 116px 56px 56px 152px 152px minmax(0, 1fr);
+  grid-template-columns: 58px 32px 116px 56px 56px 152px 152px minmax(var(--msg-w, 240px), 1fr);
   align-items: center;
 }
 .table-head {
   flex: none; height: 28px; padding: 0 10px; background: var(--bg-2);
   border-bottom: 1px solid var(--border);
   color: var(--text-faint); font-size: 11px; letter-spacing: .4px;
+  overflow: hidden;
 }
+/* Translated by the body's `scrollLeft` (see LogTable.onScroll), so the labels keep sitting
+   above their columns while the table is scrolled sideways. */
+.table-head-inner { height: 100%; will-change: transform; }
 .table-body { position: relative; flex: 1; min-height: 0; overflow: auto; background: var(--bg); }
 .table-spacer { position: relative; width: 100%; }
 .table-rows { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
@@ -261,7 +269,7 @@ button { cursor: pointer; }
 .cell-pid { color: #7f93aa; }
 .cell-pkg { color: #86c5a8; }
 .cell-tag { color: #c7b6f7; }
-.cell-msg { color: var(--text); }
+.cell-msg { color: var(--text); overflow: visible; }
 .cell-msg .cont { color: var(--accent); font-size: 11px; margin-left: 8px; }
 .badge-level {
   display: inline-block; width: 20px; height: 18px; line-height: 18px;
@@ -461,7 +469,8 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 
 /* ---------- live tail follow ---------- */
 .follow-jump {
-  position: sticky; bottom: 10px; display: flex; justify-content: center;
+  /* `left: 0` keeps the pill on screen when the table is scrolled sideways. */
+  position: sticky; bottom: 10px; left: 0; display: flex; justify-content: center;
   pointer-events: none; margin-top: -34px; height: 0;
 }
 .follow-jump .btn {
