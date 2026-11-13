@@ -56,6 +56,10 @@ Zhao Zhen asked for a client that analyses various collected logs:
 - Custom rules + categories persisted locally, importable/exportable as JSON.
 - Filtered results exportable as plain text.
 - Usable with large single files (virtual scrolling + backend paging + match cache).
+- **Full lines in the list**: the message column widens to the longest first line in the
+  result set and the table scrolls horizontally, so a long line can be read without opening
+  the detail drawer. Rows stay one line tall (fixed height is what keeps virtual scrolling
+  cheap), and the header follows the horizontal scroll so columns never drift.
 - **Import feedback**: reading and parsing a file happens off the UI thread, with a
   byte-based progress card (percentage, read/total size, entries so far) that can be
   cancelled mid-import. Two stages are reported (`parsing`, then `indexing` for the facet
@@ -124,6 +128,9 @@ Zhao Zhen asked for a client that analyses various collected logs:
 22. Cancelling mid-import removes the card, opens no tab and raises no error banner; the
     same file can be imported again afterwards. A tiny file imports without the card
     appearing at all.
+23. A log containing a very long single line (600+ characters) shows it in full: the table
+    gains a horizontal scrollbar, the end of the line is reachable, the header scrolls with
+    the rows, and short logs still show no horizontal scrollbar.
 
 ## Constraints
 

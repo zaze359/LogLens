@@ -147,6 +147,16 @@
       flash it, with read/total size, percent, entry count and a cancel button. The store
       guards one import at a time and re-checks `MAX_TABS` after the (slow) import in case a
       device capture took the last slot meanwhile.
+- [x] **Full lines without clicking (user: "显示不全，需要点击单行才能看全部…应该可以显示完整，
+      左右可以滚动")**: the message column was `minmax(0, 1fr)` + `text-overflow: ellipsis`, so
+      anything past the window width was unreadable until you opened the drawer. Rows must stay
+      26px tall (fixed height is what makes the virtual list cheap), so the fix is a **wider
+      column plus horizontal scrolling**: `--msg-w` is computed from the widest first line among
+      the loaded entries (canvas `measureText`; `ch` under-sizes mixed CJK/ASCII) and the grid
+      track became `minmax(var(--msg-w), 1fr)`. The header lives outside the scroll container,
+      so it is translated by `-scrollLeft` to stay above its columns. Verified the layout in a
+      headless browser against an equivalent static page: `scrollWidth` 5253 vs `clientWidth`
+      1200, and at max scroll the JSON tail (`"appVersion":"4.2.1"}`) is fully visible.
 - [x] **Two bugs caught by measuring instead of assuming**: (a) `since_report` was never reset,
       so after the first 4096 lines the progress callback fired on *every* line — 296k
       callbacks for a 300k-line file; (b) the parse looked like 24k lines/s until I noticed
@@ -191,6 +201,8 @@ npm run tauri build               # run on macOS and Windows separately
 | `cd src-tauri && cargo test --lib` (after import progress) | PASS — 40 passed, 6 ignored, 0 failed; new `parse_reports_progress_and_finishes_at_the_file_size` (byte reports monotonic, last report == file size) and `cancelling_stops_the_parse_and_returns_nothing` |
 | `cd src-tauri && cargo build` + `npm run build` (after import progress) | PASS — zero warnings; `index-DB7hAwB8.js` 150.71 kB, `index-hDeLLhey.css` 17.22 kB |
 | Release parse benchmark (29 MB / 300 420 lines) | PASS — 1.03s, ~293k lines/s, 74 progress callbacks (dev profile: 12.6s) |
+| `npm run build` (after full-line display) | PASS — `index-DR3_n2fk.js` 151.44 kB, `index-B5DnUQsy.css` 17.34 kB |
+| Headless browser layout check of the table (Edge, 1200px viewport, page mirroring `--msg-w` + header transform) | PASS — `scrollWidth` 5253 / `clientWidth` 1200 (horizontal scroll present), header labels aligned with data columns, line tail reachable at max scroll |
 
 Environment: macOS arm64, Node v24.14.0, npm 11.9.0, rustc/cargo 1.99.1, rustup 1.29.3,
 adb 1.0.41 (platform-tools 35.0.2), one USB device attached.
