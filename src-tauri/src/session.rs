@@ -5,6 +5,8 @@
 //! large result set does not re-evaluate the rules.
 
 use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult, SearchHits};
+use crate::netcapture::{NetworkCapture, ProxyGuard};
+use crate::network::NetworkRequest;
 use crate::rules::{compute_matches, CompiledFilter, TextMatcher};
 use crate::stream::DeviceStream;
 use std::collections::HashMap;
@@ -165,10 +167,25 @@ impl LogSession {
     }
 }
 
+/// A collected set of network requests, keyed by capture id. Kept out of `LogSession`
+/// because the columns are disjoint (method/status/duration vs tag/level/pid).
+pub struct NetworkSession {
+    pub requests: Vec<NetworkRequest>,
+    pub label: String,
+    pub source: String,
+    pub device: String,
+    pub streaming: bool,
+}
+
 pub struct AppState {
     pub sessions: Mutex<HashMap<String, LogSession>>,
     /// Live captures, keyed by the session they append to.
     pub streams: Mutex<HashMap<String, DeviceStream>>,
+    /// Live CDP captures and their collected requests.
+    pub network_captures: Mutex<HashMap<String, NetworkCapture>>,
+    pub network_sessions: Mutex<HashMap<String, NetworkSession>>,
+    /// One proxy guard per device. Dropping the guard restores the previous setting.
+    pub proxy_guards: Mutex<HashMap<String, ProxyGuard>>,
     /// Abort flags for in-flight file imports, keyed by the frontend's request id. The flag
     /// is shared with the parsing thread because a cancelled import cannot use the session
     /// lock (it has no session yet).
@@ -181,6 +198,9 @@ impl Default for AppState {
         Self {
             sessions: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            network_captures: Mutex::new(HashMap::new()),
+            network_sessions: Mutex::new(HashMap::new()),
+            proxy_guards: Mutex::new(HashMap::new()),
             import_cancels: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
         }
@@ -192,13 +212,22 @@ impl AppState {
         format!("s{}", self.seq.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Kill every live capture. Called when the window is destroyed so `adb logcat`
-    /// children do not outlive the app.
+    /// Kill every live capture and undo every device-side change. Called when the window
+    /// is destroyed: an `adb logcat` child, a CDP forward or a lingering global proxy
+    /// must not outlive the app — the last one would leave the phone offline.
     pub fn stop_all_streams(&self) {
         if let Ok(mut streams) = self.streams.lock() {
             for (_, mut stream) in streams.drain() {
                 stream.stop();
             }
+        }
+        if let Ok(mut captures) = self.network_captures.lock() {
+            for (_, mut capture) in captures.drain() {
+                capture.stop();
+            }
+        }
+        if let Ok(mut guards) = self.proxy_guards.lock() {
+            guards.clear(); // ProxyGuard::drop restores the original value
         }
     }
 }

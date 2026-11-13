@@ -2,6 +2,8 @@
 //! Every struct uses `camelCase` on the JSON boundary and tolerates missing fields,
 //! so the frontend can evolve without breaking the IPC contract.
 
+use crate::netcapture::NetworkCaptureStatus;
+use crate::network::NetworkRequest;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -233,4 +235,53 @@ pub struct QueryResult {
     /// Top 10 tags of matched entries.
     pub top_tags: Vec<NameCount>,
     pub elapsed_ms: u64,
+}
+
+// --- Device network capture -------------------------------------------------
+//
+// Traffic sessions are deliberately kept separate from log sessions: a request has
+// method / status / duration columns, not tag / level / pid. The two timelines share
+// `time_key` (`HH:MM:SS.mmm`) so the UI can correlate them later.
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CdpCaptureOptions {
+    pub serial: String,
+    /// `webview_devtools_remote_<pid>` from the capability probe.
+    pub socket: String,
+    /// Local TCP port for `adb forward`. 0 = pick the default.
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NetworkSessionInfo {
+    pub id: String,
+    pub label: String,
+    /// `cdp` | `file`
+    pub source: String,
+    pub device: String,
+    pub streaming: bool,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NetworkPollResult {
+    pub id: String,
+    /// Full current list. Captures are short and bounded, so a full snapshot is cheaper
+    /// and far less error-prone than reconciling incremental indices in the UI.
+    pub requests: Vec<NetworkRequest>,
+    pub status: NetworkCaptureStatus,
+    pub added: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProxyState {
+    pub serial: String,
+    pub proxy: String,
+    /// Value that will be put back on restore; empty means "delete the setting".
+    pub original: String,
+    pub active: bool,
 }

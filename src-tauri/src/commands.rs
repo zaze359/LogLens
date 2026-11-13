@@ -6,12 +6,17 @@ use crate::builtin;
 use crate::config_store::{self, RulesView};
 use crate::logcat::{self, LogcatParser, ParseOutcome};
 use crate::model::{
-    DeviceCaptureOptions, FileInfo, FilterSpec, LogEntry, OpenProgress, QueryResult, Rule,
-    RuleCategory, SearchHits, StreamStatus,
+    CdpCaptureOptions, DeviceCaptureOptions, FileInfo, FilterSpec, LogEntry, NetworkPollResult,
+    NetworkSessionInfo, OpenProgress, ProxyState, QueryResult, Rule, RuleCategory, SearchHits,
+    StreamStatus,
 };
 use crate::rules::CompiledFilter;
-use crate::session::{AppState, LogSession};
+use crate::session::{AppState, LogSession, NetworkSession};
 use crate::stream::DeviceStream;
+use crate::{
+    netcapture::{self, NetworkCapture, ProxyGuard},
+    netprobe, network,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -714,4 +719,271 @@ pub fn import_rules_json(app: AppHandle, json: String) -> Result<RulesView, Stri
     }
     // `save` normalises dangling categoryId values against the merged category list.
     Ok(config_store::view(&config_store::save(&app, &file)?))
+}
+
+// --- Device network capture -------------------------------------------------
+
+/// Default local port for a CDP capture. Different from `netprobe::PROBE_PORT` so a
+/// one-shot capability probe never steals the port of a running capture.
+const CDP_PORT: u16 = 19333;
+
+fn require_adb() -> Result<std::path::PathBuf, String> {
+    adb::locate().ok_or_else(|| adb::NOT_FOUND.to_string())
+}
+
+fn network_info(id: &str, session: &NetworkSession) -> NetworkSessionInfo {
+    NetworkSessionInfo {
+        id: id.to_string(),
+        label: session.label.clone(),
+        source: session.source.clone(),
+        device: session.device.clone(),
+        streaming: session.streaming,
+        count: session.requests.len() as u32,
+    }
+}
+
+/// Third-party packages installed on the device, for the "which app do you want to
+/// inspect" picker in the network panel.
+#[tauri::command]
+pub fn list_capture_packages(serial: String) -> Result<Vec<String>, String> {
+    let adb_path = require_adb()?;
+    Ok(netprobe::list_packages(&adb_path, serial.trim()))
+}
+
+/// Read-only capability probe: which routes to HTTPS plaintext are open on this device.
+#[tauri::command]
+pub fn probe_network_capture(
+    serial: String,
+    packages: Vec<String>,
+) -> Result<netprobe::ProbeReport, String> {
+    let adb_path = require_adb()?;
+    netprobe::probe(&adb_path, serial.trim(), &packages)
+}
+
+#[tauri::command]
+pub fn start_cdp_capture(
+    options: CdpCaptureOptions,
+    state: State<'_, AppState>,
+) -> Result<NetworkSessionInfo, String> {
+    let serial = options.serial.trim().to_string();
+    if serial.is_empty() {
+        return Err("请先选择一台已授权的设备".to_string());
+    }
+    let adb_path = require_adb()?;
+    let socket = if options.socket.trim().is_empty() {
+        netprobe::probe(&adb_path, &serial, &[])
+            .ok()
+            .and_then(|r| r.evidence.devtools.first().map(|d| d.socket.clone()))
+            .ok_or_else(|| "设备上没有 WebView 调试通道，请先运行环境体检".to_string())?
+    } else {
+        options.socket.trim().to_string()
+    };
+    let port = if options.port == 0 { CDP_PORT } else { options.port };
+
+    // Unlike logcat, one device may have several WebView sockets, but one local port can
+    // only be forwarded once. Refuse a second capture on the same (serial, port) pair.
+    {
+        let captures = state
+            .network_captures
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        if captures.values().any(|c| c.serial() == serial && c.port() == port) {
+            return Err("该设备已有一个正在运行的 WebView 采集，请先停止它".to_string());
+        }
+    }
+
+    let id = format!("net-{}", state.next_id());
+    let capture = NetworkCapture::start_cdp(
+        &adb_path,
+        &serial,
+        &socket,
+        port,
+        netcapture::device_tz_offset(&adb_path, &serial),
+        id.clone(),
+    )?;
+    let session = NetworkSession {
+        requests: Vec::new(),
+        label: format!("{} · WebView 请求", device_label(&serial)),
+        source: "cdp".to_string(),
+        device: serial,
+        streaming: true,
+    };
+    let info = network_info(&id, &session);
+    state
+        .network_sessions
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?
+        .insert(id.clone(), session);
+    state
+        .network_captures
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?
+        .insert(id, capture);
+    Ok(info)
+}
+
+/// Drain the CDP reader into the traffic session and return the full current list.
+#[tauri::command]
+pub fn poll_network_capture(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<NetworkPollResult, String> {
+    let (pending, mut status) = {
+        let mut captures = state
+            .network_captures
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        let capture = captures
+            .get_mut(&id)
+            .ok_or_else(|| "实时采集已停止".to_string())?;
+        capture.drain()
+    };
+    let added = pending.len() as u32;
+    let mut sessions = state
+        .network_sessions
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    let session = sessions
+        .get_mut(&id)
+        .ok_or_else(|| "网络请求会话已失效".to_string())?;
+    for mut request in pending {
+        request.index = session.requests.len() as u32;
+        session.requests.push(request);
+    }
+    status.entry_count = session.requests.len() as u32;
+    if !status.running {
+        session.streaming = false;
+    }
+    Ok(NetworkPollResult {
+        id,
+        requests: session.requests.clone(),
+        status,
+        added,
+    })
+}
+
+#[tauri::command]
+pub fn query_network_requests(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::network::NetworkRequest>, String> {
+    let sessions = state
+        .network_sessions
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    Ok(sessions
+        .get(&id)
+        .map(|s| s.requests.clone())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub fn stop_network_capture(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    if let Ok(mut captures) = state.network_captures.lock() {
+        if let Some(mut capture) = captures.remove(&id) {
+            capture.stop();
+        }
+    }
+    if let Ok(mut sessions) = state.network_sessions.lock() {
+        if let Some(session) = sessions.get_mut(&id) {
+            session.streaming = false;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn close_network_capture(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    if let Ok(mut captures) = state.network_captures.lock() {
+        if let Some(mut capture) = captures.remove(&id) {
+            capture.stop();
+        }
+    }
+    if let Ok(mut sessions) = state.network_sessions.lock() {
+        sessions.remove(&id);
+    }
+    Ok(())
+}
+
+/// Import a HAR 1.2 file (Charles / mitmproxy / DevTools) or our own JSONL capture.
+#[tauri::command]
+pub fn import_network_capture(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<NetworkSessionInfo, String> {
+    let file_path = Path::new(&path);
+    if !file_path.is_file() {
+        return Err("所选路径不是文件".to_string());
+    }
+    let text = fs::read_to_string(file_path).map_err(|e| format!("读取抓包文件失败: {e}"))?;
+    let mut requests = network::parse_capture_file(&text)?;
+    for (i, request) in requests.iter_mut().enumerate() {
+        request.index = i as u32;
+    }
+    let name = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.clone());
+    let id = format!("net-{}", state.next_id());
+    let session = NetworkSession {
+        requests,
+        label: name,
+        source: "file".to_string(),
+        device: String::new(),
+        streaming: false,
+    };
+    let info = network_info(&id, &session);
+    state
+        .network_sessions
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?
+        .insert(id, session);
+    Ok(info)
+}
+
+/// Set the device-wide HTTP proxy for the MITM route. The previous value is kept in a
+/// guard and restored on `restore_device_proxy`, `close`, or app exit.
+#[tauri::command]
+pub fn configure_device_proxy(
+    serial: String,
+    proxy: String,
+    state: State<'_, AppState>,
+) -> Result<ProxyState, String> {
+    let serial = serial.trim().to_string();
+    let adb_path = require_adb()?;
+    let mut guards = state
+        .proxy_guards
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    if let Some(mut previous) = guards.remove(&serial) {
+        previous.restore()?;
+    }
+    let guard = ProxyGuard::apply(&adb_path, &serial, &proxy)?;
+    let applied = ProxyState {
+        serial: serial.clone(),
+        proxy: guard.applied().to_string(),
+        original: guard.original().to_string(),
+        active: true,
+    };
+    guards.insert(serial, guard);
+    Ok(applied)
+}
+
+#[tauri::command]
+pub fn restore_device_proxy(
+    serial: String,
+    state: State<'_, AppState>,
+) -> Result<ProxyState, String> {
+    let serial = serial.trim().to_string();
+    let mut guards = state
+        .proxy_guards
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    if let Some(mut guard) = guards.remove(&serial) {
+        guard.restore()?;
+    }
+    Ok(ProxyState {
+        serial,
+        ..Default::default()
+    })
 }

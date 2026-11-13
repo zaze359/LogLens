@@ -42,7 +42,7 @@
 │   ├── types.ts                  # 与 Rust 模型一一对应的 IPC 类型
 │   ├── lib/ipc.ts                # invoke 封装（camelCase → snake_case 参数）
 │   ├── stores/session.ts         # 多标签状态机、查询/分页/规则/导入导出动作
-│   ├── components/               # 顶栏、标签条、规则侧栏、分组/条件编辑器、筛选栏、统计、虚拟表格、详情抽屉、设备抓取面板
+│   ├── components/               # 顶栏、标签条、规则侧栏、分组/条件编辑器、筛选栏、统计、虚拟表格、详情抽屉、设备抓取面板、网络抓包面板
 │   └── styles/main.css           # 深色主题
 ├── src-tauri/
 │   ├── Cargo.toml / build.rs / tauri.conf.json / capabilities/default.json
@@ -52,15 +52,20 @@
 │       ├── logcat.rs             # Logcat 解析器（含流式增量解析）+ 单元测试
 │       ├── rules.rs              # 规则编译与匹配 + 单元测试
 │       ├── builtin.rs            # 加载模板 + 模板合法性单测
-│       ├── adb.rs                # adb 定位、设备枚举、logcat 参数构造
+│       ├── adb.rs                # adb 定位、设备枚举、logcat 参数构造、shell / forward 辅助
 │       ├── stream.rs             # 实时 adb logcat 子进程与读线程
-│       ├── session.rs            # 日志会话、分页查询、命中索引缓存、流式追加
+│       ├── network.rs            # 网络请求模型、HAR / JSONL 解析、敏感字段脱敏
+│       ├── cdp.rs                # 零依赖 HTTP/1.1 + WebSocket CDP 客户端、Network.* 事件组装
+│       ├── netprobe.rs           # 设备抓包能力体检与四条路线评估
+│       ├── netcapture.rs         # CDP 实时采集线程、设备代理 ProxyGuard（自动还原）
+│       ├── session.rs            # 日志会话、网络请求会话、分页查询、命中索引缓存
 │       ├── config_store.rs       # 自定义规则持久化
 │       ├── commands.rs           # Tauri IPC 命令
 │       └── lib.rs / main.rs      # 应用入口
 ├── scripts/
 │   ├── setup.sh / setup.ps1      # 一键检测 / 安装 / 运行
-│   └── gen-icon.cjs              # 生成 Tauri 编译期默认窗口图标（零依赖、幂等）
+│   ├── gen-icon.cjs              # 生成 Tauri 编译期默认窗口图标（零依赖、幂等）
+│   └── mitmproxy_jsonl.py        # mitmproxy add-on：导出可导入的 JSONL 抓包
 ├── samples/logcat-sample.txt     # 示例日志，覆盖多格式 / 堆栈 / ANR / 崩溃
 └── .trellis/tasks/11-12-loglens-mvp/   # 需求 / 设计 / 实现记录
 ```
@@ -209,6 +214,35 @@ npm run tauri build
 - **包名反推**：启动前先取一次 `ps` 快照（约 120ms），保证 `adb logcat` 回放的缓冲区也能解析出包名；读线程随后每 3 秒刷新一次（只在有日志到达时触发，空闲设备不跑 `ps`），并同时从 `am_proc_start` / `am_kill` / `Start proc` / `Killing` 这些行里学习 pid → 包名 —— 进程死了、`ps` 查不到时，靠的就是缓冲区里这些行。
 - **退出清理**：停止抓取、切换日志源、关闭标签、关闭窗口、会话被新会话挤出时都会 kill 掉 `adb logcat` 子进程；`close_session` 也会一并停流。流自然结束（拔线、adb 退出）时前端也会补一次 `stop_device_stream`，否则后端会留着一条「这台设备已被占用」的记录，导致再也无法重新抓取。
 - **数据不出本机**：全部通过本机 adb 读取，没有网络上传。
+
+### 设备网络请求抓包（顶栏「网络抓包」）
+
+> adb 本身没有「网络请求」这层语义，只有 logcat 文本、shell 命令和端口转发。所有抓包方案都是这三样的组合。这一节的能力全部建立在**不修改被测 App** 的前提上。
+
+面板打开时先做一次**只读环境体检**（`getprop` / `su -c id` / `dumpsys package` / `settings get global http_proxy` / `/proc/net/unix`），再给出四条路线的可用性与推荐顺序：
+
+| 路线 | HTTPS 明文 | 覆盖面 | 前提 |
+| --- | --- | --- | --- |
+| `cdp` WebView 调试通道 | ✅ | WebView 内的 H5 / 混合页面 | 设备上有 `webview_devtools_remote_<pid>` socket |
+| `mitm-root` MITM + 系统证书 | ✅ | 全设备，含原生 OkHttp | 可 root / 非生产构建 |
+| `mitm-debug` MITM + 用户证书 | ⚠️ 条件成立才有 | 取决于 APK 是否声明 `debug-overrides` | 目标包 debuggable |
+| `proxy-metadata` 代理元数据 | ❌ | 明文 HTTP + HTTPS 的 CONNECT 域名、耗时、失败原因 | 无条件 |
+
+**为什么 CDP 是首选**：Android 允许 debuggable App 在 `user` 构建上保留 WebView 调试，此时 `adb forward tcp:<port> localabstract:webview_devtools_remote_<pid>` + `Network.enable` 就能读到 WebView 里 HTTPS 的**明文 URL、请求头、请求体、响应头、状态码和耗时**——不需要 root、不需要装 CA、不需要改 App。实现是零新增依赖的手写 HTTP/1.1 + WebSocket 客户端（`cdp.rs`）；注意 Android 的 devtools HTTP 服务**会静默丢弃 HTTP/1.0 请求**，必须用 1.1。
+
+局限：CDP 只看得到 WebView 发出的请求，原生接口走不到这个通道；响应体需要额外的 `Network.getResponseBody` 请求，当前版本只采集响应头与大小。App 没打开 H5 页面时 `/json/list` 为空，面板会提示先在 App 里进入一个页面。
+
+**原生接口与第三方工具结果**走导入：`导入 HAR / JSONL` 支持 HAR 1.2（Charles / Fiddler / DevTools / mitmproxy `har_dump.py`）和一行一个请求的 JSONL。仓库自带 `scripts/mitmproxy_jsonl.py`：
+
+```bash
+LOGLENS_JSONL=~/capture.jsonl mitmdump -s scripts/mitmproxy_jsonl.py -p 8080
+# 在面板「MITM 代理设置」里填 <本机IP>:8080 → 复现问题 → 导入 capture.jsonl
+```
+
+- **代理安全**：设置全局代理前会记录原值，点「还原」、关闭面板、退出应用（含 `ProxyGuard::drop`）都会恢复；部分厂商 ROM 忽略 `settings put global http_proxy`，设置后会读回校验并明确报错，而不是假装成功。
+- **Android 7+ 的硬门槛**：targetSdk ≥ 24 的 App 默认不信任用户安装的 CA，`DEBUGGABLE` 本身**不**等于放行；有证书固定时即使放行也失败。所以体检不会把 `mitm-debug` 标成「可看明文」。
+- **脱敏**：token / Cookie / Authorization / 密码等字段在**导入或采集落地时**就被替换（`network.rs::redact`），不会进入会话、缓存或导出文件；URL query 里的 token 同样处理。
+- **清理**：CDP 的 `adb forward` 由采集线程在停止 / 异常 / 窗口关闭时移除，不会留下占用端口。
 
 ---
 

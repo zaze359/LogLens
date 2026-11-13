@@ -12,6 +12,8 @@ src-tauri/gen/schemas/
 *.log
 setup-report.md
 *-report.md
+__pycache__/
+*.pyc
 
 # AI 工具的脚手架副本：由 .trellis 规范生成，换机器重新生成即可，不进版本库
 .claude/

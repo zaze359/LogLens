@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import {
   exportFilteredFile,
   openDevicePanel,
+  openNetworkPanel,
   pickAndLoadFile,
   resetFilter,
   stopDeviceStream,
@@ -66,6 +67,13 @@ const sourceTitle = computed(() => {
       @click="openDevicePanel()"
     >
       连接设备
+    </button>
+    <button
+      class="btn btn-sm"
+      title="检查设备抓包能力，实时采集 WebView 网络请求或导入 HAR"
+      @click="openNetworkPanel()"
+    >
+      网络抓包
     </button>
     <button
       class="btn btn-primary btn-sm"

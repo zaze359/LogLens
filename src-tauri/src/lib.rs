@@ -1,9 +1,13 @@
 mod adb;
 mod builtin;
+mod cdp;
 mod commands;
 mod config_store;
 mod logcat;
 mod model;
+mod netcapture;
+mod netprobe;
+mod network;
 mod rules;
 mod session;
 mod stream;
@@ -37,7 +41,17 @@ pub fn run() {
             commands::export_rules_json,
             commands::export_rules_to_file,
             commands::import_rules_from_file,
-            commands::import_rules_json
+            commands::import_rules_json,
+            commands::list_capture_packages,
+            commands::probe_network_capture,
+            commands::start_cdp_capture,
+            commands::poll_network_capture,
+            commands::query_network_requests,
+            commands::stop_network_capture,
+            commands::close_network_capture,
+            commands::import_network_capture,
+            commands::configure_device_proxy,
+            commands::restore_device_proxy
         ])
         // A live `adb logcat` child must not outlive the window.
         .on_window_event(|window, event| {

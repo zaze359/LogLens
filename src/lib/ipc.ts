@@ -12,7 +12,13 @@ import type {
   RuleCategory,
   RulesView,
   SearchHits,
-  StreamStatus
+  StreamStatus,
+  CdpCaptureOptions,
+  NetworkPollResult,
+  NetworkRequest,
+  NetworkSessionInfo,
+  ProbeReport,
+  ProxyState
 } from '../types'
 
 export function isTauri(): boolean {
@@ -78,7 +84,26 @@ export const ipc = {
   importRulesFromFilePath: (path: string) =>
     invoke<RulesView>('import_rules_from_file', { path }),
   exportRulesJson: () => invoke<string>('export_rules_json'),
-  importRulesJson: (json: string) => invoke<RulesView>('import_rules_json', { json })
+  importRulesJson: (json: string) => invoke<RulesView>('import_rules_json', { json }),
+
+  listCapturePackages: (serial: string) =>
+    invoke<string[]>('list_capture_packages', { serial }),
+  probeNetworkCapture: (serial: string, packages: string[]) =>
+    invoke<ProbeReport>('probe_network_capture', { serial, packages }),
+  startCdpCapture: (options: CdpCaptureOptions) =>
+    invoke<NetworkSessionInfo>('start_cdp_capture', { options: plain(options) }),
+  pollNetworkCapture: (id: string) =>
+    invoke<NetworkPollResult>('poll_network_capture', { id }),
+  queryNetworkRequests: (id: string) =>
+    invoke<NetworkRequest[]>('query_network_requests', { id }),
+  stopNetworkCapture: (id: string) => invoke<void>('stop_network_capture', { id }),
+  closeNetworkCapture: (id: string) => invoke<void>('close_network_capture', { id }),
+  importNetworkCapture: (path: string) =>
+    invoke<NetworkSessionInfo>('import_network_capture', { path }),
+  configureDeviceProxy: (serial: string, proxy: string) =>
+    invoke<ProxyState>('configure_device_proxy', { serial, proxy }),
+  restoreDeviceProxy: (serial: string) =>
+    invoke<ProxyState>('restore_device_proxy', { serial })
 }
 
 export function errorMessage(e: unknown): string {

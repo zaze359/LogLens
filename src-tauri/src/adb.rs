@@ -133,7 +133,7 @@ pub fn command(adb: &Path) -> Command {
 /// Only use this for commands with small output (`version`, `devices`, `logcat -c`).
 /// Anything that can produce a full log buffer must be streamed (see `stream.rs`) — piping
 /// it here without draining while waiting would deadlock.
-fn run(adb: &Path, args: &[String]) -> Result<String, String> {
+pub(crate) fn run(adb: &Path, args: &[String]) -> Result<String, String> {
     let mut cmd = command(adb);
     cmd.args(args)
         .stdout(Stdio::piped())
@@ -315,6 +315,49 @@ pub fn ps_args(serial: &str) -> Vec<String> {
 /// package is a degraded label, never a reason to fail the capture.
 pub fn process_snapshot(adb: &Path, serial: &str) -> String {
     run(adb, &ps_args(serial)).unwrap_or_default()
+}
+
+/// `adb -s <serial> shell "<script>"` — one device round trip per probe question.
+pub fn shell_args(serial: &str, script: &str) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "shell".to_string(),
+        script.to_string(),
+    ]
+}
+
+/// Run a read-only probe script. Failure is *data*, not an error: an absent `su`, a
+/// non-debuggable package or a missing property all say something about which capture
+/// routes are open. The wrapper swallows stderr and forces a zero exit status so
+/// [`run`] returns stdout instead of turning it into an error string, while still
+/// keeping its 10s timeout so a wedged adb server cannot freeze the UI.
+pub fn shell_probe(adb: &Path, serial: &str, script: &str) -> String {
+    let wrapped = format!("{{ {script} ; }} 2>/dev/null; true");
+    run(adb, &shell_args(serial, &wrapped)).unwrap_or_default()
+}
+
+/// `adb -s <serial> forward tcp:<port> localabstract:<socket>`.
+pub fn forward_args(serial: &str, port: u16, socket: &str) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "forward".to_string(),
+        format!("tcp:{port}"),
+        format!("localabstract:{socket}"),
+    ]
+}
+
+/// `adb -s <serial> forward --remove tcp:<port>` — always paired with a successful
+/// forward, otherwise the PC port stays occupied after the capture ends.
+pub fn forward_remove_args(serial: &str, port: u16) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "forward".to_string(),
+        "--remove".to_string(),
+        format!("tcp:{port}"),
+    ]
 }
 
 #[cfg(test)]

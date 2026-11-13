@@ -208,6 +208,126 @@ export const OPERATORS = [
   { value: 'lte', label: '小于等于' }
 ] as const
 
+// --- 设备网络抓包 ---
+
+export interface HttpHeader {
+  name: string
+  value: string
+}
+
+export interface NetworkRequest {
+  index: number
+  startedAt: string
+  /** HH:MM:SS.mmm，与 logcat 时间轴对齐用的键 */
+  timeKey: string
+  method: string
+  url: string
+  host: string
+  path: string
+  scheme: string
+  /** 0 = 未收到响应 */
+  status: number
+  statusText: string
+  mimeType: string
+  durationMs: number
+  requestSize: number
+  responseSize: number
+  requestHeaders: HttpHeader[]
+  responseHeaders: HttpHeader[]
+  requestBody: string
+  responseBody: string
+  error: string
+  /** har | jsonl | cdp */
+  source: string
+  redacted: boolean
+}
+
+export interface NetworkCaptureStatus {
+  sessionId: string
+  running: boolean
+  entryCount: number
+  events: number
+  target: string
+  error: string
+}
+
+export interface PackageProbe {
+  package: string
+  debuggable: boolean
+  targetSdk: number
+}
+
+export interface DevtoolsProbe {
+  pid: number
+  socket: string
+  package: string
+  browser: string
+  /** 0 表示通道在、但当前没有打开的 H5 页面 */
+  pages: number
+}
+
+export interface DeviceEvidence {
+  serial: string
+  androidRelease: string
+  sdk: number
+  buildType: string
+  debuggableBuild: boolean
+  rootShell: boolean
+  adbRootLikely: boolean
+  proxy: string
+  packages: PackageProbe[]
+  devtools: DevtoolsProbe[]
+}
+
+export interface CaptureRoute {
+  /** cdp | mitm-root | mitm-debug | proxy-metadata */
+  id: string
+  label: string
+  httpsPlaintext: boolean
+  coverage: string
+  available: boolean
+  reason: string
+  steps: string[]
+}
+
+export interface ProbeReport {
+  evidence: DeviceEvidence
+  routes: CaptureRoute[]
+  recommended: string
+  summary: string
+}
+
+export interface CdpCaptureOptions {
+  serial: string
+  /** 留空则自动用体检找到的第一个 WebView 调试通道 */
+  socket: string
+  /** 0 = 用默认端口 */
+  port: number
+}
+
+export interface NetworkSessionInfo {
+  id: string
+  label: string
+  source: string
+  device: string
+  streaming: boolean
+  count: number
+}
+
+export interface NetworkPollResult {
+  id: string
+  requests: NetworkRequest[]
+  status: NetworkCaptureStatus
+  added: number
+}
+
+export interface ProxyState {
+  serial: string
+  proxy: string
+  original: string
+  active: boolean
+}
+
 export const LEVELS = ['V', 'D', 'I', 'W', 'E', 'F', 'A', 'S', '?']
 
 export const LEVEL_LABELS: Record<string, string> = {

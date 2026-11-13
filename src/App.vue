@@ -9,6 +9,7 @@ import StatsPanel from './components/StatsPanel.vue'
 import LogTable from './components/LogTable.vue'
 import LogDetail from './components/LogDetail.vue'
 import DevicePanel from './components/DevicePanel.vue'
+import NetworkPanel from './components/NetworkPanel.vue'
 import ImportOverlay from './components/ImportOverlay.vue'
 import { init, loadFile, store } from './stores/session'
 
@@ -73,6 +74,7 @@ onBeforeUnmount(() => {
     </div>
 
     <DevicePanel v-if="store.devicePanel" />
+    <NetworkPanel v-if="store.networkPanel" />
 
     <Transition name="fade">
       <ImportOverlay v-if="store.importTask?.visible" />

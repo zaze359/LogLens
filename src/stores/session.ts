@@ -151,6 +151,8 @@ export interface AppState {
   rulesPath: string
   /** Device picker dialog visibility. */
   devicePanel: boolean
+  /** Device network capture dialog visibility. */
+  networkPanel: boolean
   /** Last used capture options, so reopening the panel does not start from scratch. */
   lastCapture: DeviceCaptureOptions | null
 }
@@ -184,6 +186,7 @@ export const store = reactive<AppState>({
   collapsed: {},
   rulesPath: '',
   devicePanel: false,
+  networkPanel: false,
   lastCapture: null
 })
 
@@ -459,6 +462,19 @@ export function openDevicePanel(): void {
 
 export function closeDevicePanel(): void {
   store.devicePanel = false
+}
+
+/** Opens the device network capture dialog. */
+export function openNetworkPanel(): void {
+  if (!store.tauriReady) {
+    setNotice('请在 Tauri 客户端中抓取设备网络请求')
+    return
+  }
+  store.networkPanel = true
+}
+
+export function closeNetworkPanel(): void {
+  store.networkPanel = false
 }
 
 /** Follow new device lines until the user stops or adb exits. Opens in its own tab. */
