@@ -68,6 +68,30 @@ mod tests {
         compute_matches(entries, &compiled)
     }
 
+    /// A built-in template has to do something the moment it is clicked.
+    ///
+    /// "指定应用包名" used to ship with `package contains com.example`: clicking it matched
+    /// nothing, and the only way to make it work was to find the editor and rewrite the
+    /// value — which read as a broken button. It was also redundant with the 包名 dropdown,
+    /// whose options are the packages actually present in the loaded log. So: no template
+    /// may carry a value the user is expected to edit first.
+    #[test]
+    fn templates_are_usable_without_editing() {
+        const PLACEHOLDERS: [&str; 3] = ["com.example", "你的包名", "your.package"];
+        for rule in templates() {
+            for c in &rule.group.conditions {
+                for placeholder in PLACEHOLDERS {
+                    assert!(
+                        !c.value.contains(placeholder),
+                        "内置模板 {} 的 {} 条件带了占位值 {placeholder}，点开即零命中",
+                        rule.id,
+                        c.field
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn templates_are_valid_and_have_unique_ids() {
         let items = templates();

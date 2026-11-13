@@ -135,20 +135,6 @@
       }
     },
     {
-      "id": "builtin-package",
-      "name": "指定应用包名",
-      "description": "把 com.example 改成你的包名后另存为自己的规则",
-      "color": "#22d3ee",
-      "builtin": true,
-      "categoryId": "cat-general",
-      "group": {
-        "logic": "AND",
-        "conditions": [
-          { "id": "k1", "field": "package", "op": "contains", "value": "com.example" }
-        ]
-      }
-    },
-    {
       "id": "builtin-security",
       "name": "权限与安全",
       "description": "权限拒绝、证书、Keystore、生物识别",
