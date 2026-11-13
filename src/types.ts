@@ -66,6 +66,11 @@ export interface FilterSpec {
   /** 应用包名（子进程归并到所属包）。多选取并集。 */
   packages: string[]
   search: string
+  /**
+   * `filter`（默认）= 只显示匹配的行；`find` = 只高亮定位，不改变结果集。
+   * 两种模式共用同一个关键字，切换模式决定它是「筛选」还是「查找」。
+   */
+  searchMode: string
   isRegex: boolean
   caseSensitive: boolean
   exclude: string
@@ -156,6 +161,16 @@ export interface OpenProgress {
   entries: number
   /** `parsing` while reading, `indexing` while building facets afterwards. */
   phase: string
+}
+
+/** 查找（`find` 模式）的命中位置：只报告「在哪儿」，不参与过滤。 */
+export interface SearchHits {
+  /** 命中总数（不受 limit 影响）。 */
+  total: number
+  /** 按显示顺序排列的条目 index，最多 limit 个。 */
+  indices: number[]
+  /** index 列表被 limit 截断（总数仍然准确）。 */
+  truncated: boolean
 }
 
 export interface QueryResult {

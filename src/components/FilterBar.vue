@@ -1,7 +1,16 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { LEVELS, LEVEL_LABELS } from '../types'
-import { clearRule, groupSummary, store, updateFilter } from '../stores/session'
+import {
+  clearRule,
+  groupSummary,
+  nextHit,
+  prevHit,
+  setSearchMode,
+  store,
+  updateFilter,
+  updateSearch
+} from '../stores/session'
 
 const search = ref(store.filter.search)
 const exclude = ref(store.filter.exclude)
@@ -11,13 +20,36 @@ const tagChoice = ref('')
 const pidChoice = ref('')
 const packageChoice = ref('')
 
+/** `筛选` 会改变结果集，`查找` 只高亮定位 —— 两种模式共用一个关键字。 */
+const isFind = computed(() => store.filter.searchMode === 'find')
+const canJump = computed(() => (store.searchHits?.indices.length ?? 0) > 0)
+
+const hitLabel = computed(() => {
+  if (!store.filter.search) return '输入关键字'
+  const hits = store.searchHits
+  if (!hits) return store.searchError ? '查找失败' : '查找中…'
+  if (hits.total === 0) return '无匹配'
+  // 光标为空（比如原来是第 5 条，换筛选后那条没了）：只报总数，不假装停在第一条。
+  if (store.searchCursor < 0) return `${hits.total} 处`
+  const more = hits.truncated ? '+' : ''
+  return `${store.searchCursor + 1} / ${hits.total}${more}`
+})
+
+function onEnter(e: KeyboardEvent): void {
+  if (!isFind.value) return
+  e.preventDefault()
+  if (e.shiftKey) prevHit()
+  else nextHit()
+}
+
 // Keep local inputs in sync when a filter is reset or a rule changes the spec.
 watch(() => store.filter.search, (v) => { if (v !== search.value) search.value = v })
 watch(() => store.filter.exclude, (v) => { if (v !== exclude.value) exclude.value = v })
 watch(() => store.filter.timeFrom, (v) => { if (v !== timeFrom.value) timeFrom.value = v })
 watch(() => store.filter.timeTo, (v) => { if (v !== timeTo.value) timeTo.value = v })
 
-watch(search, (v) => updateFilter({ search: v }, true))
+// 搜索框走 `updateSearch`：筛选模式下收窄列表，查找模式下只定位。
+watch(search, (v) => updateSearch(v))
 watch(exclude, (v) => updateFilter({ exclude: v }, true))
 watch(timeFrom, (v) => updateFilter({ timeFrom: v }, true))
 watch(timeTo, (v) => updateFilter({ timeTo: v }, true))
@@ -123,8 +155,37 @@ function toggleOrder(): void {
     </div>
 
     <div class="filter-row">
-      <span class="filter-label">搜索</span>
-      <input v-model="search" class="input search-input mono" placeholder="关键字 / 正则，匹配整行（含堆栈）" />
+      <div class="seg" role="group" aria-label="搜索模式">
+        <button
+          class="seg-btn"
+          :class="{ on: !isFind }"
+          title="筛选：只显示匹配的行，命中数会变"
+          @click="setSearchMode('filter')"
+        >筛选</button>
+        <button
+          class="seg-btn"
+          :class="{ on: isFind }"
+          title="查找：只高亮并跳转，不改变列表"
+          @click="setSearchMode('find')"
+        >查找</button>
+      </div>
+      <input
+        v-model="search"
+        class="input search-input mono"
+        :class="{ 'search-input-compact': isFind }"
+        :placeholder="
+          isFind
+            ? '在结果中查找（高亮 + 跳转，不改列表）'
+            : '关键字 / 正则，匹配整行（含堆栈）'
+        "
+        @keydown.enter="onEnter"
+      />
+      <template v-if="isFind">
+        <span class="hit-count" :class="{ empty: !canJump }">{{ hitLabel }}</span>
+        <button class="btn btn-sm" :disabled="!canJump" title="上一个（Shift+Enter）" @click="prevHit">↑</button>
+        <button class="btn btn-sm" :disabled="!canJump" title="下一个（Enter）" @click="nextHit">↓</button>
+        <span v-if="store.searchError" class="hit-error">{{ store.searchError }}</span>
+      </template>
       <label class="check"><input type="checkbox" :checked="store.filter.isRegex" @change="onRegex" />正则</label>
       <label class="check"><input type="checkbox" :checked="store.filter.caseSensitive" @change="onCaseSensitive" />区分大小写</label>
 

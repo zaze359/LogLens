@@ -12,6 +12,7 @@ import type {
   RuleCategory,
   RuleGroup,
   RulesView,
+  SearchHits,
   StreamStatus
 } from '../types'
 
@@ -96,6 +97,7 @@ export function emptyFilter(): FilterSpec {
     pids: [],
     packages: [],
     search: '',
+    searchMode: 'filter',
     isRegex: false,
     caseSensitive: false,
     exclude: '',
@@ -131,6 +133,14 @@ export interface AppState {
   deviceStream: DeviceStreamInfo | null
   /** Non-null while a log file is being read and parsed. */
   importTask: ImportTask | null
+  // ---- "find" (`searchMode: 'find'`) — a search, not a filter ----
+  /** Where the term appears inside the filtered set; `null` until a find has run. */
+  searchHits: SearchHits | null
+  /** Position inside `searchHits.indices`, `-1` when nothing is selected yet. */
+  searchCursor: number
+  searchError: string
+  /** Row the table should bring into view. `seq` forces a scroll even to the same row. */
+  scrollTarget: { index: number; seq: number } | null
   // ---- global (shared by every tab) ----
   templates: Rule[]
   rules: Rule[]
@@ -163,6 +173,10 @@ export const store = reactive<AppState>({
   scrollTop: 0,
   deviceStream: null,
   importTask: null,
+  searchHits: null,
+  searchCursor: -1,
+  searchError: '',
+  scrollTarget: null,
   templates: [],
   rules: [],
   categories: [],
@@ -270,10 +284,14 @@ export function activateTab(id: string): void {
   store.error = ''
   store.loading = false
   store.loadingMore = false
+  // Find results belong to the tab being left; the new tab may carry a `find` term that has
+  // to be resolved against its own session.
+  clearFind()
   // Set last: `LogTable` watches it to restore the scroll offset.
   store.activeId = id
 
   syncTimers()
+  if (store.filter.searchMode === 'find' && store.filter.search) scheduleFind()
   if (tab.stream) {
     // A background tab was not rendering its deltas, so pull them now — otherwise the
     // user comes back to a list that stops mid-burst.
@@ -540,6 +558,8 @@ async function appendNewMatches(): Promise<void> {
       store.entries = store.entries.concat(result.entries)
     }
     store.result = result
+    // New lines can add hits; keep the counter honest without moving the cursor.
+    if (store.filter.searchMode === 'find' && store.filter.search) scheduleFind(false)
   } finally {
     paging = false
   }
@@ -686,6 +706,9 @@ export async function refresh(): Promise<void> {
     store.result = result
     store.entries = result.entries
     store.error = ''
+    // 「查找」不改变结果集，但命中位置依赖结果集 —— 换筛选/换规则后必须重算，
+    // 否则「3 / 27」会停在上一套条件上。不自动跳转，避免把用户在看的位置拽走。
+    if (store.filter.searchMode === 'find' && store.filter.search) scheduleFind(false)
   } catch (e) {
     if (seq !== requestSeq) return
     store.error = errorMessage(e)
@@ -728,10 +751,160 @@ export function updateFilter(partial: Partial<FilterSpec>, debounce = false): vo
   else void refresh()
 }
 
+/* --------------------------------------------------- search vs. filter ---- */
+
+/**
+ * 「筛选」和「查找」共用一个关键字，由 `searchMode` 决定它的含义：
+ *
+ * - `filter`：参与 `compute_matches`，只显示匹配的行，命中数跟着变。
+ * - `find`：不进过滤条件，只通过 `search_hits` 拿到命中位置，用于高亮和跳转。
+ *
+ * 分开的理由很实际：想「只看匹配的」时是筛，想「在这些里找」时是查。混成一种行为时，
+ * 找一个词会把上下文一起藏掉，而「清空筛选」还会顺手把关键字也清掉。
+ */
+const SEARCH_DEBOUNCE_MS = 250
+/** 命中位置最多取这么多条；再多也没人逐个跳，`total` 仍然准确。 */
+const SEARCH_HIT_LIMIT = 5000
+
+let findTimer: ReturnType<typeof setTimeout> | null = null
+let findSeq = 0
+
+export function isFindMode(): boolean {
+  return store.filter.searchMode === 'find'
+}
+
+/** 搜索框的唯一入口：按当前模式决定收窄列表还是只定位。 */
+export function updateSearch(term: string): void {
+  if (!isFindMode()) {
+    updateFilter({ search: term }, true)
+    return
+  }
+  // 只改关键字，不 refresh：查找不改变结果集。
+  store.filter.search = term
+  scheduleFind()
+}
+
+export function setSearchMode(mode: 'filter' | 'find'): void {
+  if (store.filter.searchMode === mode) return
+  store.filter.searchMode = mode
+  clearFind()
+  if (mode === 'find') {
+    // 从「筛选」切过来：先让列表恢复成全量（去掉关键字造成的收窄），再算命中位置。
+    void refresh().then(() => scheduleFind())
+  } else {
+    void refresh()
+  }
+}
+
+export function clearFind(): void {
+  findSeq++
+  if (findTimer) {
+    clearTimeout(findTimer)
+    findTimer = null
+  }
+  store.searchHits = null
+  store.searchCursor = -1
+  store.searchError = ''
+}
+
+export function scheduleFind(autoJump = true): void {
+  if (!isFindMode()) return
+  if (findTimer) clearTimeout(findTimer)
+  findTimer = setTimeout(() => {
+    findTimer = null
+    void runFind(autoJump)
+  }, SEARCH_DEBOUNCE_MS)
+}
+
+/**
+ * `autoJump` is true when the user just typed (jump to the first hit). It is false when the
+ * result set changed underneath a find — a live capture appending lines, a filter edit — in
+ * which case the cursor must stay where it is, or streaming would yank the view back to hit 1
+ * every 800ms.
+ */
+async function runFind(autoJump: boolean): Promise<void> {
+  const info = store.fileInfo
+  const term = store.filter.search
+  if (!isFindMode() || !info || !term) {
+    clearFind()
+    return
+  }
+  const previous = currentHitIndex.value
+  const seq = ++findSeq
+  try {
+    const hits = await ipc.searchHits(info.sessionId, store.filter, SEARCH_HIT_LIMIT)
+    if (seq !== findSeq) return
+    store.searchHits = hits
+    store.searchError = ''
+    if (autoJump) {
+      store.searchCursor = -1
+      // 有命中就直接停在第一个，省得用户再按一次。
+      if (hits.total > 0) await gotoHit(0)
+    } else {
+      // 沿用原来的位置；那一行被筛掉时退回「未选中」，但不要自己跳走。
+      store.searchCursor = previous < 0 ? -1 : hits.indices.indexOf(previous)
+    }
+  } catch (e) {
+    if (seq !== findSeq) return
+    store.searchHits = null
+    store.searchError = errorMessage(e)
+  }
+}
+
+/** 跳到第 `pos` 个命中（环形，支持 `-1` 表示上一个）。 */
+export async function gotoHit(pos: number): Promise<void> {
+  const hits = store.searchHits
+  if (!hits || hits.indices.length === 0) return
+  const size = hits.indices.length
+  const next = ((pos % size) + size) % size
+  store.searchCursor = next
+  const index = hits.indices[next]
+  await ensureIndexLoaded(index)
+  // `seq` 让同一行的重复跳转也能触发滚动。
+  store.scrollTarget = { index, seq: (store.scrollTarget?.seq ?? 0) + 1 }
+}
+
+export function nextHit(): void {
+  void gotoHit(store.searchCursor + 1)
+}
+
+export function prevHit(): void {
+  void gotoHit(store.searchCursor - 1)
+}
+
+/** 虚拟列表只渲染已加载的分页，命中可能落在还没取回来的页里。 */
+async function ensureIndexLoaded(index: number): Promise<void> {
+  let guard = 0
+  while (store.entries.length <= index && guard < 500) {
+    const before = store.entries.length
+    await loadMore()
+    guard += 1
+    // 到底了，或者期间 filter 变了导致这页取不回来 —— 别死循环。
+    if (store.entries.length === before) break
+  }
+}
+
+/** 当前高亮的那一行（不是已加载条目里的序号，是 entries 的 index）。 */
+export const currentHitIndex = computed(() => {
+  const hits = store.searchHits
+  const cursor = store.searchCursor
+  if (!hits || cursor < 0 || cursor >= hits.indices.length) return -1
+  return hits.indices[cursor]
+})
+
 export function resetFilter(): void {
+  const keepFind = store.filter.searchMode === 'find'
+  const term = store.filter.search
   store.filter = emptyFilter()
+  // 「查找」不属于筛选，清空筛选不应把正在找的词一起清掉。
+  if (keepFind) {
+    store.filter.searchMode = 'find'
+    store.filter.search = term
+  }
   store.activeRuleId = ''
+  clearFind()
   void refresh()
+  if (keepFind && term) scheduleFind()
 }
 
 export function applyRule(rule: Rule): void {

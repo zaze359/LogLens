@@ -11,6 +11,7 @@ import type {
   Rule,
   RuleCategory,
   RulesView,
+  SearchHits,
   StreamStatus
 } from '../types'
 
@@ -42,6 +43,10 @@ export const ipc = {
     invoke<StreamStatus>('poll_device_stream', { sessionId }),
   stopDeviceStream: (sessionId: string) =>
     invoke<void>('stop_device_stream', { sessionId }),
+
+  /** "查找"模式：只返回命中位置，不改变 queryLogs 的结果集。 */
+  searchHits: (sessionId: string, filter: FilterSpec, limit: number) =>
+    invoke<SearchHits>('search_hits', { sessionId, filter: plain(filter), limit }),
 
   queryLogs: (sessionId: string, filter: FilterSpec, offset: number, limit: number) =>
     invoke<QueryResult>('query_logs', {

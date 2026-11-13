@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { loadMore, store } from '../stores/session'
+import { currentHitIndex, loadMore, store } from '../stores/session'
 import type { LogEntry } from '../types'
 
 const ROW_H = 26
@@ -138,6 +138,23 @@ watch(
   }
 )
 
+// A "find" jump asks the table to bring one row into view. `seq` makes repeated jumps to the
+// same row work, and the row may have been paged in only just now — hence `nextTick`.
+watch(
+  () => store.scrollTarget,
+  async (target) => {
+    if (!target) return
+    await nextTick()
+    const el = viewport.value
+    if (!el) return
+    const top = Math.max(0, target.index * ROW_H - Math.round(viewportHeight.value / 3))
+    el.scrollTop = Math.min(top, el.scrollHeight)
+    scrollTop.value = el.scrollTop
+    store.scrollTop = el.scrollTop
+    follow.value = false
+  }
+)
+
 function levelClass(level: string): string {
   return `lv-${level === '?' ? 'unknown' : level.toLowerCase()}`
 }
@@ -199,7 +216,11 @@ function segments(entry: LogEntry): Segment[] {
           v-for="entry in visible"
           :key="entry.index"
           class="log-row"
-          :class="{ selected: store.selected?.index === entry.index, unparsed: !entry.parseOk }"
+          :class="{
+            selected: store.selected?.index === entry.index,
+            hit: currentHitIndex === entry.index,
+            unparsed: !entry.parseOk
+          }"
           @click="store.selected = entry"
         >
           <span class="cell cell-index">{{ entry.index + 1 }}</span>
