@@ -231,9 +231,223 @@ fn make_request(offset_secs: i32, started: f64) -> NetworkRequest {
     }
 }
 
+const MAX_HEAD: usize = 64 * 1024;
+const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
+
+fn read_proxy_line(stream: &mut TcpStream, max: usize) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| format!("读取分块行失败: {e}"))?;
+        if n == 0 {
+            return Err("连接在分块结束前关闭".to_string());
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(line);
+        }
+        if line.len() > max {
+            return Err("分块行过长".to_string());
+        }
+    }
+}
+
+fn parse_chunk_size(line: &[u8]) -> Result<usize, String> {
+    let end = line.iter().position(|b| *b == b';').unwrap_or(line.len());
+    let text = std::str::from_utf8(&line[..end])
+        .map_err(|_| "分块大小不是合法 UTF-8".to_string())?
+        .trim();
+    usize::from_str_radix(text, 16).map_err(|_| format!("非法分块大小: {text}"))
+}
+
+/// Read a chunked request body verbatim, including chunk framing and trailers. Keeping
+/// the bytes framed lets the upstream parse exactly what the client sent; the alternative
+/// (forwarding the header but not the body) leaves the upstream waiting forever.
+fn read_chunked_request(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut raw = Vec::new();
+    loop {
+        if raw.len() > MAX_REQUEST_BODY {
+            return Err("请求体过大".to_string());
+        }
+        let line = read_proxy_line(stream, 8192)?;
+        let size = parse_chunk_size(&line)?;
+        raw.extend_from_slice(&line);
+        if size == 0 {
+            loop {
+                let trailer = read_proxy_line(stream, 8192)?;
+                raw.extend_from_slice(&trailer);
+                if trailer == b"\r\n" || trailer == b"\n" {
+                    break;
+                }
+            }
+            return Ok(raw);
+        }
+        if size > MAX_REQUEST_BODY || raw.len() + size + 2 > MAX_REQUEST_BODY {
+            return Err("请求体过大".to_string());
+        }
+        let mut chunk = vec![0u8; size];
+        stream
+            .read_exact(&mut chunk)
+            .map_err(|e| format!("读取请求体失败: {e}"))?;
+        let mut crlf = [0u8; 2];
+        stream
+            .read_exact(&mut crlf)
+            .map_err(|e| format!("读取请求体失败: {e}"))?;
+        raw.extend_from_slice(&chunk);
+        raw.extend_from_slice(&crlf);
+    }
+}
+
+fn read_response_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| format!("读取上游响应头失败: {e}"))?;
+        if n == 0 {
+            return Err(if head.is_empty() {
+                "上游未返回任何响应".to_string()
+            } else {
+                "上游响应头不完整".to_string()
+            });
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            return Ok(head);
+        }
+        if head.len() > MAX_HEAD {
+            return Err("上游响应头过大".to_string());
+        }
+    }
+}
+
+fn append_capture(captured: &mut Vec<u8>, bytes: &[u8]) {
+    let room = MAX_BODY.saturating_sub(captured.len());
+    if room > 0 {
+        captured.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+}
+
+fn relay_exact(
+    upstream: &mut TcpStream,
+    client: &mut TcpStream,
+    mut remaining: usize,
+    captured: &mut Vec<u8>,
+    total: &mut u64,
+) -> Result<(), String> {
+    let mut buf = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buf.len());
+        upstream
+            .read_exact(&mut buf[..take])
+            .map_err(|e| format!("读取上游响应体失败: {e}"))?;
+        client
+            .write_all(&buf[..take])
+            .map_err(|e| format!("回写客户端失败: {e}"))?;
+        append_capture(captured, &buf[..take]);
+        *total += take as u64;
+        remaining -= take;
+    }
+    Ok(())
+}
+
+fn relay_chunked(
+    upstream: &mut TcpStream,
+    client: &mut TcpStream,
+    captured: &mut Vec<u8>,
+    total: &mut u64,
+) -> Result<(), String> {
+    loop {
+        let line = read_proxy_line(upstream, 8192)?;
+        let size = parse_chunk_size(&line)?;
+        client
+            .write_all(&line)
+            .map_err(|e| format!("回写客户端失败: {e}"))?;
+        append_capture(captured, &line);
+        *total += line.len() as u64;
+        if size == 0 {
+            loop {
+                let trailer = read_proxy_line(upstream, 8192)?;
+                client
+                    .write_all(&trailer)
+                    .map_err(|e| format!("回写客户端失败: {e}"))?;
+                append_capture(captured, &trailer);
+                *total += trailer.len() as u64;
+                if trailer == b"\r\n" || trailer == b"\n" {
+                    return Ok(());
+                }
+            }
+        }
+        let mut remaining = size;
+        let mut buf = [0u8; 16 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(buf.len());
+            upstream
+                .read_exact(&mut buf[..take])
+                .map_err(|e| format!("读取上游响应体失败: {e}"))?;
+            client
+                .write_all(&buf[..take])
+                .map_err(|e| format!("回写客户端失败: {e}"))?;
+            append_capture(captured, &buf[..take]);
+            *total += take as u64;
+            remaining -= take;
+        }
+        let mut crlf = [0u8; 2];
+        upstream
+            .read_exact(&mut crlf)
+            .map_err(|e| format!("读取上游响应体失败: {e}"))?;
+        client
+            .write_all(&crlf)
+            .map_err(|e| format!("回写客户端失败: {e}"))?;
+        append_capture(captured, &crlf);
+        *total += 2;
+    }
+}
+
+fn relay_until_eof(
+    upstream: &mut TcpStream,
+    client: &mut TcpStream,
+    captured: &mut Vec<u8>,
+    total: &mut u64,
+) -> Result<(), String> {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match upstream.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                client
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("回写客户端失败: {e}"))?;
+                append_capture(captured, &buf[..n]);
+                *total += n as u64;
+            }
+            Err(e) => return Err(format!("读取上游响应体失败: {e}")),
+        }
+    }
+}
+
+/// A proxy that cannot get an upstream response must say so. Closing the client socket
+/// with zero bytes makes OkHttp report `unexpected end of stream`, which looks like a
+/// client bug and hides the real upstream failure.
+fn write_gateway_error(client: &mut TcpStream, reason: &str) {
+    let body = format!("代理无法从上游取得响应: {reason}");
+    let head = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = client.write_all(head.as_bytes());
+    let _ = client.write_all(body.as_bytes());
+    let _ = client.flush();
+}
+
 /// Plain HTTP: parse, forward unchanged in origin-form, return the real response to the
-/// client, and record both directions. `Connection: close` on the upstream keeps the
-/// response framing simple; OkHttp will just open a new connection next time.
+/// client, and record both directions. The upstream request asks for `Connection: close`,
+/// but the response is framed by its own headers (`Content-Length` / chunked / EOF) instead
+/// of waiting for the socket to close: a server is allowed to keep the connection alive
+/// regardless of what we asked, and blocking on EOF turns that into a 20s stall.
 fn handle_http(
     mut client: TcpStream,
     request_line: &str,
@@ -246,16 +460,31 @@ fn handle_http(
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("").to_string();
     let headers = header_pairs(head_lines);
+    let transfer_encoding = header_value(&headers, "transfer-encoding").to_ascii_lowercase();
+    let chunked_request = transfer_encoding.contains("chunked");
     let content_length: usize = header_value(&headers, "content-length")
         .parse()
         .unwrap_or(0)
-        .min(4 * 1024 * 1024);
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
+        .min(MAX_REQUEST_BODY);
+    let expects_continue = header_value(&headers, "expect")
+        .to_ascii_lowercase()
+        .contains("100-continue");
+    if expects_continue {
         client
-            .read_exact(&mut body)
-            .map_err(|e| format!("读取请求体失败: {e}"))?;
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .map_err(|e| format!("回复 100 Continue 失败: {e}"))?;
     }
+    let body = if chunked_request {
+        read_chunked_request(&mut client)?
+    } else {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            client
+                .read_exact(&mut body)
+                .map_err(|e| format!("读取请求体失败: {e}"))?;
+        }
+        body
+    };
 
     let (scheme, host_port, path) = if target.starts_with("http://") || target.starts_with("https://") {
         let (s, h, p) = split_url(&target);
@@ -271,51 +500,104 @@ fn handle_http(
         return Err("请求缺少 Host".to_string());
     }
 
-    let mut upstream = TcpStream::connect((host.as_str(), port))
-        .map_err(|e| format!("连接 {host}:{port} 失败: {e}"))?;
+    let mut upstream = match TcpStream::connect((host.as_str(), port)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let reason = format!("连接 {host}:{port} 失败: {e}");
+            write_gateway_error(&mut client, &reason);
+            return Err(reason);
+        }
+    };
     upstream.set_read_timeout(Some(Duration::from_secs(20))).ok();
     upstream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
     let mut forward = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
     for h in &headers {
         let lower = h.name.to_ascii_lowercase();
-        if lower == "host" || lower == "connection" || lower.starts_with("proxy-")
+        if lower == "host"
+            || lower == "connection"
+            || lower == "expect"
+            || lower.starts_with("proxy-")
             || lower == "content-length"
         {
             continue;
         }
         forward.push_str(&format!("{}: {}\r\n", h.name, h.value));
     }
-    if !body.is_empty() {
+    if !chunked_request && !body.is_empty() {
         forward.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     forward.push_str("\r\n");
-    upstream
+    if let Err(e) = upstream
         .write_all(forward.as_bytes())
         .and_then(|_| upstream.write_all(&body))
-        .map_err(|e| format!("转发请求失败: {e}"))?;
+    {
+        let reason = format!("转发请求失败: {e}");
+        write_gateway_error(&mut client, &reason);
+        return Err(reason);
+    }
 
-    let mut response = Vec::new();
-    upstream
-        .read_to_end(&mut response)
-        .map_err(|e| format!("读取上游响应失败: {e}"))?;
-    // The app must receive the untouched bytes regardless of how well we parse them.
-    let _ = client.write_all(&response);
-    let _ = client.flush();
-
-    let split = response.windows(4).position(|w| w == b"\r\n\r\n");
-    let (response_head, response_body) = match split {
-        Some(i) => (&response[..i], &response[i + 4..]),
-        None => (&response[..], &[][..]),
+    let response_head = match read_response_head(&mut upstream) {
+        Ok(head) => head,
+        Err(e) => {
+            write_gateway_error(&mut client, &e);
+            return Err(e);
+        }
     };
-    let head_text = String::from_utf8_lossy(response_head);
+    let head_text = String::from_utf8_lossy(&response_head[..response_head.len() - 4]);
     let mut lines = head_text.split("\r\n");
     let status_line = lines.next().unwrap_or("");
+    if !status_line.starts_with("HTTP/") {
+        let reason = format!("上游返回了非法状态行: {status_line}");
+        write_gateway_error(&mut client, &reason);
+        return Err(reason);
+    }
     let status_parts: Vec<&str> = status_line.splitn(3, ' ').collect();
     let status = status_parts.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
     let status_text = status_parts.get(2).unwrap_or(&"").to_string();
-    let response_headers = header_pairs(&lines.collect::<Vec<_>>());
+    let response_headers = header_pairs(&lines.filter(|l| !l.is_empty()).collect::<Vec<_>>());
     let mime = header_value(&response_headers, "content-type");
+    let chunked_response = header_value(&response_headers, "transfer-encoding")
+        .to_ascii_lowercase()
+        .contains("chunked");
+    let response_length = header_value(&response_headers, "content-length")
+        .parse::<usize>()
+        .ok();
+    let no_body = method.eq_ignore_ascii_case("HEAD")
+        || status == 204
+        || status == 304
+        || (100..200).contains(&status);
+
+    // Rebuild the response head: the body is framed below, and the downstream socket is
+    // closed after this exchange, so the client must be told `Connection: close` even if
+    // the upstream kept its own connection alive.
+    let mut out = Vec::new();
+    out.extend_from_slice(status_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for h in &response_headers {
+        let lower = h.name.to_ascii_lowercase();
+        if lower == "connection" || lower == "keep-alive" || lower == "proxy-connection" {
+            continue;
+        }
+        out.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    client
+        .write_all(&out)
+        .map_err(|e| format!("回写客户端失败: {e}"))?;
+
+    let mut captured = Vec::new();
+    let mut total = 0u64;
+    if !no_body {
+        if chunked_response {
+            relay_chunked(&mut upstream, &mut client, &mut captured, &mut total)?;
+        } else if let Some(length) = response_length {
+            relay_exact(&mut upstream, &mut client, length, &mut captured, &mut total)?;
+        } else {
+            relay_until_eof(&mut upstream, &mut client, &mut captured, &mut total)?;
+        }
+    }
+    let _ = client.flush();
 
     let url = if target.starts_with("http") {
         target.clone()
@@ -332,15 +614,12 @@ fn handle_http(
     request.status_text = status_text;
     request.mime_type = mime.clone();
     request.request_size = body.len() as u64;
-    request.response_size = response_body.len() as u64;
+    request.response_size = total;
     request.request_headers = headers;
     request.response_headers = response_headers;
     if is_textual(&mime) {
         request.request_body = String::from_utf8_lossy(&body[..body.len().min(MAX_BODY)]).into_owned();
-        request.response_body = String::from_utf8_lossy(
-            &response_body[..response_body.len().min(MAX_BODY)],
-        )
-        .into_owned();
+        request.response_body = String::from_utf8_lossy(&captured).into_owned();
     }
     request.duration_ms = ((now_millis() - started).max(0.0) * 1000.0) as u32;
     redact(&mut request);
@@ -480,7 +759,9 @@ fn handle_connection(
     };
     if let Err(reason) = result {
         // A failed connection is evidence, not noise: "the app tried to reach X and the
-        // DNS/TLS/connect step failed" is often the whole bug. Record it as a row.
+        // DNS/TLS/connect step failed" is often the whole bug. Record it as a row, and
+        // also put it on stderr so a foreground `tauri dev` session shows the exact stage.
+        eprintln!("[proxy] {request_line}: {reason}");
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
@@ -581,6 +862,16 @@ impl ProxyCapture {
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(40));
                     }
+                    // A client can vanish between SYN and accept(); that aborts this one
+                    // connection, not the capture. Treating it as fatal used to close the
+                    // listener while the device proxy stayed behind.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::Interrupted
+                            || e.kind() == std::io::ErrorKind::ConnectionAborted
+                            || e.kind() == std::io::ErrorKind::ConnectionReset =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     Err(e) => {
                         if let Ok(mut buffer) = thread_shared.lock() {
                             buffer.error = format!("代理监听异常: {e}");
@@ -633,7 +924,7 @@ impl ProxyCapture {
             Err(poisoned) => poisoned.into_inner(),
         };
         let pending = std::mem::take(&mut buffer.pending);
-        let status = NetworkCaptureStatus {
+        let mut status = NetworkCaptureStatus {
             session_id: self.session_id.clone(),
             running: !buffer.finished,
             entry_count: 0,
@@ -641,18 +932,48 @@ impl ProxyCapture {
             target: self.info.endpoint.clone(),
             error: buffer.error.clone(),
         };
+        let finished = !status.running;
+        drop(buffer);
+        // The listener can die on its own (accept error) without anyone calling stop().
+        // Restore here as well: the guard must not depend on a UI button that may already
+        // be disabled because the capture reports itself as finished.
+        if finished {
+            if let Some(mut guard) = self.guard.take() {
+                if let Err(e) = guard.restore() {
+                    let message = if status.error.is_empty() {
+                        e
+                    } else {
+                        format!("{}；{e}", status.error)
+                    };
+                    if let Ok(mut buffer) = self.shared.lock() {
+                        buffer.error = message.clone();
+                    }
+                    status.error = message;
+                }
+            }
+        }
         (pending, status)
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::Relaxed);
+        let mut errors = Vec::new();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                errors.push("代理监听线程异常退出".to_string());
+            }
         }
+        // Restore unconditionally: the listener being gone says nothing about whether the
+        // device still points at it.
         if let Some(mut guard) = self.guard.take() {
             if let Err(e) = guard.restore() {
-                eprintln!("恢复设备代理失败: {e}");
+                errors.push(e);
             }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("；"))
         }
     }
 }
@@ -770,7 +1091,7 @@ mod tests {
             let n = socket.read(&mut buf).unwrap();
             assert!(String::from_utf8_lossy(&buf[..n]).starts_with("POST /v1/homework HTTP/1.1"));
             socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"code\":0}")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"code\":0}")
                 .unwrap();
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -798,6 +1119,203 @@ mod tests {
         assert_eq!(rows[0].path, "/v1/homework");
         assert_eq!(rows[0].mime_type, "application/json");
         assert_eq!(rows[0].source, "proxy");
+    }
+
+    #[test]
+    fn a_chunked_response_is_forwarded_without_waiting_for_eof() {
+        // A server may ignore `Connection: close`. Framing by chunk boundaries must not
+        // depend on the socket closing, or every response stalls until the 20s timeout.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(1200));
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = listener.local_addr().unwrap();
+        let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
+        let handle = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || {
+                let (client, _) = listener.accept().unwrap();
+                let line = format!("GET http://127.0.0.1:{}/v1/chunked HTTP/1.1", addr.port());
+                handle_http(client, &line, &["Host: 127.0.0.1"], &shared, 0).unwrap();
+            }
+        });
+        let started = std::time::Instant::now();
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let elapsed = started.elapsed();
+        assert!(String::from_utf8_lossy(&response).contains("hello"));
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "chunked 响应不应等上游关闭: {elapsed:?}"
+        );
+        handle.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_content_length_response_does_not_wait_for_upstream_close() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(1200));
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = listener.local_addr().unwrap();
+        let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
+        let handle = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || {
+                let (client, _) = listener.accept().unwrap();
+                let line = format!("GET http://127.0.0.1:{}/v1/length HTTP/1.1", addr.port());
+                handle_http(client, &line, &["Host: 127.0.0.1"], &shared, 0).unwrap();
+            }
+        });
+        let started = std::time::Instant::now();
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let elapsed = started.elapsed();
+        assert!(String::from_utf8_lossy(&response).contains("ok"));
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "Content-Length 响应不应等上游关闭: {elapsed:?}"
+        );
+        handle.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_zero_byte_upstream_close_returns_502() {
+        // This was the `unexpected end of stream`: the proxy forwarded zero bytes and
+        // closed, leaving the client with no status line at all.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = upstream.accept().unwrap();
+            drop(socket);
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = listener.local_addr().unwrap();
+        let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
+        let handle = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || {
+                let (client, _) = listener.accept().unwrap();
+                let line = format!("POST http://127.0.0.1:{}/v1/empty HTTP/1.1", addr.port());
+                let _ = handle_http(client, &line, &["Host: 127.0.0.1"], &shared, 0);
+            }
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 502 Bad Gateway"), "{text}");
+        assert!(text.contains("代理无法从上游取得响应"), "{text}");
+        handle.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_upstream_connect_failure_returns_502() {
+        // Connect failures used to return before any response was written, which looked
+        // exactly like an empty upstream response: zero bytes and EOF on the client.
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = upstream.local_addr().unwrap();
+        drop(upstream);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = listener.local_addr().unwrap();
+        let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
+        let handle = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || {
+                let (client, _) = listener.accept().unwrap();
+                let line = format!("GET http://127.0.0.1:{}/v1/down HTTP/1.1", addr.port());
+                let _ = handle_http(client, &line, &["Host: 127.0.0.1"], &shared, 0);
+            }
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 502 Bad Gateway"), "{text}");
+        assert!(text.contains("连接 127.0.0.1"), "{text}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_chunked_request_body_is_forwarded() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .ok();
+            let mut received = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !received.windows(5).any(|w| w == b"0\r\n\r\n") {
+                match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&received).into_owned());
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client_addr = listener.local_addr().unwrap();
+        let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
+        let handle = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || {
+                let (client, _) = listener.accept().unwrap();
+                let line = format!("POST http://127.0.0.1:{}/v1/chunked-request HTTP/1.1", addr.port());
+                handle_http(
+                    client,
+                    &line,
+                    &[
+                        "Host: 127.0.0.1",
+                        "Transfer-Encoding: chunked",
+                        "Content-Type: application/json",
+                    ],
+                    &shared,
+                    0,
+                )
+                .unwrap();
+            }
+        });
+        let mut client = TcpStream::connect(client_addr).unwrap();
+        // `handle_http` receives the parsed head from its caller; only the body is left
+        // on the socket, exactly like the real `handle_connection` path.
+        client.write_all(b"2\r\n{}\r\n0\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+
+        let seen = rx.recv().unwrap();
+        assert!(seen.contains("Transfer-Encoding: chunked"), "{seen}");
+        assert!(seen.contains("2\r\n{}\r\n0\r\n\r\n"), "{seen}");
+        handle.join().unwrap();
+        server.join().unwrap();
     }
 
     // This is the only ignored proxy test on purpose: the device has a single global
@@ -859,7 +1377,9 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        capture.stop();
+        capture
+            .stop()
+            .expect("停止采集时应能恢复设备代理");
         let after = crate::netprobe::parse_proxy_settings(&adb::shell_probe(
             &adb_path,
             &serial,

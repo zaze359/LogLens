@@ -222,29 +222,40 @@ async function startProxy(): Promise<void> {
 
 async function stopAll(): Promise<void> {
   stopPolling()
+  const failures: string[] = []
   for (const c of captures.value) {
     try {
       await ipc.stopNetworkCapture(c.id)
-    } catch {
-      // The app-level cleanup still runs on window close.
+    } catch (e) {
+      // The app-level cleanup still runs on window close, but the user must know the
+      // device may still point at the now-closed proxy and can use the manual restore.
+      failures.push(errorMessage(e))
     }
   }
   const next = { ...statuses.value }
   for (const id of Object.keys(next)) next[id] = { ...next[id], running: false }
   statuses.value = next
+  if (failures.length > 0) {
+    error.value = `停止采集时未能恢复设备代理：${failures.join('；')}。可在设备代理区域手动恢复。`
+  }
 }
 
 async function closeAll(): Promise<void> {
   stopPolling()
+  const failures: string[] = []
   for (const c of captures.value) {
     try {
       await ipc.closeNetworkCapture(c.id)
-    } catch {
+    } catch (e) {
       // Best effort; ProxyGuard::drop is the final safety net.
+      failures.push(errorMessage(e))
     }
   }
   captures.value = []
   statuses.value = {}
+  if (failures.length > 0) {
+    error.value = `关闭采集时未能恢复设备代理：${failures.join('；')}。可在设备代理区域手动恢复。`
+  }
 }
 
 async function pickCaptureFile(): Promise<void> {

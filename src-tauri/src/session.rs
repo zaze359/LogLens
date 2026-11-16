@@ -227,7 +227,11 @@ impl AppState {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         for (_, mut capture) in captures.drain() {
-            capture.stop();
+            // The device may already be gone; the failure is logged instead of ignored,
+            // and the journal entry is kept for `heal_stale_proxies` / the retry thread.
+            if let Err(e) = capture.stop() {
+                eprintln!("[proxy] 退出时恢复设备代理失败: {e}");
+            }
         }
         let mut guards = self.proxy_guards.lock().unwrap_or_else(|p| p.into_inner());
         guards.clear(); // ProxyGuard::drop restores the original proxy

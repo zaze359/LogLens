@@ -16,12 +16,12 @@ use crate::proxy::ProxyCapture;
 use crate::{adb, netprobe};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -81,6 +81,9 @@ pub struct ProxyGuard {
     original: HashMap<String, String>,
     original_display: String,
     applied: String,
+    /// Distinguishes this application from a later capture on the same device, so a
+    /// delayed restore retry cannot undo the newer capture's proxy.
+    generation: u64,
     active: bool,
 }
 
@@ -116,13 +119,201 @@ fn restore_script(original: &HashMap<String, String>) -> String {
     script
 }
 
+fn original_proxy_display(original: &HashMap<String, String>) -> String {
+    if let Some(direct) = original.get("http_proxy") {
+        if !direct.is_empty() {
+            return direct.clone();
+        }
+    }
+    let host = original
+        .get("global_http_proxy_host")
+        .cloned()
+        .unwrap_or_default();
+    if host.is_empty() {
+        return String::new();
+    }
+    let port = original
+        .get("global_http_proxy_port")
+        .cloned()
+        .unwrap_or_default();
+    if port.is_empty() {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn restore_settings(
     adb_path: &Path,
     serial: &str,
     original: &HashMap<String, String>,
 ) -> Result<(), String> {
     let script = restore_script(original);
-    adb::run(adb_path, &proxy_args(serial, &script)).map(|_| ())
+    adb::run(adb_path, &proxy_args(serial, &script))
+        .map_err(|e| format!("恢复设备代理失败: {e}"))?;
+    // The script ends with `true` so one missing key cannot abort the rest; that also
+    // means adb's exit code proves nothing. Read the values back, otherwise a device
+    // that ignored the write would be reported as restored and its journal deleted.
+    let after_text = adb::run(
+        adb_path,
+        &proxy_args(serial, &netprobe::proxy_settings_script()),
+    )
+    .map_err(|e| format!("恢复后读取设备代理失败: {e}"))?;
+    let actual = netprobe::proxy_from_settings(&after_text);
+    let expected = original_proxy_display(original);
+    if actual != expected {
+        return Err(format!(
+            "恢复后设备代理仍为 {}（期望 {}）",
+            if actual.is_empty() { "直连" } else { &actual },
+            if expected.is_empty() { "直连" } else { &expected }
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Restore retry
+//
+// A restore can fail for a reason that has nothing to do with the proxy: the
+// user switched devices, the cable was pulled, or adb dropped the serial for a
+// moment. Printing one line and giving up leaves the tablet dialling a dead
+// port, so keep the journal entry and retry in the background until the device
+// comes back. A generation counter makes sure an old retry never undoes a proxy
+// that a *new* capture has just applied to the same device.
+// ---------------------------------------------------------------------------
+
+const RESTORE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const RESTORE_RETRY_WINDOW: Duration = Duration::from_secs(600);
+
+fn proxy_generations() -> &'static Mutex<HashMap<String, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_proxy_generation(serial: &str) -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let generation = SEQ.fetch_add(1, Ordering::Relaxed);
+    proxy_generations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(serial.to_string(), generation);
+    generation
+}
+
+fn proxy_generation(serial: &str) -> Option<u64> {
+    proxy_generations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(serial)
+        .copied()
+}
+
+fn forget_proxy_generation(serial: &str, generation: u64) {
+    let mut generations = proxy_generations()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if generations.get(serial) == Some(&generation) {
+        generations.remove(serial);
+    }
+}
+
+fn restore_retries() -> &'static Mutex<HashSet<String>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Keep trying to undo a proxy we set after the first attempt failed.
+///
+/// `generation` is `None` for a heal of a previous run: that retry must give up as
+/// soon as any new capture takes ownership of the device.
+fn schedule_restore_retry(
+    adb_path: &Path,
+    serial: &str,
+    original: &HashMap<String, String>,
+    applied: &str,
+    generation: Option<u64>,
+) {
+    let key = match generation {
+        Some(generation) => format!("{serial}#{generation}"),
+        None => format!("{serial}#heal"),
+    };
+    {
+        // `restore` runs again from `Drop` in some paths; one thread per device/attempt
+        // is enough.
+        let mut active = restore_retries()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !active.insert(key.clone()) {
+            return;
+        }
+    }
+    let recorded_adb = adb_path.to_path_buf();
+    let serial = serial.to_string();
+    let original = original.clone();
+    let applied = applied.to_string();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + RESTORE_RETRY_WINDOW;
+        while Instant::now() < deadline {
+            std::thread::sleep(RESTORE_RETRY_INTERVAL);
+            let superseded = match generation {
+                Some(generation) => proxy_generation(&serial) != Some(generation),
+                // A heal retry is stale the moment a new capture owns the device.
+                None => proxy_generation(&serial).is_some(),
+            };
+            if superseded {
+                // Do not even log: a new capture may legitimately have re-applied a proxy.
+                break;
+            }
+            let adb = if recorded_adb.exists() {
+                recorded_adb.clone()
+            } else if let Some(path) = adb::locate() {
+                path
+            } else {
+                continue;
+            };
+            let online = adb::devices()
+                .map(|devices| {
+                    devices
+                        .iter()
+                        .any(|d| d.serial == serial && d.is_ready())
+                })
+                .unwrap_or(false);
+            if !online {
+                continue;
+            }
+            // The device is back. Only undo a value that is still ours: the user (or
+            // another tool) may have configured a proxy in the meantime.
+            let current = netprobe::proxy_from_settings(&adb::shell_probe(
+                &adb,
+                &serial,
+                &netprobe::proxy_settings_script(),
+            ));
+            if !current.is_empty() && current != applied {
+                eprintln!("[proxy] {serial}: 设备代理已由其他程序改写，不再自动恢复");
+                break;
+            }
+            match restore_settings(&adb, &serial, &original) {
+                Ok(()) => {
+                    clear_proxy_marker(&serial);
+                    if let Some(generation) = generation {
+                        forget_proxy_generation(&serial, generation);
+                    }
+                    eprintln!("[proxy] {serial}: 设备重新上线，已补做代理恢复");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[proxy] {serial}: 补做代理恢复失败，{} 秒后重试: {e}",
+                        RESTORE_RETRY_INTERVAL.as_secs()
+                    );
+                }
+            }
+        }
+        restore_retries()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +386,7 @@ pub fn mark_proxy_applied(
     serial: &str,
     applied: &str,
     original: &HashMap<String, String>,
-) {
+) -> Result<(), String> {
     let mut file = read_proxy_markers();
     file.version = 1;
     file.entries.insert(
@@ -206,9 +397,7 @@ pub fn mark_proxy_applied(
             original: original.clone(),
         },
     );
-    if let Err(e) = write_proxy_markers(&file) {
-        eprintln!("记录设备代理状态失败: {e}");
-    }
+    write_proxy_markers(&file)
 }
 
 pub fn clear_proxy_marker(serial: &str) {
@@ -218,12 +407,12 @@ pub fn clear_proxy_marker(serial: &str) {
     }
 }
 
-/// Take the marker out of the journal (manual restore command).
-pub fn take_proxy_marker(serial: &str) -> Option<ProxyMarkerEntry> {
-    let mut file = read_proxy_markers();
-    let entry = file.entries.remove(serial)?;
-    let _ = write_proxy_markers(&file);
-    Some(entry)
+/// Peek at a journal entry without consuming it.
+///
+/// A failed restore must not delete the entry: it is the only thing the retry
+/// thread and the next start's `heal_stale_proxies` can use to fix the device.
+pub fn proxy_marker(serial: &str) -> Option<ProxyMarkerEntry> {
+    read_proxy_markers().entries.remove(serial)
 }
 
 pub(crate) fn restore_proxy_settings(
@@ -232,6 +421,17 @@ pub(crate) fn restore_proxy_settings(
     original: &HashMap<String, String>,
 ) -> Result<(), String> {
     restore_settings(adb_path, serial, original)
+}
+
+/// Public entry for the manual restore command: retry in the background after a failure
+/// instead of dropping the journal entry on the floor.
+pub(crate) fn schedule_proxy_restore_retry(
+    adb_path: &Path,
+    serial: &str,
+    original: &HashMap<String, String>,
+    applied: &str,
+) {
+    schedule_restore_retry(adb_path, serial, original, applied, None);
 }
 
 /// True when a proxy string points back at this machine. Manual restore uses this
@@ -331,6 +531,15 @@ fn heal_stale_proxies_at(path: &Path) -> String {
         let action = heal_decision(is_online, &current_proxy, &entry.applied);
         match action {
             HealAction::Keep => {
+                // The device is offline right now. Retry while the app runs instead of
+                // only when it is next started; reconnect can happen minutes later.
+                schedule_restore_retry(
+                    &adb_path,
+                    &serial,
+                    &entry.original,
+                    &entry.applied,
+                    None,
+                );
                 remaining.insert(serial, entry);
             }
             HealAction::LeaveAlone => {
@@ -349,6 +558,13 @@ fn heal_stale_proxies_at(path: &Path) -> String {
                     Ok(()) => notes.push(format!("{serial}: {label}")),
                     Err(e) => {
                         notes.push(format!("{serial}: 暂无法清理: {e}"));
+                        schedule_restore_retry(
+                            &adb_path,
+                            &serial,
+                            &entry.original,
+                            &entry.applied,
+                            None,
+                        );
                         remaining.insert(serial, entry);
                     }
                 }
@@ -401,14 +617,25 @@ impl ProxyGuard {
             return Err("设备拒绝了全局代理设置（部分厂商 ROM 忽略该设置）。请在 系统设置 → WLAN → 当前网络 → 高级 → 代理 中手动填写。".to_string());
         }
         // Journal *before* returning: if the process is killed a millisecond later,
-        // the next start must still know this device needs undoing.
-        mark_proxy_applied(adb_path, serial, proxy, &original);
+        // the next start must still know this device needs undoing. If the journal
+        // cannot be persisted, refuse to keep the device proxy: otherwise a crash or
+        // kill leaves the tablet pointed at a dead port with no way to heal it.
+        if let Err(e) = mark_proxy_applied(adb_path, serial, proxy, &original) {
+            let restored = restore_settings(adb_path, serial, &original);
+            return Err(match restored {
+                Ok(()) => format!("无法记录代理状态，已恢复设备代理: {e}"),
+                Err(restore_error) => {
+                    format!("无法记录代理状态（{e}），且恢复设备代理失败: {restore_error}")
+                }
+            });
+        }
         Ok(Self {
             adb_path: adb_path.to_path_buf(),
             serial: serial.to_string(),
             original,
             original_display,
             applied: proxy.to_string(),
+            generation: next_proxy_generation(serial),
             active: true,
         })
     }
@@ -425,12 +652,28 @@ impl ProxyGuard {
         if !self.active {
             return Ok(());
         }
-        let result = restore_settings(&self.adb_path, &self.serial, &self.original);
-        if result.is_ok() {
-            clear_proxy_marker(&self.serial);
+        match restore_settings(&self.adb_path, &self.serial, &self.original) {
+            Ok(()) => {
+                clear_proxy_marker(&self.serial);
+                forget_proxy_generation(&self.serial, self.generation);
+                self.active = false;
+                Ok(())
+            }
+            Err(e) => {
+                // Keep the journal entry and hand the job to a background retry: the
+                // device may simply be absent right now (switched away, cable pulled).
+                schedule_restore_retry(
+                    &self.adb_path,
+                    &self.serial,
+                    &self.original,
+                    &self.applied,
+                    Some(self.generation),
+                );
+                // The retry owns the restore now; `Drop` must not fire a second attempt.
+                self.active = false;
+                Err(e)
+            }
         }
-        self.active = false;
-        result
     }
 }
 
@@ -690,9 +933,12 @@ impl AnyCapture {
         }
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self) -> Result<(), String> {
         match self {
-            AnyCapture::Cdp(c) => c.stop(),
+            AnyCapture::Cdp(c) => {
+                c.stop();
+                Ok(())
+            }
             AnyCapture::Proxy(c) => c.stop(),
         }
     }

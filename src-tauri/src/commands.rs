@@ -955,9 +955,12 @@ pub fn query_network_requests(
 
 #[tauri::command]
 pub fn stop_network_capture(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut stop_error = None;
     if let Ok(mut captures) = state.network_captures.lock() {
         if let Some(mut capture) = captures.remove(&id) {
-            capture.stop();
+            if let Err(e) = capture.stop() {
+                stop_error = Some(e);
+            }
         }
     }
     if let Ok(mut sessions) = state.network_sessions.lock() {
@@ -965,20 +968,29 @@ pub fn stop_network_capture(id: String, state: State<'_, AppState>) -> Result<()
             session.streaming = false;
         }
     }
-    Ok(())
+    match stop_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[tauri::command]
 pub fn close_network_capture(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut stop_error = None;
     if let Ok(mut captures) = state.network_captures.lock() {
         if let Some(mut capture) = captures.remove(&id) {
-            capture.stop();
+            if let Err(e) = capture.stop() {
+                stop_error = Some(e);
+            }
         }
     }
     if let Ok(mut sessions) = state.network_sessions.lock() {
         sessions.remove(&id);
     }
-    Ok(())
+    match stop_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Import a HAR 1.2 file (Charles / mitmproxy / DevTools) or our own JSONL capture.
@@ -1073,7 +1085,11 @@ pub fn restore_device_proxy(
     // No in-memory guard: this is the "app was killed / crashed / cable pulled"
     // case. Fall back to the on-disk journal, then to any proxy still pointing at
     // this machine. Never delete a proxy the user configured on the device.
-    let marker = netcapture::take_proxy_marker(&serial);
+    //
+    // Read the marker without taking it: when the device is gone the restore below
+    // fails, and the entry must survive so the retry thread / next-start heal can
+    // still undo the proxy once it is back.
+    let marker = netcapture::proxy_marker(&serial);
     let current = adb::shell_probe(&adb_path, &serial, &netprobe::proxy_settings_script());
     let current_proxy = netprobe::proxy_from_settings(&current);
     if !current_proxy.is_empty() {
@@ -1091,8 +1107,17 @@ pub fn restore_device_proxy(
     // Always run the restore, even when Settings reads clean: on Android 15 the
     // effective proxy can survive a clean-looking `settings delete`, and only an
     // explicit `:0` makes the system stop handing it to newly started apps.
+    let applied = marker
+        .as_ref()
+        .map(|m| m.applied.clone())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| current_proxy.clone());
     let original = marker.map(|m| m.original).unwrap_or_default();
-    netcapture::restore_proxy_settings(&adb_path, &serial, &original)?;
+    if let Err(e) = netcapture::restore_proxy_settings(&adb_path, &serial, &original) {
+        // Journal entry stays; retry once the device is reachable again.
+        netcapture::schedule_proxy_restore_retry(&adb_path, &serial, &original, &applied);
+        return Err(e);
+    }
     netcapture::clear_proxy_marker(&serial);
     Ok(ProxyState {
         serial,
