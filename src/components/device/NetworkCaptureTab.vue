@@ -22,6 +22,8 @@ const props = defineProps<{ serial: string; active: boolean }>()
 const report = ref<ProbeReport | null>(null)
 const probing = ref(false)
 const busy = ref(false)
+/** 哪个通道正在启动/停止，让两个切换按钮只在自己的操作期间显示忙碌文案。 */
+const busyChannel = ref<'cdp' | 'proxy' | ''>('')
 const error = ref('')
 
 /** WebView and native captures may run together and are merged into one request table. */
@@ -215,6 +217,7 @@ async function prepareLive(): Promise<void> {
 async function startCdp(): Promise<void> {
   if (!canStartCdp.value) return
   busy.value = true
+  busyChannel.value = 'cdp'
   error.value = ''
   try {
     await prepareLive()
@@ -223,12 +226,14 @@ async function startCdp(): Promise<void> {
     error.value = errorMessage(e)
   } finally {
     busy.value = false
+    busyChannel.value = ''
   }
 }
 
 async function startProxy(): Promise<void> {
   if (!canStartProxy.value) return
   busy.value = true
+  busyChannel.value = 'proxy'
   error.value = ''
   try {
     await prepareLive()
@@ -237,26 +242,41 @@ async function startProxy(): Promise<void> {
     error.value = errorMessage(e)
   } finally {
     busy.value = false
+    busyChannel.value = ''
   }
 }
 
-async function stopAll(): Promise<void> {
-  stopPolling()
+/** 每个通道的开始/停止在同一个按钮上切换；停掉一个不影响另一个。 */
+async function stopSource(source: 'cdp' | 'proxy'): Promise<void> {
+  const target = captures.value.filter((c) => c.source === source)
+  if (target.length === 0) return
+  busy.value = true
+  busyChannel.value = source
   const failures: string[] = []
-  for (const c of captures.value) {
-    try {
-      await ipc.stopNetworkCapture(c.id)
-    } catch (e) {
-      // The app-level cleanup still runs on window close, but the user must know the
-      // device may still point at the now-closed proxy and can use the manual restore.
-      failures.push(errorMessage(e))
+  try {
+    for (const c of target) {
+      try {
+        await ipc.stopNetworkCapture(c.id)
+      } catch (e) {
+        // The app-level cleanup still runs on window close, but the user must know the
+        // device may still point at the now-closed proxy and can use the manual restore.
+        failures.push(errorMessage(e))
+      }
     }
-  }
-  const next = { ...statuses.value }
-  for (const id of Object.keys(next)) next[id] = { ...next[id], running: false }
-  statuses.value = next
-  if (failures.length > 0) {
-    error.value = `停止采集时未能恢复设备代理：${failures.join('；')}。可在设备代理区域手动恢复。`
+    const next = { ...statuses.value }
+    for (const c of target) {
+      const status = next[c.id]
+      if (status) next[c.id] = { ...status, running: false }
+    }
+    statuses.value = next
+    if (Object.values(next).every((s) => !s.running)) stopPolling()
+    if (failures.length > 0) {
+      const channel = source === 'proxy' ? '原生采集' : 'H5 采集'
+      error.value = `停止${channel}时未能完成清理：${failures.join('；')}。可在设备代理区域检查并手动恢复。`
+    }
+  } finally {
+    busy.value = false
+    busyChannel.value = ''
   }
 }
 
@@ -485,13 +505,41 @@ defineExpose({ shutdown, isCapturing: running })
 
         <!-- 采集控制：WebView 与原生可同时开，请求合并到同一张表 -->
         <div class="net-controls">
-          <button class="btn btn-primary btn-sm" :disabled="!canStartCdp" @click="startCdp">
-            {{ busy ? '连接中…' : '开始 H5 采集' }}
+          <!-- 两个通道各自在同一个按钮上切换开始/停止；原生是高频主路径，未运行时保持 primary -->
+          <button
+            v-if="proxyRunning"
+            class="btn btn-sm btn-danger-ghost"
+            :disabled="busy"
+            title="停止原生接口采集并还原设备代理"
+            @click="stopSource('proxy')"
+          >
+            {{ busyChannel === 'proxy' ? '停止中…' : '停止原生采集' }}
           </button>
-          <button class="btn btn-sm" :disabled="!canStartProxy" @click="startProxy">
-            开始原生接口采集
+          <button
+            v-else
+            class="btn btn-primary btn-sm"
+            :disabled="!canStartProxy"
+            @click="startProxy"
+          >
+            {{ busyChannel === 'proxy' ? '连接中…' : '开始原生接口采集' }}
           </button>
-          <button class="btn btn-sm" :disabled="!running" @click="stopAll">停止采集</button>
+          <button
+            v-if="cdpRunning"
+            class="btn btn-sm btn-danger-ghost"
+            :disabled="busy"
+            title="停止 H5 采集"
+            @click="stopSource('cdp')"
+          >
+            {{ busyChannel === 'cdp' ? '停止中…' : '停止 H5 采集' }}
+          </button>
+          <button
+            v-else
+            class="btn btn-sm"
+            :disabled="!canStartCdp"
+            @click="startCdp"
+          >
+            {{ busyChannel === 'cdp' ? '连接中…' : '开始 H5 采集' }}
+          </button>
           <button class="btn btn-sm" @click="pickCaptureFile">导入 HAR / JSONL</button>
           <div class="spacer" />
           <span v-if="running" class="live-hint">

@@ -76,6 +76,16 @@ const restoreTarget = computed(() => boundSerial.value || props.serial)
   hex colors (`var(--bg-1)`, `var(--text-dim)`, `var(--accent)`).
 - Reuse shared classes: `btn`, `btn-sm`, `btn-primary`, `btn-ghost`, `input`, `select`,
   `check`, `chip`, `muted`, `mono`, `spacer`.
+- Highlight hierarchy: `btn-primary` marks the single most common / expected action in the
+  current context; alternatives and low-frequency paths stay plain `btn`. Do not use
+  `btn-primary` for every entry point of a feature. Example: in device network capture,
+  native proxy capture is primary and H5 capture is a plain button; a stop action uses
+  `btn-danger-ghost`.
+- Selection / active states all use the accent family: `var(--accent-soft)` background plus
+  `var(--accent)` border or text. Shape may vary with the control (solid accent block for the
+  device tool rail, tinted tab for session tabs, underline for detail sub-tabs, tinted row for
+  table selection), but never introduce a separate blue. Green stays reserved for live /
+  available status, yellow for find hits and warnings, red for destructive actions.
 - Dynamic appearance comes from state classes, not inline style objects, except for values
   that are genuinely computed (column width / scroll transform in `LogTable.vue`).
 - Row height and virtual scrolling constants are DOM/CSS-coupled:
