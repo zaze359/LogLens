@@ -49,6 +49,7 @@ pub fn run() {
             commands::start_proxy_capture,
             commands::poll_network_capture,
             commands::query_network_requests,
+            commands::clear_network_capture,
             commands::stop_network_capture,
             commands::close_network_capture,
             commands::import_network_capture,

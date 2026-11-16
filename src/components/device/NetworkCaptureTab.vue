@@ -49,11 +49,6 @@ let bodyTimer: ReturnType<typeof setTimeout> | null = null
 const proxyInput = ref('')
 const proxyState = ref<ProxyState | null>(null)
 const showAdvanced = ref(false)
-/**
- * The dock is short, so the probe verdict starts as a single line and the four-route
- * reasoning is opt-in. It collapses itself once there is something to watch.
- */
-const showReport = ref(true)
 
 /**
  * The device that currently owns the proxy / CDP forward. The dialog can switch its picker
@@ -68,6 +63,8 @@ const restoreTarget = computed(() => boundSerial.value || props.serial)
 const curlText = computed(() => (selected.value ? toCurl(selected.value) : ''))
 
 let timer: ReturnType<typeof setInterval> | null = null
+/** 清空表格时递增：清空之前发出、清空之后才返回的轮询结果必须丢弃，否则历史会被回填。 */
+let clearEpoch = 0
 
 const cdpSocket = computed(() => report.value?.evidence.devtools[0]?.socket ?? '')
 const canProbe = computed(() => !!props.serial && !probing.value)
@@ -93,6 +90,42 @@ const canStartCdp = computed(
 const canStartProxy = computed(
   () => !!props.serial && !proxyRunning.value && !busy.value && !proxyState.value?.active
 )
+/** 空表引导文案只提当前在跑的通道，否则只开原生采集的人会被 H5 的说法带偏。 */
+const emptyHint = computed(() => {
+  if (!running.value) {
+    return fileMode.value && requests.value.length === 0
+      ? '这份抓包文件里没有解析出请求。'
+      : '暂无请求。可以开始 H5 / 原生接口采集，或导入一份 HAR / JSONL 抓包文件。'
+  }
+  if (cdpRunning.value && proxyRunning.value) {
+    return '等待设备请求…（在 App 里触发接口调用或打开 H5 页面）'
+  }
+  return cdpRunning.value
+    ? '等待 H5 请求…（在 App 里打开一个 WebView 页面）'
+    : '等待原生请求…（在 App 里触发接口调用）'
+})
+/**
+ * 体检时调试通道在、但一个页面都没有：H5 采集收不到数据，值得单独说明。
+ * 页面一旦打开、请求开始进来，这条诊断就该让位给真实数据。
+ */
+const h5NoPage = computed(() => {
+  const devtools = report.value?.evidence.devtools[0]
+  return cdpRunning.value && requests.value.length === 0 && !!devtools && devtools.pages === 0
+})
+/**
+ * 按钮置灰时说明「为什么现在不支持」，否则用户只能看到一个点不动的按钮。
+ * 空串表示可以开始，不需要额外解释。
+ */
+const cdpStartHint = computed(() => {
+  if (!props.serial) return '先选择设备'
+  if (cdpSocket.value) return ''
+  return '未检测到 WebView 调试通道：App 需开启 WebView 调试，或当前没有 WebView 进程'
+})
+const proxyStartHint = computed(() => {
+  if (!props.serial) return '先选择设备'
+  if (proxyState.value?.active) return '设备上已有手动代理，先在下方还原再开始'
+  return ''
+})
 
 function formatSize(bytes: number): string {
   if (bytes <= 0) return '—'
@@ -148,9 +181,12 @@ async function pollAll(): Promise<void> {
     stopPolling()
     return
   }
+  const epoch = clearEpoch
   const settled = await Promise.allSettled(
     captures.value.map((c) => ipc.pollNetworkCapture(c.id))
   )
+  // A poll that started before the table was cleared still carries the old history.
+  if (epoch !== clearEpoch) return
   const next = { ...statuses.value }
   const merged: NetworkRequest[] = []
   let ok = 0
@@ -210,8 +246,6 @@ async function prepareLive(): Promise<void> {
   }
   fileMode.value = false
   boundSerial.value = props.serial
-  // Capture is starting: give the table and the controls the room instead of the cards.
-  showReport.value = false
 }
 
 async function startCdp(): Promise<void> {
@@ -315,6 +349,25 @@ async function pickCaptureFile(): Promise<void> {
     selected.value = null
   } catch (e) {
     error.value = errorMessage(e)
+  }
+}
+
+/**
+ * 清空表格：先清界面再清后端会话缓冲，清空后只显示新进来的请求。
+ * 采集（监听线程 / 设备代理）不受影响，所以不需要停下来再重开。
+ */
+async function clearRequests(): Promise<void> {
+  if (requests.value.length === 0) return
+  clearEpoch += 1
+  requests.value = []
+  selected.value = null
+  if (fileMode.value) return
+  const settled = await Promise.allSettled(
+    captures.value.map((c) => ipc.clearNetworkCapture(c.id))
+  )
+  const failed = settled.find((result) => result.status === 'rejected')
+  if (failed?.status === 'rejected') {
+    error.value = `清空请求失败：${errorMessage(failed.reason)}`
   }
 }
 
@@ -435,29 +488,14 @@ defineExpose({ shutdown, isCapturing: running })
   <div class="device-tab-body net-body">
     <div class="net-main">
       <div class="net-toolbar">
-        <!--
-          The dock is short: keep the environment verdict on one line and put the four-route
-          reasoning behind a toggle. A wall of cards would push the request table — the thing
-          people actually watch — below the fold.
-        -->
-        <template v-if="report">
-          <span class="probe-badge" :class="report.recommended === 'cdp' ? 'ok' : 'muted'">
-            推荐 {{ report.recommended }}
-          </span>
-          <span class="muted mono">
-            Android {{ report.evidence.androidRelease }} / SDK {{ report.evidence.sdk }} ·
-            {{ report.evidence.buildType }} ·
-            {{ report.evidence.rootShell ? '有 root' : '无 root' }}
-          </span>
-        </template>
-        <span v-else class="muted">
-          体检会读取构建类型、WebView 调试通道与目标包的
-          <code class="mono">network_security_config</code>，据此决定哪条采集路线可用。
+        <!-- 用户只关心能不能采到：环境一行带过，采集路线的推理论证留在技术方案里 -->
+        <span v-if="report" class="muted mono">
+          Android {{ report.evidence.androidRelease }} / SDK {{ report.evidence.sdk }} ·
+          {{ report.evidence.buildType }} ·
+          {{ report.evidence.rootShell ? '有 root' : '无 root' }}
         </span>
+        <span v-else class="muted">正在读取设备环境，用来判断两条采集通道是否可用。</span>
         <div class="spacer" />
-        <button v-if="report" class="btn btn-ghost btn-sm" @click="showReport = !showReport">
-          {{ showReport ? '收起详情' : '路线详情' }}
-        </button>
         <button class="btn btn-sm" :disabled="!canProbe || busy" @click="runProbe">
           {{ probing ? '体检中…' : report ? '重新体检' : '运行环境体检' }}
         </button>
@@ -473,35 +511,6 @@ defineExpose({ shutdown, isCapturing: running })
         <p v-if="report?.healedProxy" class="probe-healed">
           已自动修复设备代理：{{ report.healedProxy }}
         </p>
-
-        <template v-if="showReport && report">
-          <div class="probe-summary">
-            <p>{{ report.summary }}</p>
-          </div>
-
-          <div class="route-list">
-            <div
-              v-for="route in report.routes"
-              :key="route.id"
-              class="route-card"
-              :class="{ off: !route.available, recommended: route.id === report.recommended }"
-            >
-              <div class="route-head">
-                <span class="route-state" :class="route.available ? 'on' : 'off'">
-                  {{ route.available ? '可用' : '不可用' }}
-                </span>
-                <b>{{ route.label }}</b>
-                <span v-if="route.httpsPlaintext" class="route-tag">HTTPS 明文</span>
-                <div class="spacer" />
-                <span class="muted">{{ route.coverage }}</span>
-              </div>
-              <p class="route-reason">{{ route.reason }}</p>
-              <ol v-if="route.available && route.id === report.recommended" class="route-steps">
-                <li v-for="(step, i) in route.steps" :key="i">{{ step }}</li>
-              </ol>
-            </div>
-          </div>
-        </template>
 
         <!-- 采集控制：WebView 与原生可同时开，请求合并到同一张表 -->
         <div class="net-controls">
@@ -519,6 +528,7 @@ defineExpose({ shutdown, isCapturing: running })
             v-else
             class="btn btn-primary btn-sm"
             :disabled="!canStartProxy"
+            :title="proxyStartHint || undefined"
             @click="startProxy"
           >
             {{ busyChannel === 'proxy' ? '连接中…' : '开始原生接口采集' }}
@@ -536,11 +546,20 @@ defineExpose({ shutdown, isCapturing: running })
             v-else
             class="btn btn-sm"
             :disabled="!canStartCdp"
+            :title="cdpStartHint || undefined"
             @click="startCdp"
           >
             {{ busyChannel === 'cdp' ? '连接中…' : '开始 H5 采集' }}
           </button>
           <button class="btn btn-sm" @click="pickCaptureFile">导入 HAR / JSONL</button>
+          <button
+            class="btn btn-ghost btn-sm"
+            :disabled="requests.length === 0"
+            title="清空请求列表（采集不中断，之后只显示新请求）"
+            @click="clearRequests"
+          >
+            清空
+          </button>
           <div class="spacer" />
           <span v-if="running" class="live-hint">
             <span class="live-dot" />采集中 · {{ events }} 个事件
@@ -548,15 +567,20 @@ defineExpose({ shutdown, isCapturing: running })
           <span class="muted">{{ requests.length }} 条请求</span>
         </div>
 
-        <!-- 解释性长文放进折叠区：它在第一次用时有用，之后只是占地方 -->
-        <p v-if="showReport" class="net-native-note">
-          <b>原生接口</b>走内建代理：明文 HTTP 可看到完整请求 / 响应；HTTPS 只能看到
-          CONNECT 域名、TLS SNI、耗时与字节数。原生 HTTPS 明文需要 App 信任 MITM 证书，
-          本机目标包未声明 <code class="mono">debug-overrides</code>，因此不做解密，也不会伪装成能看。
-          采集结束后自动还原设备代理。
-        </p>
+        <!-- 用户只关心能力边界：每条通道一句话说清支持什么、不支持什么 -->
+        <ul class="net-capability">
+          <li>
+            <b>原生接口</b>（内建代理）：支持 HTTP 明文全文；不支持 HTTPS 解密，
+            只能拿到域名、SNI、耗时与字节数。采集结束会自动还原设备代理。
+          </li>
+          <li>
+            <b>H5 采集</b>（WebView CDP）：支持 WebView 内的 HTTPS 明文；不支持 App 的原生接口请求，
+            那部分请用原生抓包。
+          </li>
+        </ul>
 
-        <p v-if="report && report.evidence.devtools.length && !report.evidence.devtools[0].pages" class="empty-hint warn">
+        <!-- H5 通道专属提示：只开了原生采集时这条属于噪音 -->
+        <p v-if="h5NoPage" class="empty-hint warn">
           调试通道已就绪，但当前没有打开的 H5 页面。请在 App 里进入一个 WebView 页面，请求会自动出现在这里。
         </p>
         <p v-if="targets" class="empty-hint mono">采集端点：{{ targets }}</p>
@@ -590,13 +614,15 @@ defineExpose({ shutdown, isCapturing: running })
                 <td><span class="net-source" :class="row.source">{{ sourceLabel(row) }}</span></td>
                 <td class="mono">{{ row.method }}</td>
                 <td class="mono net-url" :title="row.url">{{ row.url }}</td>
-                <td class="mono" :class="statusClass(row)">{{ statusText(row) }}</td>
+                <td class="mono" :class="statusClass(row)">
+                  <span class="net-status-text" :title="statusText(row)">{{ statusText(row) }}</span>
+                </td>
                 <td class="mono">{{ row.durationMs }} ms</td>
                 <td class="mono">{{ formatSize(row.responseSize) }}</td>
               </tr>
               <tr v-if="requests.length === 0">
                 <td colspan="7" class="net-empty">
-                  {{ running ? '等待设备请求…（在 App 里触发接口调用或打开 H5 页面）' : '暂无请求。可以开始 H5 / 原生接口采集，或导入一份 HAR / JSONL 抓包文件。' }}
+                  {{ emptyHint }}
                 </td>
               </tr>
             </tbody>
@@ -627,8 +653,8 @@ defineExpose({ shutdown, isCapturing: running })
       </template>
 
       <p class="empty-hint net-foot-note">
-        请求与响应中的 token / Cookie 在落地时即脱敏，不会进入导出文件。
-        关闭本面板会停止采集并还原设备代理。
+        请求与响应中的 token / Cookie 在落盘时即脱敏。
+        <span v-if="running">关闭本面板会停止采集并还原设备代理。</span>
       </p>
     </div>
 
@@ -678,7 +704,7 @@ defineExpose({ shutdown, isCapturing: running })
             响应
           </button>
           <div class="spacer" />
-          <span v-if="selected.redacted" class="route-tag">敏感字段已隐藏</span>
+          <span v-if="selected.redacted" class="net-tag">敏感字段已隐藏</span>
         </div>
 
         <template v-if="detailTab === 'request'">
@@ -740,7 +766,9 @@ defineExpose({ shutdown, isCapturing: running })
             </button>
           </p>
           <pre v-if="selected.responseBody" class="net-body-pre mono">{{ selected.responseBody }}</pre>
-          <p v-else class="muted">无响应体（或不是文本内容；HTTPS 隧道只有域名与字节数）</p>
+          <p v-else class="muted">
+            {{ selected.method === 'CONNECT' ? 'HTTPS 隧道不解密，只有域名、SNI 与字节数' : '无响应体（或不是文本内容）' }}
+          </p>
         </template>
       </div>
     </aside>

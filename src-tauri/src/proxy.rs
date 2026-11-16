@@ -1135,6 +1135,14 @@ impl ProxyCapture {
         self.port
     }
 
+    /// Drop rows the UI has not polled yet. Without this, clearing the table would be
+    /// undone by the next poll, which would push the same history right back.
+    pub fn clear(&mut self) {
+        if let Ok(mut buffer) = self.shared.lock() {
+            buffer.pending.clear();
+        }
+    }
+
     pub fn drain(&mut self) -> (Vec<NetworkRequest>, NetworkCaptureStatus) {
         let mut buffer = match self.shared.lock() {
             Ok(guard) => guard,

@@ -954,6 +954,23 @@ pub fn query_network_requests(
 }
 
 #[tauri::command]
+pub fn clear_network_capture(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    // Two halves must go: rows already handed to earlier polls (the session) and rows the
+    // capture buffered since the last poll — otherwise the next poll restores history.
+    if let Ok(mut captures) = state.network_captures.lock() {
+        if let Some(capture) = captures.get_mut(&id) {
+            capture.clear();
+        }
+    }
+    if let Ok(mut sessions) = state.network_sessions.lock() {
+        if let Some(session) = sessions.get_mut(&id) {
+            session.requests.clear();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn stop_network_capture(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut stop_error = None;
     if let Ok(mut captures) = state.network_captures.lock() {

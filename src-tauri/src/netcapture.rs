@@ -792,6 +792,13 @@ impl NetworkCapture {
         (pending, status)
     }
 
+    /// Drop rows the UI has not polled yet, mirroring the table being cleared.
+    pub fn clear(&mut self) {
+        if let Ok(mut buffer) = self.shared.lock() {
+            buffer.pending.clear();
+        }
+    }
+
     /// Signal the reader and wait for it. The reader thread owns the `adb forward`
     /// cleanup (including its early-exit paths), so joining here guarantees the port is
     /// released before the UI reports the capture as stopped.
@@ -940,6 +947,13 @@ impl AnyCapture {
                 Ok(())
             }
             AnyCapture::Proxy(c) => c.stop(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        match self {
+            AnyCapture::Cdp(c) => c.clear(),
+            AnyCapture::Proxy(c) => c.clear(),
         }
     }
 

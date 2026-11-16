@@ -99,6 +99,7 @@ export const ipc = {
     invoke<NetworkPollResult>('poll_network_capture', { id }),
   queryNetworkRequests: (id: string) =>
     invoke<NetworkRequest[]>('query_network_requests', { id }),
+  clearNetworkCapture: (id: string) => invoke<void>('clear_network_capture', { id }),
   stopNetworkCapture: (id: string) => invoke<void>('stop_network_capture', { id }),
   closeNetworkCapture: (id: string) => invoke<void>('close_network_capture', { id }),
   importNetworkCapture: (path: string) =>
