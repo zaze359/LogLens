@@ -325,3 +325,61 @@ state correctly, but several commands still re-parsed event payload fields with
 local casts. The fix was to make the core event layer own `ThreadChannelEvent`
 and `isThreadEvent`, make `reduceChannelMetadata` the only channel metadata
 projection, and make `reduceThreads` the only thread replay reducer.
+
+---
+
+## LogAnalyse: The Actual Data Flow
+
+```
+log file / adb logcat stdout
+  -> logcat.rs parser (LogEntry: raw, message, continuation, level, pid, package, time_key)
+  -> LogSession.entries (Rust, in memory)
+  -> FilterSpec + rules.rs CompiledFilter -> Vec<LogEntry> page (QueryResult)
+  -> src/lib/ipc.ts (camelCase JSON)
+  -> src/stores/session.ts (active-tab mirror / per-tab snapshots)
+  -> Vue components (LogTable, LogDetail, StatsPanel, NetworkCaptureTab)
+```
+
+Network capture is a parallel pipeline: `adb`/CDP/proxy/HAR -> `network::NetworkRequest` ->
+`NetworkSession` -> `NetworkCaptureTab`. It is deliberately **not** stored in `LogSession`;
+the two timelines share only `timeKey` (`HH:MM:SS.mmm`) for later correlation.
+
+### Boundaries and their owners
+
+| Boundary | Owner | Contract |
+|----------|-------|----------|
+| Device/file -> parser | `logcat.rs` | One `LogEntry` per logical log line, stack traces merged into `message` |
+| Parser -> session | `session.rs` | `index` is assigned by the session, not the parser, for appended entries |
+| Rust -> TS | `model.rs` / domain modules + `types.ts` | camelCase, `#[serde(default)]`, non-optional TS fields |
+| Command -> UI | `commands.rs` + `ipc.ts` | `Result<T, String>`; the string is Chinese and user-facing |
+| Store -> components | `session.ts` | Flat mirror for the active tab; per-tab snapshot on leave |
+| UI -> device cleanup | `DevicePage.vue` + `netcapture.rs` | `shutdownOperations()` plus RAII guards/journal |
+
+### Project-specific cross-layer traps
+
+1. **`find` vs `filter`.** `FilterSpec.searchMode` is a contract, not a UI toggle:
+   - `filter`: the term participates in `compute_matches` and narrows the result set.
+   - `find`: the term never narrows; `search_hits` reports `indices` inside the filtered set.
+   Export and paging always follow `filter`, so `find` must never change what gets written.
+   If a new consumer reads `search`, it must honor `search_mode`.
+2. **`timeKey` alignment.** Logs and network rows are correlated by `timeKey`, while
+   `timestamp` is display-only. Do not compare display timestamps across the two pipelines.
+3. **Progress events carry an identity.** `log-open-progress` echoes `requestId`; the UI must
+   ignore events whose id is not the import it displays. Any new streamed event needs the
+   same kind of correlation key.
+4. **Session ids are the cursor.** Tab id == Rust session id. Do not invent a second id for
+   paging, caching or "the latest" — `LogSession` already assigns entry indices.
+5. **`PAGE_SIZE` and `MAX_TABS` mirror Rust bounds.** If Rust evicts at a different count or
+   pages differently, the UI silently breaks. Change both sides together.
+6. **Optimistic device state is not reality.** A proxy/forward left on the device outlives the
+   process. Cleanup must be reachable from every shutdown path, and startup must self-heal.
+
+### Checklist: Adding A Command Or Wire Field (LogAnalyse)
+
+- [ ] Type added to `src-tauri/src/model.rs` with `camelCase` + `default`
+- [ ] Command implemented in `commands.rs` and registered in `lib.rs`
+- [ ] TS mirror added to `src/types.ts`
+- [ ] Wrapper added to `src/lib/ipc.ts` (and `plain()` used for reactive objects)
+- [ ] Store action guards async results with `requestSeq` / `findSeq`
+- [ ] No component casts raw payload fields; it imports the shared type instead
+- [ ] `cargo test --lib` and `npm run build` pass

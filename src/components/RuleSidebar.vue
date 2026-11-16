@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onBeforeUnmount, ref } from 'vue'
 import { UNCATEGORIZED } from '../types'
 import type { Rule, RuleCategory } from '../types'
 import ConditionEditor from './ConditionEditor.vue'
@@ -32,6 +32,13 @@ const editorRule = ref<Rule | null>(null)
 const editorCategory = ref<RuleCategory | null>(null)
 const confirmDeleteId = ref('')
 let confirmTimer: ReturnType<typeof setTimeout> | null = null
+
+onBeforeUnmount(() => {
+  if (confirmTimer) {
+    clearTimeout(confirmTimer)
+    confirmTimer = null
+  }
+})
 
 function edit(rule: Rule): void {
   editorRule.value = JSON.parse(JSON.stringify(rule)) as Rule

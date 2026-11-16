@@ -221,3 +221,55 @@ rsync -av --delete --exclude='__pycache__' .trellis/scripts/ packages/cli/src/te
 ```
 
 **Gotcha**: Running rsync with wrong source/destination paths can create nested garbage directories (e.g., `.trellis/scripts/packages/cli/...`). Always double-check paths before running.
+
+---
+
+## LogAnalyse: Duplication That Is Intentional
+
+Some duplication is a **contract**, not an accident. Do not "deduplicate" these by adding a
+code generator or a shared schema without a deliberate decision:
+
+| Duplicated item | Location A | Location B | Why |
+|-----------------|------------|------------|-----|
+| Wire structs | `src-tauri/src/model.rs` plus domain modules (`adb.rs`, `network.rs`, `netcapture.rs`, `netprobe.rs`, `config_store.rs`) | `src/types.ts` | Two languages, one JSON contract; must be edited together |
+| Rule field/operator values | `src/types.ts` (`FIELDS`, `OPERATORS`) | `src-tauri/src/rules.rs` match arms | UI offers a whitelist; `rules.rs` has tolerant fallbacks (unknown field -> `message`, unknown op -> pass) |
+| Session/tab limit | `MAX_OPEN_SESSIONS = 4` (`commands.rs`) | `MAX_TABS = 4` (`session.ts`) | UI cannot show more than Rust keeps |
+| Page size | `PAGE_SIZE = 400` (`session.ts`) | `query_logs` offset/limit params | UI owns the chunk size; Rust accepts the caller's `limit` |
+| Search semantics | `FilterSpec.searchMode` (`model.rs` / `types.ts`) | `LogSession::matched_indices` + `find` | `find` must never narrow the set |
+
+### Duplication That Is Not Acceptable
+
+- Parsing logcat lines in TypeScript. `logcat.rs` is the only parser; the UI renders
+  `LogEntry`.
+- Re-implementing rule matching in the frontend to "preview" a rule. Use the `testRule`
+  command / `testCount` field.
+- A second `invoke` wrapper outside `src/lib/ipc.ts` (the documented exception is
+  `NetworkCaptureTab.vue` for capture-specific calls; do not add a third pattern).
+- A second cURL/size/status formatter. `src/lib/curl.ts` and the local formatters exist;
+  promote to `lib/` only when a second consumer appears.
+- Defining a payload shape inside a component. Import it from `types.ts`.
+
+### Where to look before adding a helper
+
+| Need | Existing owner |
+|------|----------------|
+| Invoke/listen/error normalization | `src/lib/ipc.ts` |
+| Deep clone of reactive state | `clone()` in `src/stores/session.ts` |
+| Empty filter defaults | `emptyFilter()` in `src/stores/session.ts` |
+| adb argument construction | `src-tauri/src/adb.rs` (`logcat_args`, `ps_args`, `forward_args`, ...) |
+| Text/regex matching | `src-tauri/src/rules.rs` (`TextMatcher`) |
+| Filter evaluation | `src-tauri/src/rules.rs` (`CompiledFilter`, `compute_matches`) |
+| Facet collection | `src-tauri/src/logcat.rs` (`collect_facets`) |
+| Rule persistence/normalisation | `src-tauri/src/config_store.rs` |
+| Secret redaction | `src-tauri/src/network.rs` (`redact`) |
+
+### Before adding a constant
+
+Search both sides first:
+
+```bash
+grep -rn "MAX_TABS\|MAX_OPEN_SESSIONS\|PAGE_SIZE\|STREAM_POLL_MS" src src-tauri/src
+```
+
+If the value describes a backend bound, it belongs in Rust and the UI should either import it
+via a command or document the mirror in a comment next to its copy.

@@ -785,7 +785,10 @@ function applyStreamStatus(info: FileInfo, status: StreamStatus): void {
 async function syncStream(): Promise<void> {
   const info = store.fileInfo
   const device = store.deviceStream
-  if (!info || !device) return
+  const tab = store.tabs.find((candidate) => candidate.id === info?.sessionId)
+  // Same per-tab guard as `pollInBackground`: a slow poll must not stack another one.
+  if (!info || !device || !tab || tab.polling) return
+  tab.polling = true
   const sessionId = info.sessionId
   try {
     const status: StreamStatus = await ipc.pollDeviceStream(sessionId)
@@ -798,8 +801,7 @@ async function syncStream(): Promise<void> {
     if (!status.running) {
       device.running = false
       info.streaming = false
-      const tab = store.tabs.find((candidate) => candidate.id === sessionId)
-      if (tab) tab.stream = null
+      tab.stream = null
       store.deviceStream = null
       await ipc.stopDeviceStream(sessionId).catch(() => {})
       syncTimers()
@@ -813,14 +815,15 @@ async function syncStream(): Promise<void> {
   } catch (e) {
     // The tab was closed, or the backend already cleaned the stream up. Both poll errors
     // mean the capture is over, so make sure no stale stream record blocks the device.
-    const tab = store.tabs.find((candidate) => candidate.id === sessionId)
-    if (tab) tab.stream = null
+    tab.stream = null
     void ipc.stopDeviceStream(sessionId).catch(() => {})
     if (store.fileInfo?.sessionId === sessionId) {
       store.deviceStream = null
       store.error = errorMessage(e)
     }
     syncTimers()
+  } finally {
+    tab.polling = false
   }
 }
 

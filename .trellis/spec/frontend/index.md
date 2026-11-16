@@ -1,12 +1,25 @@
 # Frontend Development Guidelines
 
-> Best practices for frontend development in this project.
+> Conventions for `src/` — a Vue 3 + TypeScript single-page desktop UI rendered inside Tauri 2.
 
 ---
 
 ## Overview
 
-This directory contains guidelines for frontend development. Fill in each file with your project's specific conventions.
+| Item | Reality in this repo |
+|------|----------------------|
+| Framework | Vue 3.5 SFC, `<script setup lang="ts">` only |
+| Build | Vite 6 (`vite.config.ts`), fixed dev port `1420` |
+| Types | TypeScript strict (`tsconfig.json`), checked by `vue-tsc --noEmit` |
+| State | One module-level `reactive` store in `src/stores/session.ts`. No Pinia, no Vuex |
+| Routing | None. Workspaces are switched with `v-show` / store flags |
+| Styling | One global stylesheet `src/styles/main.css`; no `<style>` blocks. Some layout/size values use inline `style` attributes |
+| Native access | All Rust IPC through `src/lib/ipc.ts`. Components do not call `invoke` directly (one documented exception: `NetworkCaptureTab.vue`) |
+| Tests | No frontend test runner. Verification is `npm run build` (type check + bundle) |
+
+The frontend is a **view layer over Rust-owned state**. Parsing, filtering, paging, rule
+matching and persistence all happen in `src-tauri`. The UI keeps per-tab view snapshots and
+polls live captures; it must not re-implement backend logic.
 
 ---
 
@@ -14,26 +27,24 @@ This directory contains guidelines for frontend development. Fill in each file w
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [Directory Structure](./directory-structure.md) | Module organization and file layout | To fill |
-| [Component Guidelines](./component-guidelines.md) | Component patterns, props, composition | To fill |
-| [Hook Guidelines](./hook-guidelines.md) | Custom hooks, data fetching patterns | To fill |
-| [State Management](./state-management.md) | Local state, global state, server state | To fill |
-| [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
-| [Type Safety](./type-safety.md) | Type patterns, validation | To fill |
+| [Directory Structure](./directory-structure.md) | Module organization and file layout | Ready |
+| [Component Guidelines](./component-guidelines.md) | SFC structure, props/emits, styling, pane lifetime | Ready |
+| [Hook Guidelines](./hook-guidelines.md) | Composition functions, watchers, timers, event subscriptions | Ready |
+| [State Management](./state-management.md) | Singleton store, tab snapshots, request races, polling | Ready |
+| [Quality Guidelines](./quality-guidelines.md) | Verification commands, forbidden patterns, review checklist | Ready |
+| [Type Safety](./type-safety.md) | IPC type mirror, `unknown` handling, `plain()`, casts | Ready |
 
 ---
 
-## How to Fill These Guidelines
+## Cross-layer companion
 
-For each guideline file:
-
-1. Document your project's **actual conventions** (not ideals)
-2. Include **code examples** from your codebase
-3. List **forbidden patterns** and why
-4. Add **common mistakes** your team has made
-
-The goal is to help AI assistants and new team members understand how YOUR project works.
+`src/types.ts` mirrors the Rust wire types: core payloads from `src-tauri/src/model.rs`, plus
+domain payloads defined in `adb.rs`, `network.rs`, `netcapture.rs`, `netprobe.rs` and
+`config_store.rs`. Before changing a wire type, read
+[../backend/directory-structure.md](../backend/directory-structure.md) and
+[../guides/cross-layer-thinking-guide.md](../guides/cross-layer-thinking-guide.md).
 
 ---
 
-**Language**: All documentation should be written in **English**.
+**Language**: Specs are written in English. UI copy, comments and user-facing error strings
+are Chinese, matching the existing codebase.

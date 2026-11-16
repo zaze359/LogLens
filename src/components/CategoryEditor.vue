@@ -28,7 +28,7 @@ async function submit(): Promise<void> {
       <div class="modal-head">
         <span>{{ draft.id ? '编辑分组' : '新建分组' }}</span>
         <div class="spacer" />
-        <button class="btn btn-ghost btn-sm" @click="emit('close')">×</button>
+        <button class="btn btn-ghost btn-sm" title="关闭" aria-label="关闭" @click="emit('close')">×</button>
       </div>
 
       <div class="modal-body">

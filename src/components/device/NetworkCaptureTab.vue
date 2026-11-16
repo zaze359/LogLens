@@ -525,7 +525,12 @@ defineExpose({ shutdown, isCapturing: running })
           >
             {{ curlCopied ? '已复制' : '复制 cURL' }}
           </button>
-          <button class="btn btn-ghost btn-sm" @click="selected = null">×</button>
+          <button
+            class="btn btn-ghost btn-sm"
+            title="关闭请求详情"
+            aria-label="关闭请求详情"
+            @click="selected = null"
+          >×</button>
         </div>
         <div class="net-detail-grid">
           <div>

@@ -27,45 +27,53 @@ const fileTabs = computed<SessionTab[]>(() => store.tabs.filter((tab) => !tab.in
 
 <template>
   <div v-if="store.tabs.length || store.deviceWorkspaces.length" class="tabbar">
-    <button
+    <div
       v-for="serial in store.deviceWorkspaces"
       :key="serial"
       class="tab device-tab-strip"
       :class="{ on: store.deviceView && store.activeSerial === serial }"
-      :title="`设备工作区：${deviceBySerial(serial)?.model || serial}（日志 / 抓包都是它的工具）`"
-      @click="showDeviceWorkspace(serial)"
     >
-      <span class="device-tab-icon">▣</span>
-      <span class="tab-title">{{ deviceBySerial(serial)?.model || serial }}</span>
-      <span class="tab-badge">设备</span>
-      <span
+      <button
+        class="tab-main"
+        :title="`设备工作区：${deviceBySerial(serial)?.model || serial}（日志 / 抓包都是它的工具）`"
+        @click="showDeviceWorkspace(serial)"
+      >
+        <span class="device-tab-icon">▣</span>
+        <span class="tab-title">{{ deviceBySerial(serial)?.model || serial }}</span>
+        <span class="tab-badge">设备</span>
+      </button>
+      <button
         class="tab-x"
-        role="button"
         title="关闭设备工作区（连同它的日志一起关闭，并还原代理）"
+        aria-label="关闭设备工作区"
         @click.stop="closeDeviceWorkspace(serial)"
-      >×</span>
-    </button>
+      >×</button>
+    </div>
 
     <div v-if="store.deviceWorkspaces.length && fileTabs.length" class="tab-sep" />
 
-    <button
+    <div
       v-for="tab in fileTabs"
       :key="tab.id"
       class="tab"
       :class="{ on: tab.id === store.activeId && !store.deviceView, live: !!tab.stream }"
-      :title="`${tab.title}\n${tab.info.path}\n${badge(tab)}`"
-      @click="activateTab(tab.id)"
     >
-      <span v-if="tab.stream" class="live-dot" />
-      <span class="tab-title">{{ tab.title }}</span>
-      <span class="tab-badge">{{ badge(tab) }}</span>
-      <span
+      <button
+        class="tab-main"
+        :title="`${tab.title}\n${tab.info.path}\n${badge(tab)}`"
+        @click="activateTab(tab.id)"
+      >
+        <span v-if="tab.stream" class="live-dot" />
+        <span class="tab-title">{{ tab.title }}</span>
+        <span class="tab-badge">{{ badge(tab) }}</span>
+      </button>
+      <button
         class="tab-x"
-        role="button"
         title="关闭标签"
+        aria-label="关闭标签"
         @click.stop="closeTab(tab.id)"
-      >×</span>
-    </button>
+      >×</button>
+    </div>
 
     <div class="spacer" />
     <span v-if="store.tabs.length > 1" class="tab-hint">
