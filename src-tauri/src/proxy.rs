@@ -287,6 +287,20 @@ fn decode_body(raw: &[u8], chunked: bool, content_encoding: &str) -> Vec<u8> {
     }
 }
 
+/// The listener is non-blocking so the accept loop can poll `stop`; on macOS/BSD the
+/// accepted socket inherits `O_NONBLOCK`, and then the very first `read` of the request
+/// head returns `WouldBlock` before the client has written anything. That was reported as
+/// a 10s timeout after ~2ms, the connection was closed with zero bytes, and OkHttp showed
+/// exactly the reported `unexpected end of stream … limit=0`. Linux does not inherit the
+/// flag, which is why the failure only appeared on some runs. Always hand the connection
+/// back to blocking mode before anything reads from it.
+fn prepare_client(stream: TcpStream) -> Result<TcpStream, String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("恢复阻塞模式失败: {e}"))?;
+    Ok(stream)
+}
+
 /// Read exactly up to `\r\n\r\n`, one byte at a time. A BufReader would prefetch bytes
 /// belonging to the TLS handshake or request body, which breaks CONNECT relaying.
 ///
@@ -1021,7 +1035,14 @@ impl ProxyCapture {
             let local_addr = local_addr.as_str();
             while !thread_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((mut stream, peer)) => {
+                    Ok((stream, peer)) => {
+                        let mut stream = match prepare_client(stream) {
+                            Ok(stream) => stream,
+                            Err(reason) => {
+                                proxy_log(offset_secs, &format!("{reason}"));
+                                continue;
+                            }
+                        };
                         let source = match peer.ip() {
                             std::net::IpAddr::V4(v4) => v4.to_string(),
                             std::net::IpAddr::V6(v6) => v6.to_string(),
@@ -1292,6 +1313,39 @@ mod tests {
         client.join().unwrap();
         assert!(read > 0, "已收到部分请求头，不能被当成空闲连接静默丢弃");
         assert!(!reason.is_empty());
+    }
+
+    /// The real accept loop listens non-blocking, and on macOS/BSD the accepted socket
+    /// inherits that flag: reading before the client wrote anything returned
+    /// `WouldBlock` at once, the socket was closed with zero bytes, and OkHttp reported
+    /// `unexpected end of stream … limit=0`. A client that connects first and sends its
+    /// headers a moment later must still be served.
+    #[test]
+    fn a_client_that_sends_its_request_late_is_not_dropped_after_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(addr).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            socket
+                .write_all(b"POST /v1/late HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("accept 失败: {e}"),
+            }
+        };
+        let mut server = prepare_client(stream).unwrap();
+        let head = read_head(&mut server).expect("连接先建立、请求头稍后到达时不能被丢弃");
+        client.join().unwrap();
+        assert!(head.starts_with("POST /v1/late"), "实际读到: {head}");
     }
 
     #[test]
