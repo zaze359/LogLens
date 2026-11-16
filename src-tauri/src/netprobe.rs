@@ -89,6 +89,87 @@ fn props_script() -> &'static str {
      echo SEC=$(getprop ro.secure)"
 }
 
+/// 探针输出里分隔「键值对」和「socket 列表」两段的标记。dumpsys / getprop 都不会产出它。
+///
+/// 不能用 `#` 开头：`adb::shell_probe` 把脚本包成单行的 `{ … ; }`，`#` 会把行尾的
+/// `; }` 一起注释掉，整条 shell 因为花括号不闭合而失败（输出全空，还看不到报错）。
+const UNIX_MARK: &str = "__UNIX__";
+
+/// 一次 `dumpsys` 覆盖全部已安装包。
+///
+/// 之前是「每个包跑一次 `dumpsys package <pkg>`」，24 个包串行 ≈ 6.5s（单次实测 270ms），
+/// 而 `dumpsys package packages` 全量 191 个包只花 0.45s。grep 在设备端执行，回传的是
+/// 每包两三行（约 30KB），所以传输量也不是问题。
+const PACKAGE_FLAGS_SCRIPT: &str =
+    "dumpsys package packages | grep -E '^  Package \\[|^    flags=\\[|targetSdk='";
+
+/// props + 代理设置 + WebView 调试 socket，一次 shell 拿完。
+///
+/// 拆成三次 `adb shell` 意味着三次 USB 往返（每次 150–250ms），而 `settings get` 只有五个
+/// 键，不值得单独跑一趟。
+fn evidence_script() -> String {
+    format!(
+        "{}; {}; echo {UNIX_MARK}; cat /proc/net/unix | grep -i devtools",
+        props_script(),
+        proxy_settings_script()
+    )
+}
+
+/// 按 [`UNIX_MARK`] 把探针输出切成「键值对段」和「socket 段」。
+fn split_evidence(text: &str) -> (&str, &str) {
+    match text.split_once(UNIX_MARK) {
+        Some((labeled, unix)) => (labeled, unix),
+        None => (text, ""),
+    }
+}
+
+/// 解析 `dumpsys package packages` 的过滤结果。
+///
+/// 输出是「包段落」串起来的：每个包以 `  Package [name] (...)` 开头，段内有
+/// `    versionCode=… minSdk=… targetSdk=…` 和 `    flags=[ DEBUGGABLE … ]`。
+/// 注意权限行里也会出现 `flags=[`，但不在行首，按行首缩进匹配即可排除。
+pub fn parse_package_flags(text: &str) -> Vec<PackageProbe> {
+    let mut out: Vec<PackageProbe> = Vec::new();
+    let mut current: Option<PackageProbe> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("Package [") {
+            if let Some(done) = current.take() {
+                out.push(done);
+            }
+            let name = rest.split(']').next().unwrap_or("").trim();
+            if !name.is_empty() {
+                current = Some(PackageProbe {
+                    package: name.to_string(),
+                    debuggable: false,
+                    target_sdk: 0,
+                });
+            }
+            continue;
+        }
+        let Some(probe) = current.as_mut() else {
+            continue;
+        };
+        if trimmed.starts_with("flags=[") && trimmed.contains("DEBUGGABLE") {
+            probe.debuggable = true;
+        }
+        if let Some(pos) = trimmed.find("targetSdk=") {
+            let digits: String = trimmed[pos + "targetSdk=".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(sdk) = digits.parse::<u32>() {
+                probe.target_sdk = sdk;
+            }
+        }
+    }
+    if let Some(done) = current.take() {
+        out.push(done);
+    }
+    out
+}
+
 pub fn parse_labeled(text: &str) -> HashMap<String, String> {
     text.lines()
         .filter_map(|line| line.trim().split_once('='))
@@ -350,25 +431,43 @@ pub fn assess(evidence: &DeviceEvidence) -> (Vec<CaptureRoute>, String, String) 
 
 /// Run every read-only probe against a connected device and grade the capture routes.
 pub fn probe(adb_path: &Path, serial: &str, packages: &[String]) -> Result<ProbeReport, String> {
-    let props = parse_labeled(&adb::shell_probe(adb_path, serial, props_script()));
-    let root = adb::shell_probe(adb_path, serial, "su -c id");
-    let proxy = adb::shell_probe(adb_path, serial, &proxy_settings_script());
+    // 一次 shell 拿 props / 代理 / socket；`packages` 只在下面那条慢路径上用到。
+    let evidence_text = adb::shell_probe(adb_path, serial, &evidence_script());
+    let (labeled, unix) = split_evidence(&evidence_text);
+    let props = parse_labeled(labeled);
+    let proxy = proxy_from_settings(labeled);
 
-    let mut probed = Vec::new();
-    for package in packages {
-        let script = format!("dumpsys package {package} | grep -E 'targetSdk=|flags=\\['");
-        let dumpsys = adb::shell_probe(adb_path, serial, &script);
-        let (debuggable, target_sdk) = parse_dumpsys(&dumpsys);
-        probed.push(PackageProbe {
-            package: package.clone(),
-            debuggable,
-            target_sdk,
-        });
+    // `command -v su` 先短路：没有 su 的设备上跑 `su -c id` 是白等一趟 shell（有些机型还会
+    // 卡到超时），而 su 存在与否本来就是这里唯一要判断的事。
+    let has_su = !adb::shell_probe(adb_path, serial, "command -v su").trim().is_empty();
+    let root = if has_su {
+        adb::shell_probe(adb_path, serial, "su -c id")
+    } else {
+        String::new()
+    };
+
+    let mut probed = parse_package_flags(&adb::shell_probe(adb_path, serial, PACKAGE_FLAGS_SCRIPT));
+    if probed.is_empty() {
+        // 极少数定制 ROM 的 dumpsys 缩进不一样：退回逐个探测。限 24 个包，够判断有没有
+        // DEBUGGABLE 的包（`mitm-debug` 路线只关心「有没有」）。
+        let list: Vec<String> = if packages.is_empty() {
+            list_packages(adb_path, serial)
+        } else {
+            packages.to_vec()
+        };
+        for package in list.iter().take(24) {
+            let script = format!("dumpsys package {package} | grep -E 'targetSdk=|flags=\\['");
+            let (debuggable, target_sdk) = parse_dumpsys(&adb::shell_probe(adb_path, serial, &script));
+            probed.push(PackageProbe {
+                package: package.clone(),
+                debuggable,
+                target_sdk,
+            });
+        }
     }
 
-    let unix = adb::shell_probe(adb_path, serial, "cat /proc/net/unix | grep -i devtools");
     let mut devtools = Vec::new();
-    for (pid, socket) in parse_devtools_sockets(&unix) {
+    for (pid, socket) in parse_devtools_sockets(unix) {
         let cmdline = adb::shell_probe(
             adb_path,
             serial,
@@ -405,7 +504,7 @@ pub fn probe(adb_path: &Path, serial: &str, packages: &[String]) -> Result<Probe
         debuggable_build: props.get("DBG").map(|s| s == "1").unwrap_or(false),
         root_shell: root.contains("uid=0"),
         adb_root_likely: secure == "0",
-        proxy: proxy_from_settings(&proxy),
+        proxy,
         packages: probed,
         devtools,
     };
@@ -439,6 +538,61 @@ mod tests {
             proxy_from_settings("http_proxy=null\nglobal_http_proxy_host=null"),
             ""
         );
+    }
+
+    #[test]
+    fn splits_the_single_shell_evidence_into_props_and_sockets() {
+        // `evidence_script()` 一次 shell 输出的形状：键值对 → 标记 → /proc/net/unix 行。
+        let text = "REL=15\nSDK=35\nTYPE=user\nDBG=0\nSEC=1\nhttp_proxy=null\n\
+                    __UNIX__\n\
+                    00000000: 00000002 00000000 00010000 0001 01 23456 @webview_devtools_remote_13311\n";
+        let (labeled, unix) = split_evidence(text);
+        let props = parse_labeled(labeled);
+        assert_eq!(props["SDK"], "35");
+        assert_eq!(props["TYPE"], "user");
+        // 标记行不能被当成键值对混进 props。
+        assert!(!props.contains_key(UNIX_MARK));
+
+        let sockets = parse_devtools_sockets(unix);
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].0, 13311);
+        assert!(sockets[0].1.contains("webview_devtools_remote"));
+    }
+
+    /// 合成脚本会被包进单行 `{ … ; }`，任何 `#` 都会把 `; }` 注释掉并让整条 shell 失败。
+    #[test]
+    fn evidence_script_is_safe_inside_a_single_line_shell_block() {
+        let script = evidence_script();
+        assert!(!script.contains('#'), "脚本里不能出现 #：{script}");
+        assert!(script.contains(UNIX_MARK));
+        assert!(script.contains("getprop ro.build.version.release"));
+        assert!(script.contains("settings get global"));
+    }
+
+    /// 批量 `dumpsys package packages` 的解析：一次覆盖全部包，取代「每包一次 dumpsys」。
+    #[test]
+    fn parses_package_flags_from_the_bulk_dumpsys() {
+        // 真实形状（Android 15）：targetSdk 与 versionCode 同行；权限行里也有 `flags=[`，
+        // 但它不在行首，不能被误当成包级 flags。
+        let text = "\
+  Package [com.example.app] (1a2b3c):
+    versionCode=35 minSdk=24 targetSdk=35
+    flags=[ DEBUGGABLE HAS_CODE ALLOW_BACKUP ]
+      android.permission.CAMERA: granted=true, flags=[ USER_SENSITIVE_WHEN_GRANTED]
+  Package [com.vendor.locked] (9f8e7d):
+    versionCode=1 minSdk=29 targetSdk=34
+    flags=[ SYSTEM HAS_CODE ]
+";
+        let packages = parse_package_flags(text);
+        assert_eq!(packages.len(), 2, "两个包段落都应解析出来");
+        assert!(packages[0].debuggable, "DEBUGGABLE 应被识别");
+        assert_eq!(packages[0].target_sdk, 35);
+        assert!(!packages[1].debuggable);
+        assert_eq!(packages[1].target_sdk, 34);
+
+        // 格式不认识时返回空，`probe()` 据此退回逐个探测。
+        assert!(parse_package_flags("").is_empty());
+        assert!(parse_package_flags("dumpsys: not found").is_empty());
     }
 
     #[test]
