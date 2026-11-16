@@ -32,6 +32,43 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_BODY: usize = 64 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Proxy diagnostics also go to a file: `tauri dev` relays stderr through a pipe, so a
+/// session started from an IDE or another shell can hide every `[proxy]` line.
+fn proxy_log_path() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from)?;
+    #[cfg(target_os = "macos")]
+    let base = std::path::PathBuf::from(std::env::var_os("HOME")?)
+        .join("Library/Application Support");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("com.zaze.loglens").join("proxy.log"))
+}
+
+fn proxy_log(offset_secs: i32, message: &str) {
+    let line = format!("{} {message}\n", hms_from_wall_time(now_millis(), offset_secs));
+    let Some(path) = proxy_log_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 2 * 1024 * 1024 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProxyCaptureInfo {
@@ -178,7 +215,11 @@ fn is_textual(mime: &str) -> bool {
 
 /// Read exactly up to `\r\n\r\n`, one byte at a time. A BufReader would prefetch bytes
 /// belonging to the TLS handshake or request body, which breaks CONNECT relaying.
-fn read_head(stream: &mut TcpStream) -> Result<String, String> {
+///
+/// The error carries how many bytes were already received: zero means a half-open or
+/// idle socket that can be dropped silently, while a partial request deserves an
+/// explicit answer instead of a zero-byte close.
+fn read_head(stream: &mut TcpStream) -> Result<String, (usize, String)> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     let mut matched = 0usize;
@@ -188,7 +229,7 @@ fn read_head(stream: &mut TcpStream) -> Result<String, String> {
         .ok();
     loop {
         match stream.read(&mut byte) {
-            Ok(0) => return Err("连接在请求头结束前关闭".to_string()),
+            Ok(0) => return Err((head.len(), "连接在请求头结束前关闭".to_string())),
             Ok(_) => {
                 head.push(byte[0]);
                 if byte[0] == END[matched] {
@@ -200,15 +241,15 @@ fn read_head(stream: &mut TcpStream) -> Result<String, String> {
                     matched = if byte[0] == END[0] { 1 } else { 0 };
                 }
                 if head.len() > 64 * 1024 {
-                    return Err("请求头过大".to_string());
+                    return Err((head.len(), "请求头过大".to_string()));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return Err("读取请求头超时".to_string())
+                return Err((head.len(), "读取请求头超时".to_string()))
             }
-            Err(e) => return Err(format!("读取请求头失败: {e}")),
+            Err(e) => return Err((head.len(), format!("读取请求头失败: {e}"))),
         }
     }
     Ok(String::from_utf8_lossy(&head).into_owned())
@@ -433,13 +474,30 @@ fn relay_until_eof(
 /// with zero bytes makes OkHttp report `unexpected end of stream`, which looks like a
 /// client bug and hides the real upstream failure.
 fn write_gateway_error(client: &mut TcpStream, reason: &str) {
-    let body = format!("代理无法从上游取得响应: {reason}");
+    write_error_response(
+        client,
+        "502 Bad Gateway",
+        &format!("代理无法从上游取得响应: {reason}"),
+    );
+}
+
+/// Malformed request / unreadable request body: still answer, so the device sees the
+/// proxy's reason instead of a bare EOF.
+fn write_bad_request(client: &mut TcpStream, reason: &str) {
+    write_error_response(
+        client,
+        "400 Bad Request",
+        &format!("代理无法解析请求: {reason}"),
+    );
+}
+
+fn write_error_response(client: &mut TcpStream, status: &str, message: &str) {
     let head = format!(
-        "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        message.len()
     );
     let _ = client.write_all(head.as_bytes());
-    let _ = client.write_all(body.as_bytes());
+    let _ = client.write_all(message.as_bytes());
     let _ = client.flush();
 }
 
@@ -475,13 +533,21 @@ fn handle_http(
             .map_err(|e| format!("回复 100 Continue 失败: {e}"))?;
     }
     let body = if chunked_request {
-        read_chunked_request(&mut client)?
+        match read_chunked_request(&mut client) {
+            Ok(body) => body,
+            Err(e) => {
+                write_bad_request(&mut client, &e);
+                return Err(e);
+            }
+        }
     } else {
         let mut body = vec![0u8; content_length];
         if content_length > 0 {
-            client
-                .read_exact(&mut body)
-                .map_err(|e| format!("读取请求体失败: {e}"))?;
+            if let Err(e) = client.read_exact(&mut body) {
+                let reason = format!("读取请求体失败: {e}");
+                write_bad_request(&mut client, &reason);
+                return Err(reason);
+            }
         }
         body
     };
@@ -497,7 +563,9 @@ fn handle_http(
         None => (host_port.clone(), 80),
     };
     if host.is_empty() {
-        return Err("请求缺少 Host".to_string());
+        let reason = "请求缺少 Host".to_string();
+        write_bad_request(&mut client, &reason);
+        return Err(reason);
     }
 
     let mut upstream = match TcpStream::connect((host.as_str(), port)) {
@@ -555,6 +623,7 @@ fn handle_http(
     let status_parts: Vec<&str> = status_line.splitn(3, ' ').collect();
     let status = status_parts.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
     let status_text = status_parts.get(2).unwrap_or(&"").to_string();
+    proxy_log(offset_secs, &format!("{request_line}: 上游 {status}"));
     let response_headers = header_pairs(&lines.filter(|l| !l.is_empty()).collect::<Vec<_>>());
     let mime = header_value(&response_headers, "content-type");
     let chunked_response = header_value(&response_headers, "transfer-encoding")
@@ -582,9 +651,15 @@ fn handle_http(
         out.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
-    client
-        .write_all(&out)
-        .map_err(|e| format!("回写客户端失败: {e}"))?;
+    if let Err(e) = client.write_all(&out) {
+        let reason = format!("回写客户端失败: {e}");
+        proxy_log(offset_secs, &format!("{request_line}: {reason}"));
+        return Err(reason);
+    }
+    proxy_log(
+        offset_secs,
+        &format!("{request_line}: 已回写响应头 {} 字节", out.len()),
+    );
 
     let mut captured = Vec::new();
     let mut total = 0u64;
@@ -598,6 +673,10 @@ fn handle_http(
         }
     }
     let _ = client.flush();
+    proxy_log(
+        offset_secs,
+        &format!("{request_line}: 响应体 {total} 字节，关闭连接"),
+    );
 
     let url = if target.starts_with("http") {
         target.clone()
@@ -738,20 +817,45 @@ fn handle_connect(
 
 fn handle_connection(
     mut client: TcpStream,
+    source: &str,
     shared: Arc<Mutex<ProxyBuffer>>,
     stop: Arc<AtomicBool>,
     offset_secs: i32,
 ) {
+    proxy_log(offset_secs, &format!("{source}: 连接建立"));
     let head = match read_head(&mut client) {
         Ok(head) => head,
-        Err(_) => return, // half-open / health check: no evidence to record
+        // Nothing arrived at all: a health check, or an idle pooled socket being closed.
+        // Still logged to the file — "connected but never sent a request" is exactly the
+        // shape of a stale pooled connection, and it used to leave no trace anywhere.
+        Err((0, reason)) => {
+            proxy_log(
+                offset_secs,
+                &format!("{source}: 未收到请求头（0 字节）: {reason}"),
+            );
+            return;
+        }
+        // A request started and then stalled. Answer explicitly: closing with zero bytes
+        // is what the device reports as `unexpected end of stream`.
+        Err((read, reason)) => {
+            proxy_log(
+                offset_secs,
+                &format!("{source}: 请求头不完整（已读 {read} 字节）: {reason}"),
+            );
+            eprintln!("[proxy] 请求头不完整（已读 {read} 字节）: {reason}");
+            write_bad_request(&mut client, &reason);
+            return;
+        }
     };
     let mut lines = head.split("\r\n");
     let request_line = lines.next().unwrap_or("").to_string();
     let rest: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
     if request_line.is_empty() {
+        proxy_log(offset_secs, &format!("{source}: 请求行缺失"));
+        write_bad_request(&mut client, "请求行缺失");
         return;
     }
+    proxy_log(offset_secs, &format!("{source}: {request_line}"));
     let result = if request_line.starts_with("CONNECT ") {
         handle_connect(client, &request_line, &rest, &shared, stop, offset_secs)
     } else {
@@ -762,6 +866,7 @@ fn handle_connection(
         // DNS/TLS/connect step failed" is often the whole bug. Record it as a row, and
         // also put it on stderr so a foreground `tauri dev` session shows the exact stage.
         eprintln!("[proxy] {request_line}: {reason}");
+        proxy_log(offset_secs, &format!("{request_line}: 失败 {reason}"));
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
@@ -836,7 +941,7 @@ impl ProxyCapture {
             let local_addr = local_addr.as_str();
             while !thread_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, peer)) => {
+                    Ok((mut stream, peer)) => {
                         let source = match peer.ip() {
                             std::net::IpAddr::V4(v4) => v4.to_string(),
                             std::net::IpAddr::V6(v6) => v6.to_string(),
@@ -850,13 +955,24 @@ impl ProxyCapture {
                             && source != "127.0.0.1"
                             && source != "::1"
                         {
+                            // Do not close silently: a changed device IP (DHCP renew,
+                            // Wi-Fi reassociation) would otherwise look exactly like an
+                            // upstream EOF on the device, with nothing in the log.
+                            eprintln!(
+                                "[proxy] 拒绝来源 {source}：仅允许设备 {allowed} 与本机访问（设备 IP 变化时请重新开始采集）"
+                            );
+                            write_error_response(
+                                &mut stream,
+                                "403 Forbidden",
+                                "该代理仅允许已连接的 Android 设备使用",
+                            );
                             drop(stream);
                             continue;
                         }
                         let shared = Arc::clone(&thread_shared);
                         let stop = Arc::clone(&thread_stop);
                         std::thread::spawn(move || {
-                            handle_connection(stream, shared, stop, offset_secs)
+                            handle_connection(stream, &source, shared, stop, offset_secs)
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1077,6 +1193,25 @@ mod tests {
         assert_eq!(header_value(&headers, "HOST"), "api.example.com");
         assert_eq!(header_value(&headers, "content-length"), "3");
         assert_eq!(headers.len(), 3);
+    }
+
+    /// A half-finished request must be distinguishable from an idle socket: the caller
+    /// answers the former with a 400, so the device never sees a bare EOF.
+    #[test]
+    fn a_truncated_request_head_reports_the_bytes_it_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(addr).unwrap();
+            socket.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+            // Drop without the terminating blank line, exactly like a client that died
+            // mid-request.
+        });
+        let (mut server, _) = listener.accept().unwrap();
+        let (read, reason) = read_head(&mut server).unwrap_err();
+        client.join().unwrap();
+        assert!(read > 0, "已收到部分请求头，不能被当成空闲连接静默丢弃");
+        assert!(!reason.is_empty());
     }
 
     #[test]
