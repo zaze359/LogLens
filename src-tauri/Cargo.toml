@@ -20,6 +20,9 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
+# 仅用于「显示」：把抓到的 gzip / deflate / br 响应体解压后再展示，转发字节原样不动。
+flate2 = "1"
+brotli = "9"
 
 [features]
 # This feature is used for production builds where `devUrl` points to the filesystem.

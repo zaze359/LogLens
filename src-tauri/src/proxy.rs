@@ -20,6 +20,7 @@ use crate::adb;
 use crate::cdp::hms_from_wall_time;
 use crate::netcapture::{NetworkCaptureStatus, ProxyGuard};
 use crate::network::{redact, split_url, HttpHeader, NetworkRequest};
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
@@ -211,6 +212,79 @@ fn header_value(headers: &[HttpHeader], name: &str) -> String {
 fn is_textual(mime: &str) -> bool {
     mime.contains("json") || mime.contains("text") || mime.contains("xml")
         || mime.contains("javascript") || mime.contains("urlencoded")
+}
+
+/// Strip chunk framing. Tolerant on purpose: a capture is capped at [`MAX_BODY`], so the
+/// last chunk can be cut in half — the chunks that arrived intact are still worth showing.
+fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < body.len() {
+        let Some(rel) = body[cursor..].windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let line = String::from_utf8_lossy(&body[cursor..cursor + rel]).into_owned();
+        // `1a; ext=…` — chunk extensions are legal, the size is before the semicolon.
+        let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+        else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        cursor += rel + 2;
+        let take = size.min(body.len().saturating_sub(cursor));
+        if take == 0 {
+            break;
+        }
+        out.extend_from_slice(&body[cursor..cursor + take]);
+        if take < size {
+            break;
+        }
+        cursor += size + 2; // trailing CRLF
+    }
+    out
+}
+
+/// Drain a decoder. A truncated capture makes the final block fail with `UnexpectedEof`,
+/// but the plaintext decoded so far is still useful — partial output beats discarding all.
+fn inflate<R: Read>(mut decoder: R) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        match decoder.read(&mut buf) {
+            Ok(0) => return Some(out),
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.len() >= MAX_BODY {
+                    out.truncate(MAX_BODY);
+                    return Some(out);
+                }
+            }
+            Err(_) if !out.is_empty() => return Some(out),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Undo the two transport layers that make a captured body unreadable.
+///
+/// The proxy records the exact bytes it relays: chunk sizes (`23a\r\n` …) plus whatever
+/// `Content-Encoding` the server chose. Shown as text that is pure mojibake — which is what
+/// a gzipped JSON reply looked like: the chunk length, then binary. Both layers are removed
+/// here for display only; the bytes forwarded to the device are untouched, and a body that
+/// still cannot be decoded is returned as-is instead of losing the evidence.
+fn decode_body(raw: &[u8], chunked: bool, content_encoding: &str) -> Vec<u8> {
+    let framed = if chunked { dechunk(raw) } else { raw.to_vec() };
+    match content_encoding.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => inflate(GzDecoder::new(&framed[..])).unwrap_or(framed),
+        // `deflate` is ambiguous in the wild: zlib-wrapped or raw. Try both.
+        "deflate" => inflate(ZlibDecoder::new(&framed[..]))
+            .or_else(|| inflate(DeflateDecoder::new(&framed[..])))
+            .unwrap_or(framed),
+        "br" => inflate(brotli::Decompressor::new(&framed[..], 4096)).unwrap_or(framed),
+        _ => framed,
+    }
 }
 
 /// Read exactly up to `\r\n\r\n`, one byte at a time. A BufReader would prefetch bytes
@@ -697,8 +771,14 @@ fn handle_http(
     request.request_headers = headers;
     request.response_headers = response_headers;
     if is_textual(&mime) {
-        request.request_body = String::from_utf8_lossy(&body[..body.len().min(MAX_BODY)]).into_owned();
-        request.response_body = String::from_utf8_lossy(&captured).into_owned();
+        // Decode for display only: `Transfer-Encoding` and `Content-Encoding` are stripped
+        // from the captured copy, never from the relayed stream.
+        let request_encoding = header_value(&request.request_headers, "content-encoding");
+        let response_encoding = header_value(&request.response_headers, "content-encoding");
+        let request_body = decode_body(&body, chunked_request, &request_encoding);
+        let response_body = decode_body(&captured, chunked_response, &response_encoding);
+        request.request_body = String::from_utf8_lossy(&request_body).into_owned();
+        request.response_body = String::from_utf8_lossy(&response_body).into_owned();
     }
     request.duration_ms = ((now_millis() - started).max(0.0) * 1000.0) as u32;
     redact(&mut request);
@@ -1254,6 +1334,37 @@ mod tests {
         assert_eq!(rows[0].path, "/v1/homework");
         assert_eq!(rows[0].mime_type, "application/json");
         assert_eq!(rows[0].source, "proxy");
+    }
+
+    /// The mojibake in the detail panel: a gzipped, chunked JSON reply was stored with its
+    /// transport framing, so the text began with `23a` and continued with binary bytes.
+    #[test]
+    fn decodes_chunked_gzip_bodies_for_display() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let json = br#"{"code":0,"data":{"name":"work"}}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json).unwrap();
+        let gz = encoder.finish().unwrap();
+
+        // Frame the gzip stream the way an HTTP/1.1 server would, in several chunks.
+        let mut chunked = Vec::new();
+        for part in gz.chunks(17) {
+            chunked.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            chunked.extend_from_slice(part);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+
+        assert_eq!(decode_body(&chunked, true, "gzip"), json.to_vec());
+        // Plain bodies must survive untouched.
+        assert_eq!(
+            decode_body(br#"{"code":0}"#, false, ""),
+            br#"{"code":0}"#.to_vec()
+        );
+        // A truncated capture still yields the plaintext decoded so far.
+        let truncated = &chunked[..chunked.len() / 2];
+        assert!(!decode_body(truncated, true, "gzip").is_empty());
     }
 
     #[test]

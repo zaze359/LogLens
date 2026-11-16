@@ -30,8 +30,19 @@ const statuses = ref<Record<string, NetworkCaptureStatus>>({})
 const requests = ref<NetworkRequest[]>([])
 const fileMode = ref(false)
 const selected = ref<NetworkRequest | null>(null)
+/** 详情抽屉里的当前页签；切换请求时保持不动，方便连续比对多个响应。 */
+const detailTab = ref<'request' | 'response'>('request')
+/**
+ * 头部默认收起哪一段：看返回值的人远多于看响应头的人，所以响应头默认收起；
+ * 请求头是「这条请求到底带了什么」的第一手证据，保持展开。状态跟着人走，不随选中行重置。
+ */
+const requestHeadersOpen = ref(true)
+const responseHeadersOpen = ref(false)
 const curlCopied = ref(false)
 let curlTimer: ReturnType<typeof setTimeout> | null = null
+/** 正文复制按钮的短暂反馈：'request' | 'response' | ''。 */
+const bodyCopied = ref('')
+let bodyTimer: ReturnType<typeof setTimeout> | null = null
 
 const proxyInput = ref('')
 const proxyState = ref<ProxyState | null>(null)
@@ -152,6 +163,15 @@ async function pollAll(): Promise<void> {
     (a.timeKey || '99:99:99.999').localeCompare(b.timeKey || '99:99:99.999')
   )
   requests.value = merged
+  // The drawer holds the object from a previous poll: once the request completes, swap in
+  // the fresh copy or the response body would never appear while it is being watched.
+  const picked = selected.value
+  if (picked) {
+    const fresh = merged.find(
+      (row) => row.source === picked.source && row.index === picked.index
+    )
+    if (fresh) selected.value = fresh
+  }
   if (ok === 0 || Object.values(next).every((s) => !s.running)) stopPolling()
 }
 
@@ -311,6 +331,20 @@ async function copyCurl(): Promise<void> {
   }
 }
 
+/** 一键复制请求体 / 响应体原文（已脱敏、已解压后的文本）。 */
+async function copyBody(which: 'request' | 'response'): Promise<void> {
+  const text = which === 'request' ? selected.value?.requestBody : selected.value?.responseBody
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    bodyCopied.value = which
+    if (bodyTimer) clearTimeout(bodyTimer)
+    bodyTimer = setTimeout(() => (bodyCopied.value = ''), 1600)
+  } catch {
+    error.value = '复制失败，请手动选中文本'
+  }
+}
+
 /**
  * Called by the device dialog before it closes: stop both channels and give the device its
  * proxy back. Kept separate from `onBeforeUnmount` so the dialog can await it and show the
@@ -351,6 +385,8 @@ watch(
       report.value = null
       error.value = ''
       proxyState.value = null
+      // The open detail panel shows a request from the previous device.
+      selected.value = null
     }
     if (report.value && !changed) return
     await runProbe()
@@ -361,6 +397,7 @@ watch(
 onBeforeUnmount(() => {
   stopPolling()
   if (curlTimer) clearTimeout(curlTimer)
+  if (bodyTimer) clearTimeout(bodyTimer)
   // The component can be unmounted without going through shutdown() (window close,
   // store reset). Best effort only: an IPC may not get out while the webview is
   // being torn down. The Rust CloseRequested/Exit hooks and the proxy journal are
@@ -375,222 +412,290 @@ defineExpose({ shutdown, isCapturing: running })
 </script>
 
 <template>
-  <div class="device-tab-body">
-    <div class="net-toolbar">
-      <!--
-        The dock is short: keep the environment verdict on one line and put the four-route
-        reasoning behind a toggle. A wall of cards would push the request table — the thing
-        people actually watch — below the fold.
-      -->
-      <template v-if="report">
-        <span class="probe-badge" :class="report.recommended === 'cdp' ? 'ok' : 'muted'">
-          推荐 {{ report.recommended }}
+  <div class="device-tab-body net-body">
+    <div class="net-main">
+      <div class="net-toolbar">
+        <!--
+          The dock is short: keep the environment verdict on one line and put the four-route
+          reasoning behind a toggle. A wall of cards would push the request table — the thing
+          people actually watch — below the fold.
+        -->
+        <template v-if="report">
+          <span class="probe-badge" :class="report.recommended === 'cdp' ? 'ok' : 'muted'">
+            推荐 {{ report.recommended }}
+          </span>
+          <span class="muted mono">
+            Android {{ report.evidence.androidRelease }} / SDK {{ report.evidence.sdk }} ·
+            {{ report.evidence.buildType }} ·
+            {{ report.evidence.rootShell ? '有 root' : '无 root' }}
+          </span>
+        </template>
+        <span v-else class="muted">
+          体检会读取构建类型、WebView 调试通道与目标包的
+          <code class="mono">network_security_config</code>，据此决定哪条采集路线可用。
         </span>
-        <span class="muted mono">
-          Android {{ report.evidence.androidRelease }} / SDK {{ report.evidence.sdk }} ·
-          {{ report.evidence.buildType }} ·
-          {{ report.evidence.rootShell ? '有 root' : '无 root' }}
-        </span>
-      </template>
-      <span v-else class="muted">
-        体检会读取构建类型、WebView 调试通道与目标包的
-        <code class="mono">network_security_config</code>，据此决定哪条采集路线可用。
-      </span>
-      <div class="spacer" />
-      <button v-if="report" class="btn btn-ghost btn-sm" @click="showReport = !showReport">
-        {{ showReport ? '收起详情' : '路线详情' }}
-      </button>
-      <button class="btn btn-sm" :disabled="!canProbe || busy" @click="runProbe">
-        {{ probing ? '体检中…' : report ? '重新体检' : '运行环境体检' }}
-      </button>
-    </div>
+        <div class="spacer" />
+        <button v-if="report" class="btn btn-ghost btn-sm" @click="showReport = !showReport">
+          {{ showReport ? '收起详情' : '路线详情' }}
+        </button>
+        <button class="btn btn-sm" :disabled="!canProbe || busy" @click="runProbe">
+          {{ probing ? '体检中…' : report ? '重新体检' : '运行环境体检' }}
+        </button>
+      </div>
 
-    <p v-if="!serial" class="empty-hint warn">
-      先在设备选择器里选一台已授权的设备，再回来体检并开始采集。
-    </p>
-
-    <template v-else>
-
-      <!-- 代理自愈是异常状态，任何时候都要露出来，不能藏在折叠里 -->
-      <p v-if="report?.healedProxy" class="probe-healed">
-        已自动修复设备代理：{{ report.healedProxy }}
+      <p v-if="!serial" class="empty-hint warn">
+        先在设备选择器里选一台已授权的设备，再回来体检并开始采集。
       </p>
 
-      <template v-if="showReport && report">
-        <div class="probe-summary">
-          <p>{{ report.summary }}</p>
+      <template v-else>
+
+        <!-- 代理自愈是异常状态，任何时候都要露出来，不能藏在折叠里 -->
+        <p v-if="report?.healedProxy" class="probe-healed">
+          已自动修复设备代理：{{ report.healedProxy }}
+        </p>
+
+        <template v-if="showReport && report">
+          <div class="probe-summary">
+            <p>{{ report.summary }}</p>
+          </div>
+
+          <div class="route-list">
+            <div
+              v-for="route in report.routes"
+              :key="route.id"
+              class="route-card"
+              :class="{ off: !route.available, recommended: route.id === report.recommended }"
+            >
+              <div class="route-head">
+                <span class="route-state" :class="route.available ? 'on' : 'off'">
+                  {{ route.available ? '可用' : '不可用' }}
+                </span>
+                <b>{{ route.label }}</b>
+                <span v-if="route.httpsPlaintext" class="route-tag">HTTPS 明文</span>
+                <div class="spacer" />
+                <span class="muted">{{ route.coverage }}</span>
+              </div>
+              <p class="route-reason">{{ route.reason }}</p>
+              <ol v-if="route.available && route.id === report.recommended" class="route-steps">
+                <li v-for="(step, i) in route.steps" :key="i">{{ step }}</li>
+              </ol>
+            </div>
+          </div>
+        </template>
+
+        <!-- 采集控制：WebView 与原生可同时开，请求合并到同一张表 -->
+        <div class="net-controls">
+          <button class="btn btn-primary btn-sm" :disabled="!canStartCdp" @click="startCdp">
+            {{ busy ? '连接中…' : '开始 H5 采集' }}
+          </button>
+          <button class="btn btn-sm" :disabled="!canStartProxy" @click="startProxy">
+            开始原生接口采集
+          </button>
+          <button class="btn btn-sm" :disabled="!running" @click="stopAll">停止采集</button>
+          <button class="btn btn-sm" @click="pickCaptureFile">导入 HAR / JSONL</button>
+          <div class="spacer" />
+          <span v-if="running" class="live-hint">
+            <span class="live-dot" />采集中 · {{ events }} 个事件
+          </span>
+          <span class="muted">{{ requests.length }} 条请求</span>
         </div>
 
-        <div class="route-list">
-          <div
-            v-for="route in report.routes"
-            :key="route.id"
-            class="route-card"
-            :class="{ off: !route.available, recommended: route.id === report.recommended }"
-          >
-            <div class="route-head">
-              <span class="route-state" :class="route.available ? 'on' : 'off'">
-                {{ route.available ? '可用' : '不可用' }}
-              </span>
-              <b>{{ route.label }}</b>
-              <span v-if="route.httpsPlaintext" class="route-tag">HTTPS 明文</span>
-              <div class="spacer" />
-              <span class="muted">{{ route.coverage }}</span>
+        <!-- 解释性长文放进折叠区：它在第一次用时有用，之后只是占地方 -->
+        <p v-if="showReport" class="net-native-note">
+          <b>原生接口</b>走内建代理：明文 HTTP 可看到完整请求 / 响应；HTTPS 只能看到
+          CONNECT 域名、TLS SNI、耗时与字节数。原生 HTTPS 明文需要 App 信任 MITM 证书，
+          本机目标包未声明 <code class="mono">debug-overrides</code>，因此不做解密，也不会伪装成能看。
+          采集结束后自动还原设备代理。
+        </p>
+
+        <p v-if="report && report.evidence.devtools.length && !report.evidence.devtools[0].pages" class="empty-hint warn">
+          调试通道已就绪，但当前没有打开的 H5 页面。请在 App 里进入一个 WebView 页面，请求会自动出现在这里。
+        </p>
+        <p v-if="targets" class="empty-hint mono">采集端点：{{ targets }}</p>
+        <p v-for="c in captures" :key="c.id" class="empty-hint mono">
+          {{ c.label }} · {{ statuses[c.id]?.error || (statuses[c.id]?.running ? '运行中' : '已停止') }}
+        </p>
+        <p v-if="error" class="empty-hint error-text">{{ error }}</p>
+
+        <!-- 请求列表：H5 + 原生按时间合并；点行在右侧面板看全文，不在行下展开 -->
+        <div class="net-table-wrap">
+          <table class="net-table">
+            <thead>
+              <tr>
+                <th style="width: 96px">时间</th>
+                <th style="width: 48px">来源</th>
+                <th style="width: 62px">方法</th>
+                <th>URL</th>
+                <th style="width: 190px">状态</th>
+                <th style="width: 76px">耗时</th>
+                <th style="width: 80px">大小</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="row in requests"
+                :key="row.source + '-' + row.index"
+                :class="{ picked: selected?.index === row.index && selected?.source === row.source }"
+                @click="selected = row"
+              >
+                <td class="mono">{{ row.timeKey || row.startedAt || '—' }}</td>
+                <td><span class="net-source" :class="row.source">{{ sourceLabel(row) }}</span></td>
+                <td class="mono">{{ row.method }}</td>
+                <td class="mono net-url" :title="row.url">{{ row.url }}</td>
+                <td class="mono" :class="statusClass(row)">{{ statusText(row) }}</td>
+                <td class="mono">{{ row.durationMs }} ms</td>
+                <td class="mono">{{ formatSize(row.responseSize) }}</td>
+              </tr>
+              <tr v-if="requests.length === 0">
+                <td colspan="7" class="net-empty">
+                  {{ running ? '等待设备请求…（在 App 里触发接口调用或打开 H5 页面）' : '暂无请求。可以开始 H5 / 原生接口采集，或导入一份 HAR / JSONL 抓包文件。' }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 手动代理：供外部 MITM 工具使用，与内建代理采集互斥 -->
+        <div class="net-advanced">
+          <button class="btn btn-ghost btn-sm" @click="showAdvanced = !showAdvanced">
+            {{ showAdvanced ? '收起' : '展开' }} · 手动 MITM 代理设置（外部抓包工具）
+          </button>
+          <div v-if="showAdvanced" class="net-advanced-body">
+            <div class="form-row">
+              <span class="form-label">代理</span>
+              <input v-model="proxyInput" class="select mono" style="flex: 1" placeholder="例如 10.0.0.2:8080" />
+              <button class="btn btn-sm" :disabled="!serial || !proxyInput" @click="configureProxy">设置</button>
+              <button class="btn btn-sm" :disabled="!proxyState?.active" @click="restoreProxy">还原</button>
             </div>
-            <p class="route-reason">{{ route.reason }}</p>
-            <ol v-if="route.available && route.id === report.recommended" class="route-steps">
-              <li v-for="(step, i) in route.steps" :key="i">{{ step }}</li>
-            </ol>
+            <p class="empty-hint">
+              这里是给 Charles / mitmproxy 等外部工具手动指向设备用的；上面「原生接口采集」会自动设置并还原代理，两者不要同时用。
+              Android 7+ 的 release 包不信任用户 CA，HTTPS 明文仍取决于证书条件。
+            </p>
+            <p v-if="proxyState?.active" class="empty-hint warn mono">
+              当前生效：{{ proxyState.proxy }}（原值：{{ proxyState.original || '无' }}）
+            </p>
           </div>
         </div>
       </template>
 
-      <!-- 采集控制：WebView 与原生可同时开，请求合并到同一张表 -->
-      <div class="net-controls">
-        <button class="btn btn-primary btn-sm" :disabled="!canStartCdp" @click="startCdp">
-          {{ busy ? '连接中…' : '开始 H5 采集' }}
-        </button>
-        <button class="btn btn-sm" :disabled="!canStartProxy" @click="startProxy">
-          开始原生接口采集
-        </button>
-        <button class="btn btn-sm" :disabled="!running" @click="stopAll">停止采集</button>
-        <button class="btn btn-sm" @click="pickCaptureFile">导入 HAR / JSONL</button>
+      <p class="empty-hint net-foot-note">
+        请求与响应中的 token / Cookie 在落地时即脱敏，不会进入导出文件。
+        关闭本面板会停止采集并还原设备代理。
+      </p>
+    </div>
+
+    <!--
+      选中请求详情：与日志详情同一种交互 —— 点行在右侧看全文，不在行下展开。
+      请求 / 响应分成两个页签，省掉在长列表里上下找段落的麻烦。
+    -->
+    <aside v-if="selected" class="net-drawer">
+      <div class="net-drawer-head">
+        <b class="mono">{{ selected.method }}</b>
+        <span class="mono" :class="statusClass(selected)">{{ statusText(selected) }}</span>
         <div class="spacer" />
-        <span v-if="running" class="live-hint">
-          <span class="live-dot" />采集中 · {{ events }} 个事件
-        </span>
-        <span class="muted">{{ requests.length }} 条请求</span>
+        <button
+          v-if="curlText"
+          class="btn btn-ghost btn-sm"
+          :class="{ copied: curlCopied }"
+          :title="selected.redacted ? '复制为 cURL 命令（token / Cookie 等为脱敏值）' : '复制为 cURL 命令'"
+          @click="copyCurl"
+        >
+          {{ curlCopied ? '已复制' : '复制 cURL' }}
+        </button>
+        <button
+          class="btn btn-ghost btn-sm"
+          title="关闭请求详情"
+          aria-label="关闭请求详情"
+          @click="selected = null"
+        >×</button>
       </div>
+      <div class="net-drawer-body">
+        <p class="net-drawer-url mono">{{ selected.url }}</p>
+        <dl class="kv">
+          <dt>来源</dt><dd>{{ sourceLabel(selected) }}</dd>
+          <dt>时间</dt><dd class="mono">{{ selected.timeKey || selected.startedAt || '—' }}</dd>
+          <dt>耗时</dt><dd class="mono">{{ selected.durationMs }} ms</dd>
+          <dt>大小</dt><dd class="mono">{{ formatSize(selected.responseSize) }}</dd>
+          <dt>类型</dt><dd class="mono">{{ selected.mimeType || '—' }}</dd>
+          <template v-if="selected.error">
+            <dt>错误</dt><dd class="empty-hint error-text">{{ selected.error }}</dd>
+          </template>
+        </dl>
 
-      <!-- 解释性长文放进折叠区：它在第一次用时有用，之后只是占地方 -->
-      <p v-if="showReport" class="net-native-note">
-        <b>原生接口</b>走内建代理：明文 HTTP 可看到完整请求 / 响应；HTTPS 只能看到
-        CONNECT 域名、TLS SNI、耗时与字节数。原生 HTTPS 明文需要 App 信任 MITM 证书，
-        本机目标包未声明 <code class="mono">debug-overrides</code>，因此不做解密，也不会伪装成能看。
-        采集结束后自动还原设备代理。
-      </p>
-
-      <p v-if="report && report.evidence.devtools.length && !report.evidence.devtools[0].pages" class="empty-hint warn">
-        调试通道已就绪，但当前没有打开的 H5 页面。请在 App 里进入一个 WebView 页面，请求会自动出现在这里。
-      </p>
-      <p v-if="targets" class="empty-hint mono">采集端点：{{ targets }}</p>
-      <p v-for="c in captures" :key="c.id" class="empty-hint mono">
-        {{ c.label }} · {{ statuses[c.id]?.error || (statuses[c.id]?.running ? '运行中' : '已停止') }}
-      </p>
-      <p v-if="error" class="empty-hint error-text">{{ error }}</p>
-
-      <!-- 请求列表：H5 + 原生按时间合并 -->
-      <div class="net-table-wrap">
-        <table class="net-table">
-          <thead>
-            <tr>
-              <th style="width: 96px">时间</th>
-              <th style="width: 48px">来源</th>
-              <th style="width: 62px">方法</th>
-              <th>URL</th>
-              <th style="width: 190px">状态</th>
-              <th style="width: 76px">耗时</th>
-              <th style="width: 80px">大小</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="row in requests"
-              :key="row.source + '-' + row.index"
-              :class="{ picked: selected?.index === row.index && selected?.source === row.source }"
-              @click="selected = row"
-            >
-              <td class="mono">{{ row.timeKey || row.startedAt || '—' }}</td>
-              <td><span class="net-source" :class="row.source">{{ sourceLabel(row) }}</span></td>
-              <td class="mono">{{ row.method }}</td>
-              <td class="mono net-url" :title="row.url">{{ row.url }}</td>
-              <td class="mono" :class="statusClass(row)">{{ statusText(row) }}</td>
-              <td class="mono">{{ row.durationMs }} ms</td>
-              <td class="mono">{{ formatSize(row.responseSize) }}</td>
-            </tr>
-            <tr v-if="requests.length === 0">
-              <td colspan="7" class="net-empty">
-                {{ running ? '等待设备请求…（在 App 里触发接口调用或打开 H5 页面）' : '暂无请求。可以开始 H5 / 原生接口采集，或导入一份 HAR / JSONL 抓包文件。' }}
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <!-- 选中请求详情 -->
-      <div v-if="selected" class="net-detail">
-        <div class="net-detail-head">
-          <b class="mono">{{ selected.method }} {{ selected.url }}</b>
+        <div class="net-tabs">
+          <button class="net-tab" :class="{ on: detailTab === 'request' }" @click="detailTab = 'request'">
+            请求
+          </button>
+          <button class="net-tab" :class="{ on: detailTab === 'response' }" @click="detailTab = 'response'">
+            响应
+          </button>
           <div class="spacer" />
           <span v-if="selected.redacted" class="route-tag">敏感字段已隐藏</span>
-          <button
-            v-if="curlText"
-            class="btn btn-ghost btn-sm"
-            :class="{ copied: curlCopied }"
-            :title="
-              selected.redacted
-                ? '复制为 cURL 命令（token / Cookie 等为脱敏值）'
-                : '复制为 cURL 命令'
-            "
-            @click="copyCurl"
-          >
-            {{ curlCopied ? '已复制' : '复制 cURL' }}
-          </button>
-          <button
-            class="btn btn-ghost btn-sm"
-            title="关闭请求详情"
-            aria-label="关闭请求详情"
-            @click="selected = null"
-          >×</button>
         </div>
-        <div class="net-detail-grid">
-          <div>
-            <p class="net-detail-title">请求头</p>
-            <p v-for="(h, i) in selected.requestHeaders" :key="i" class="mono">
+
+        <template v-if="detailTab === 'request'">
+          <button
+            class="net-section-toggle"
+            :class="{ open: requestHeadersOpen }"
+            :aria-expanded="requestHeadersOpen"
+            @click="requestHeadersOpen = !requestHeadersOpen"
+          >
+            <span class="net-caret" />请求头
+            <span class="muted">{{ selected.requestHeaders.length }}</span>
+          </button>
+          <template v-if="requestHeadersOpen">
+            <p v-for="(h, i) in selected.requestHeaders" :key="i" class="mono net-header-line">
               {{ h.name }}: {{ h.value }}
             </p>
             <p v-if="!selected.requestHeaders.length" class="muted">—</p>
-            <p v-if="selected.requestBody" class="net-detail-title">请求体</p>
-            <pre v-if="selected.requestBody" class="mono">{{ selected.requestBody }}</pre>
-          </div>
-          <div>
-            <p class="net-detail-title">响应头</p>
-            <p v-for="(h, i) in selected.responseHeaders" :key="i" class="mono">
+          </template>
+          <p class="net-section-title">
+            <span>请求体</span>
+            <button
+              v-if="selected.requestBody"
+              class="btn btn-ghost btn-sm"
+              :class="{ copied: bodyCopied === 'request' }"
+              @click="copyBody('request')"
+            >
+              {{ bodyCopied === 'request' ? '已复制' : '复制' }}
+            </button>
+          </p>
+          <pre v-if="selected.requestBody" class="net-body-pre mono">{{ selected.requestBody }}</pre>
+          <p v-else class="muted">无请求体（或不是文本内容）</p>
+        </template>
+
+        <template v-else>
+          <button
+            class="net-section-toggle"
+            :class="{ open: responseHeadersOpen }"
+            :aria-expanded="responseHeadersOpen"
+            @click="responseHeadersOpen = !responseHeadersOpen"
+          >
+            <span class="net-caret" />响应头
+            <span class="muted">{{ selected.responseHeaders.length }}</span>
+          </button>
+          <template v-if="responseHeadersOpen">
+            <p v-for="(h, i) in selected.responseHeaders" :key="i" class="mono net-header-line">
               {{ h.name }}: {{ h.value }}
             </p>
             <p v-if="!selected.responseHeaders.length" class="muted">—</p>
-            <p v-if="selected.responseBody" class="net-detail-title">响应体</p>
-            <pre v-if="selected.responseBody" class="mono">{{ selected.responseBody }}</pre>
-          </div>
-        </div>
-      </div>
-
-      <!-- 手动代理：供外部 MITM 工具使用，与内建代理采集互斥 -->
-      <div class="net-advanced">
-        <button class="btn btn-ghost btn-sm" @click="showAdvanced = !showAdvanced">
-          {{ showAdvanced ? '收起' : '展开' }} · 手动 MITM 代理设置（外部抓包工具）
-        </button>
-        <div v-if="showAdvanced" class="net-advanced-body">
-          <div class="form-row">
-            <span class="form-label">代理</span>
-            <input v-model="proxyInput" class="select mono" style="flex: 1" placeholder="例如 10.0.0.2:8080" />
-            <button class="btn btn-sm" :disabled="!serial || !proxyInput" @click="configureProxy">设置</button>
-            <button class="btn btn-sm" :disabled="!proxyState?.active" @click="restoreProxy">还原</button>
-          </div>
-          <p class="empty-hint">
-            这里是给 Charles / mitmproxy 等外部工具手动指向设备用的；上面「原生接口采集」会自动设置并还原代理，两者不要同时用。
-            Android 7+ 的 release 包不信任用户 CA，HTTPS 明文仍取决于证书条件。
+          </template>
+          <p class="net-section-title">
+            <span>响应体</span>
+            <button
+              v-if="selected.responseBody"
+              class="btn btn-ghost btn-sm"
+              :class="{ copied: bodyCopied === 'response' }"
+              @click="copyBody('response')"
+            >
+              {{ bodyCopied === 'response' ? '已复制' : '复制' }}
+            </button>
           </p>
-          <p v-if="proxyState?.active" class="empty-hint warn mono">
-            当前生效：{{ proxyState.proxy }}（原值：{{ proxyState.original || '无' }}）
-          </p>
-        </div>
+          <pre v-if="selected.responseBody" class="net-body-pre mono">{{ selected.responseBody }}</pre>
+          <p v-else class="muted">无响应体（或不是文本内容；HTTPS 隧道只有域名与字节数）</p>
+        </template>
       </div>
-    </template>
-
-    <p class="empty-hint net-foot-note">
-      请求与响应中的 token / Cookie 在落地时即脱敏，不会进入导出文件。
-      关闭本面板会停止采集并还原设备代理。
-    </p>
+    </aside>
   </div>
 </template>
+
