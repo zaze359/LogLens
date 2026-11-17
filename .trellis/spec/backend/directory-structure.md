@@ -22,6 +22,7 @@ src-tauri/
     ├── adb.rs               # adb discovery, command/arg builders, device parsing, probes
     ├── rules.rs             # Condition compilation, text matcher, quick filters, matching
     ├── config_store.rs      # rules.json load/save/normalise, builtin/user merge
+    ├── error_log.rs         # Client self-diagnostics: bounded JSONL + global panic hook
     ├── builtin.rs           # Embedded templates + built-in categories
     ├── netprobe.rs          # Device capability probe and capture-route recommendation
     ├── netcapture.rs        # Capture abstraction, proxy journal, stale-proxy self-heal
@@ -46,13 +47,15 @@ src-tauri/
 | `logcat.rs` / `adb.rs` | Pure parsing / pure process helpers; testable without a device | UI state |
 | `rules.rs` | Filter compilation and matching | Persistence |
 | `config_store.rs` | File persistence and normalisation | Rule semantics |
+| `error_log.rs` | This app's own failure records, panic hook, file bound/folding | Analysed log data, general-purpose logging |
 | `netprobe.rs` / `netcapture.rs` / `cdp.rs` / `proxy.rs` / `network.rs` | Device network capture pipeline and redaction | Log sessions |
 
 ### Dependency direction
 
 ```
 lib.rs -> commands.rs -> { session, stream, logcat, adb, rules, config_store, builtin,
-                           netcapture, netprobe, network, cdp, proxy }
+                           netcapture, netprobe, network, cdp, proxy, error_log }
+error_log.rs <- lib.rs (.setup installs its panic hook) and commands.rs (5 log commands)
 model.rs <- everyone (types only)
 ```
 

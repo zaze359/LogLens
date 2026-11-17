@@ -18,6 +18,10 @@
   surface it on the next poll (`StreamStatus.error`).
 - Nothing panics on expected failures (missing adb, unauthorized device, cancelled import,
   malformed JSONL line).
+- A `Err` is still shown to the user, but the banner is transient. The frontend `call()`
+  wrapper in `ipc.ts` mirrors every failed command into the bounded client error log so it
+  survives a restart; the two polling commands are excluded (see `logging-guidelines.md`).
+  This is additive — the `Result` remains the only way the UI learns about the failure.
 
 ---
 

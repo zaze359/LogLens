@@ -14,7 +14,7 @@
 | State | One module-level `reactive` store in `src/stores/session.ts`. No Pinia, no Vuex |
 | Routing | None. Workspaces are switched with `v-show` / store flags |
 | Styling | One global stylesheet `src/styles/main.css`; no `<style>` blocks. Some layout/size values use inline `style` attributes |
-| Native access | All Rust IPC through `src/lib/ipc.ts`. Components do not call `invoke` directly (one documented exception: `NetworkCaptureTab.vue`) |
+| Native access | All Rust IPC through `src/lib/ipc.ts`. Components do not call `invoke` directly (documented exceptions: `NetworkCaptureTab.vue`, `error-report.ts` which reports failures via raw invoke to avoid recursion) |
 | Tests | No frontend test runner. Verification is `npm run build` (type check + bundle) |
 
 The frontend is a **view layer over Rust-owned state**. Parsing, filtering, paging, rule

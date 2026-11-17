@@ -66,6 +66,7 @@ not be imported by the store.
 | New screen region or dialog | `src/components/`, or `src/components/device/` if device-only |
 | New device tool | `operations.ts` entry + `DevicePage.vue` body + cleanup in `shutdownOperations()` |
 | New pure formatter (cURL, size, label) | `src/lib/` when reused; keep local when single-use |
+| Global error capture (window / Vue / rejection) | `src/lib/error-report.ts`, installed once from `main.ts` before `mount()` |
 | New shared style | `src/styles/main.css` under the existing section comments |
 
 ### Device vs. file workspaces

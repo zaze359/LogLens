@@ -1141,3 +1141,42 @@ pub fn restore_device_proxy(
         ..Default::default()
     })
 }
+
+/* --------------------------------------------------- client error log ------ */
+
+/// Newest-first view of this app's own failures. No `AppHandle` needed: `error_log`
+/// resolves its file once during `.setup()` and keeps it in process state.
+#[tauri::command]
+pub fn list_error_log() -> Result<Vec<crate::model::ErrorRecord>, String> {
+    Ok(crate::error_log::list())
+}
+
+#[tauri::command]
+pub fn clear_error_log() -> Result<(), String> {
+    crate::error_log::clear()
+}
+
+#[tauri::command]
+pub fn error_log_location() -> Result<String, String> {
+    crate::error_log::location()
+}
+
+/// Called by the webview's global error handlers and by the IPC wrapper. Failures here
+/// are best-effort: a broken diagnostics channel must never mask the original error.
+#[tauri::command]
+pub fn report_client_error(
+    level: String,
+    source: String,
+    scope: String,
+    message: String,
+    detail: String,
+) {
+    crate::error_log::record(&level, &source, &scope, &message, &detail);
+}
+
+#[tauri::command]
+pub fn export_error_log(dest_path: String) -> Result<usize, String> {
+    let text = crate::error_log::export_text();
+    fs::write(&dest_path, &text).map_err(|e| format!("写入错误日志文件失败: {e}"))?;
+    Ok(text.len())
+}

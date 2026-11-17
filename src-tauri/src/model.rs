@@ -293,3 +293,28 @@ pub struct ProxyState {
     pub original: String,
     pub active: bool,
 }
+
+// --- Client self-diagnostics ------------------------------------------------
+//
+// Deliberately NOT the log entries the user is analysing: these are LogLens's own
+// failures (panic / uncaught frontend error / failed command). Kept out of the parsing
+// pipeline so a 300MB import can never turn into 300MB of diagnostics.
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ErrorRecord {
+    pub id: String,
+    /// Epoch millis when the failure happened (or last repeated).
+    pub ts: i64,
+    /// `panic` | `error` | `warning`
+    pub level: String,
+    /// `rust` | `frontend`
+    pub source: String,
+    /// Command name, module or JS handler that reported it.
+    pub scope: String,
+    pub message: String,
+    /// Backtrace / JS stack, empty when unavailable.
+    pub detail: String,
+    /// Identical failures inside a short window fold into one record.
+    pub count: u32,
+}

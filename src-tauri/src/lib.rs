@@ -3,6 +3,7 @@ mod builtin;
 mod cdp;
 mod commands;
 mod config_store;
+mod error_log;
 mod logcat;
 mod model;
 mod netcapture;
@@ -54,11 +55,18 @@ pub fn run() {
             commands::close_network_capture,
             commands::import_network_capture,
             commands::configure_device_proxy,
-            commands::restore_device_proxy
+            commands::restore_device_proxy,
+            commands::list_error_log,
+            commands::clear_error_log,
+            commands::report_client_error,
+            commands::error_log_location,
+            commands::export_error_log
         ])
         // A device-wide global proxy is persistent while this process is not. Clean
         // up on *every* shutdown path, not just the one Tauri happens to deliver.
-        .setup(|_app| {
+        .setup(|app| {
+            // Install the panic hook + load previous records before anything else can fail.
+            error_log::init(app.handle());
             let healed = netcapture::heal_stale_proxies();
             if !healed.is_empty() {
                 eprintln!("[proxy] 启动自愈: {healed}");
