@@ -8,14 +8,14 @@ const maxLevelCount = computed(() =>
 )
 
 const colors: Record<string, string> = {
-  V: '#64748b',
-  D: '#60a5fa',
-  I: '#34d399',
-  W: '#fbbf24',
-  E: '#f87171',
-  F: '#ef4444',
-  A: '#f472b6',
-  S: '#a78bfa',
+  V: '#ffffff',
+  D: '#299999',
+  I: '#5ac023',
+  W: '#bbb529',
+  E: '#ff6b68',
+  F: '#ff3b30',
+  A: '#ff6b68',
+  S: '#8b95a5',
   '?': '#64748b'
 }
 </script>
