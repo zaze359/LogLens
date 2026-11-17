@@ -91,12 +91,14 @@ function Write-Die {
     exit 2
 }
 
-# 架构标签，和 Tauri 自己的产物命名保持一致
-$ArchTag = switch ($env:PROCESSOR_ARCHITECTURE) {
+# 架构标签，和 Tauri 自己的产物命名保持一致；32 位 PowerShell 下必须看 ARCHITEW6432
+$ProcessArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+if (-not $ProcessArch) { $ProcessArch = 'unknown' }
+$ArchTag = switch ($ProcessArch) {
     'AMD64' { 'x64' }
     'ARM64' { 'aarch64' }
     'x86' { 'x86' }
-    default { $env:PROCESSOR_ARCHITECTURE.ToLower() }
+    default { $ProcessArch.ToLower() }
 }
 
 Write-Step '环境检查'
@@ -106,22 +108,46 @@ $NodeVersion = (& node -v)
 $NpmVersion = (& npm.cmd -v)
 Write-Info "Node $NodeVersion / npm $NpmVersion"
 
+# 平台名会拼进路径；-Clean 前还要确认目标在 release 目录下
+if ($PlatName -notmatch '^[A-Za-z0-9._-]+$' -or $PlatName -match '^\.+$') {
+    Write-Die "非法平台名: $PlatName（只允许字母、数字、点、下划线、连字符）"
+}
+
 $CfgPath = Join-Path $Root 'src-tauri\tauri.conf.json'
 $Cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
 $Product = $Cfg.productName
 $Version = $Cfg.version
-$CargoVersion = '-'
+$PkgVersion = (Get-Content (Join-Path $Root 'package.json') -Raw | ConvertFrom-Json).version
+if ($PkgVersion -ne $Version) {
+    Write-Warn2 "版本号不一致：tauri.conf.json=$Version，package.json=$PkgVersion"
+}
+$CargoVersion = $null
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    # 新开的终端 / CI 可能没有刷新 PATH，先尝试 rustup 默认安装目录
+    $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+    if (Test-Path (Join-Path $cargoBin 'cargo.exe')) {
+        $env:PATH = "$cargoBin;$env:PATH"
+        Write-Info "cargo 不在 PATH，已临时加入 $cargoBin"
+    }
+}
+if (Get-Command cargo -ErrorAction SilentlyContinue) { $CargoVersion = ((& cargo --version) -split '\s+')[1] }
 Write-Info "产品 $Product $Version，目标平台 $PlatName ($ArchTag)，bundles: $BundleList"
 
 if (-not $SkipBuild) {
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { Write-Die '未找到 cargo，请先安装 Rust 工具链（见 README 第 3 节）' }
-    $CargoVersion = ((& cargo --version) -split '\s+')[1]
+    if (-not $CargoVersion) { Write-Die '未找到 cargo，请先安装 Rust 工具链（见 README 第 3 节）' }
     Write-Info "Rust $CargoVersion"
     if (-not (Test-Path (Join-Path $Root 'node_modules'))) {
         if ($NoInstall) { Write-Die '缺少 node_modules 且指定了 -NoInstall' }
-        Write-Info '未检测到 node_modules，执行 npm install'
-        & npm.cmd install
-        if ($LASTEXITCODE -ne 0) { Write-Die 'npm install 失败' }
+        # 有锁文件就用 npm ci：可复现，且不会悄悄改 lock
+        if (Test-Path (Join-Path $Root 'package-lock.json')) {
+            Write-Info '未检测到 node_modules，执行 npm ci'
+            & npm.cmd ci
+            if ($LASTEXITCODE -ne 0) { Write-Die 'npm ci 失败' }
+        } else {
+            Write-Info '未检测到 node_modules，执行 npm install'
+            & npm.cmd install
+            if ($LASTEXITCODE -ne 0) { Write-Die 'npm install 失败' }
+        }
     }
     # generate_context!() 编译期会读 icons/icon.png，缺了会直接编译失败
     & node (Join-Path $Root 'scripts\gen-icon.cjs') | Out-Host
@@ -129,17 +155,30 @@ if (-not $SkipBuild) {
 }
 
 # ---------- 1. 打包图标 ----------
-# 不写回 tauri.conf.json：用 --config 覆盖，避免污染受版本控制的配置。
+# 不写回 tauri.conf.json：把覆盖配置写到临时文件，用 --config 指向它，避免污染受版本控制的配置。
+# 图标路径必须是绝对路径：--config 指向 %TEMP% 时，相对路径会相对临时目录解析。
 $script:IconArgs = @()
-$IconConfig = '{"bundle":{"icon":["icons/32x32.png","icons/128x128.png","icons/128x128@2x.png","icons/icon.icns","icons/icon.ico"]}}'
+$IconConfigPath = Join-Path $env:TEMP 'loglens-bundle-icon.json'
+function Set-IconConfig {
+    $icons = Join-Path $Root 'src-tauri\icons'
+    $cfg = @{ bundle = @{ icon = @(
+        (Join-Path $icons '32x32.png'),
+        (Join-Path $icons '128x128.png'),
+        (Join-Path $icons '128x128@2x.png'),
+        (Join-Path $icons 'icon.icns'),
+        (Join-Path $icons 'icon.ico')
+    ) } }
+    [IO.File]::WriteAllText($IconConfigPath, ($cfg | ConvertTo-Json -Depth 6), $Utf8NoBom)
+    $script:IconArgs = @('--config', $IconConfigPath)
+}
 function Resolve-IconArgs {
     $icons = Join-Path $Root 'src-tauri\icons'
     if ($NoIcons) {
-        Write-Warn2 '已指定 -NoIcons，本次打包使用系统默认图标'
+        Write-Warn2 '已指定 -NoIcons，本次打包使用 Tauri 通用占位图标'
         return
     }
     if ((Test-Path (Join-Path $icons 'icon.icns')) -and (Test-Path (Join-Path $icons 'icon.ico'))) {
-        $script:IconArgs = @('--config', $IconConfig)
+        Set-IconConfig
         Write-Ok '图标齐全，已注入 bundle.icon（不修改 tauri.conf.json）'
         return
     }
@@ -148,17 +187,17 @@ function Resolve-IconArgs {
         if (Test-Path $candidate) {
             Write-Info "发现 $candidate，自动生成图标集"
             & npm.cmd run tauri icon -- $candidate | Out-Host
-            if ((Test-Path (Join-Path $icons 'icon.icns')) -and (Test-Path (Join-Path $icons 'icon.ico'))) {
-                $script:IconArgs = @('--config', $IconConfig)
+            if ($LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $icons 'icon.icns')) -and (Test-Path (Join-Path $icons 'icon.ico'))) {
+                Set-IconConfig
                 Write-Ok '图标已生成并注入'
             } else {
-                Write-Warn2 "从 $candidate 生成图标失败，继续使用默认图标"
+                Write-Warn2 "从 $candidate 生成图标失败，继续使用通用占位图标"
             }
             break
         }
     }
     if ($script:IconArgs.Count -eq 0) {
-        Write-Warn2 '未找到 icon.icns / icon.ico，本次打包不含自定义图标（用系统默认图标）'
+        Write-Warn2 '未找到 icon.icns / icon.ico，本次打包不含自定义图标（用 Tauri 通用占位图标）'
         Write-Info '生成方式: 准备 1024x1024 PNG 后执行  npm run tauri icon <png>'
     }
 }
@@ -176,7 +215,18 @@ $BundleDir = Join-Path $Root 'src-tauri\target\release\bundle'
 if (-not $SkipBuild) {
     Resolve-IconArgs
     Write-Step "编译客户端（$Product $Version）"
-    if (-not (Invoke-TauriBuild $BundleList)) { Write-Die '编译失败，未产出任何产物' }
+    # 逐个格式打：单种格式失败（如 NSIS 缺工具链）不应丢掉已产出的 msi
+    $parts = @($BundleList.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $okCount = 0
+    foreach ($b in $parts) {
+        if (Invoke-TauriBuild $b) {
+            $okCount++
+        } else {
+            Write-Warn2 "$b 打包失败，继续其它格式"
+            Write-Info "  可单独重试: npm run tauri build -- --bundles $b"
+        }
+    }
+    if ($okCount -eq 0) { Write-Die '所有格式都编译失败，未产出任何产物' }
 } else {
     Write-Step '跳过编译（-SkipBuild），直接收集已有产物'
 }
@@ -184,8 +234,13 @@ if (-not $SkipBuild) {
 # ---------- 2. 收集产物 ----------
 $Target = Join-Path $OutRoot $PlatName
 
-# 清理范围限制在本次平台目录内，避免误删别的平台的产物
+# -Out / -Platform 会拼进路径，-Clean 前必须确认落在 <项目根>\release 之下
 if ($Clean -and (Test-Path $Target)) {
+    $releaseRoot = [IO.Path]::GetFullPath((Join-Path $Root 'release')).TrimEnd('\') + '\'
+    $targetFull = [IO.Path]::GetFullPath($Target)
+    if (-not ($targetFull + '\').StartsWith($releaseRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-Die "拒绝在项目 release 目录外执行 -Clean: $Target"
+    }
     Write-Step "清空 $Target"
     Get-ChildItem $Target -Force | Remove-Item -Recurse -Force
 }
@@ -203,6 +258,11 @@ foreach ($p in $patterns) {
     $srcDir = Join-Path $BundleDir $p.Dir
     if (-not (Test-Path $srcDir)) { continue }
     foreach ($f in Get-ChildItem $srcDir -Filter $p.Filter -File) {
+        # bundle 里会残留历史版本的安装包（文件名带版本号），只收当前版本
+        if ($f.Name -notlike "*$Version*") {
+            Write-Warn2 "跳过旧版本产物 $($f.Name)（当前版本 $Version）"
+            continue
+        }
         Copy-Item $f.FullName $Target -Force
         Write-Ok $f.Name
         $Collected += $f.Name
@@ -223,6 +283,8 @@ Write-Step '写入构建信息'
 $files = Get-ChildItem $Target -File | Where-Object { $_.Name -notin @('BUILD-INFO.md', 'SHA256SUMS.txt') }
 $IconNote = ''
 if ($script:IconArgs.Count -gt 0) { $IconNote = ' + bundle.icon' }
+$BuildDesc = if ($SkipBuild) { '跳过编译（-SkipBuild），仅收集已有产物' } else { "``npm run tauri build -- --bundles $BundleList``$IconNote" }
+$RustDesc = if ($CargoVersion) { $CargoVersion } else { '未知' }
 $lines = @(
     "# $Product 打包信息",
     '',
@@ -232,8 +294,9 @@ $lines = @(
     "| 平台 / 架构 | $PlatName / $ArchTag |",
     "| 打包时间 | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz') |",
     "| Git | $GitBranch@$GitCommit $GitDirty|",
-    "| 打包方式 | ``npm run tauri build -- --bundles $BundleList``$IconNote |",
-    "| 工具链 | Node $NodeVersion / Rust $CargoVersion |",
+    "| 打包方式 | $BuildDesc |",
+    '| 签名 | 未签名（SmartScreen 可能提示「未知发布者」） |',
+    "| 工具链 | Node $NodeVersion / Rust $RustDesc |",
     '',
     '## 文件',
     '',
@@ -262,7 +325,7 @@ $totalMb = [math]::Round(((Get-ChildItem $Target -Recurse -File | Measure-Object
 Write-Host "  输出目录: release\$PlatName  ($totalMb MB)"
 Get-ChildItem $Target -Force | Sort-Object Name | ForEach-Object { Write-Host "    $($_.Name)" }
 
-if ($script:IconArgs.Count -eq 0) {
+if (-not $SkipBuild -and $script:IconArgs.Count -eq 0) {
     Write-Host ''
     Write-Warn2 '本次产物未带自定义应用图标（bundle.icon 为空），正式发布前请生成图标后重跑本脚本'
 }

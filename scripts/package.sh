@@ -11,7 +11,7 @@
 #   --platform <name>  覆盖平台目录名（默认按系统自动检测：macos / linux）
 #   --skip-build       不重新编译，只收集 target/release/bundle 里已有的产物
 #   --no-install       跳过 npm install
-#   --clean            打包前清空本次平台输出目录（只删该平台目录内的文件）
+#   --clean            打包前清空本次平台输出目录（须位于项目 release/ 下，只删该目录内文件）
 #   --no-icons         即使图标齐全也不注入 bundle.icon
 #   --open             完成后在 Finder / 文件管理器中打开输出目录
 #   -h, --help         显示本帮助
@@ -47,7 +47,31 @@ else
 fi
 
 usage() {
-  sed -n '2,27p' "${BASH_SOURCE[0]}" | sed -E 's/^# ?//'
+  cat <<'EOF'
+LogLens 客户端打包脚本（macOS / Linux）
+
+用法: bash scripts/package.sh [选项]
+
+  --out <dir>        输出根目录（默认 <项目根>/release）
+  --bundles <list>   tauri build --bundles 的值（默认 mac: app,dmg；linux: deb,appimage）
+  --platform <name>  覆盖平台目录名（默认按系统自动检测：macos / linux）
+  --skip-build       不重新编译，只收集 target/release/bundle 里已有的产物
+  --no-install       跳过 npm install
+  --clean            打包前清空本次平台输出目录（只删该平台目录内的文件）
+  --no-icons         即使图标齐全也不注入 bundle.icon
+  --open             完成后在 Finder / 文件管理器中打开输出目录
+  -h, --help         显示本帮助
+
+产物结构:
+  release/macos/LogLens.app                 Apple 应用包（双击运行）
+  release/macos/LogLens_0.1.0_aarch64.dmg   安装镜像
+  release/macos/LogLens_0.1.0_aarch64.zip   便携包（zip 分发 .app）
+  release/<平台>/BUILD-INFO.md              版本 / 平台 / 提交 / 工具链 / 签名状态
+  release/<平台>/SHA256SUMS.txt             校验和
+
+设计原则：编译失败就失败，但「打包某一种格式失败」不阻断交付——
+例如无权限挂载磁盘卷时 DMG 会失败，此时仍产出 .app + zip 并明确告警。
+EOF
 }
 
 while [ $# -gt 0 ]; do
@@ -128,19 +152,48 @@ command -v node >/dev/null 2>&1 || die "未找到 node，请先安装 Node.js >=
 command -v npm  >/dev/null 2>&1 || die "未找到 npm"
 info "Node $(node -v) / npm $(npm -v)"
 
+# 从 GUI / IDE 启动的终端、以及某些 npm 脚本环境不会加载 ~/.cargo/env，
+# 导致 rustup 装的 cargo 不在 PATH；先尝试常见安装位置，避免误判“未安装 Rust”。
+if ! command -v cargo >/dev/null 2>&1; then
+  for cargo_dir in "${CARGO_HOME:-$HOME/.cargo}/bin" /opt/homebrew/bin /usr/local/bin; do
+    if [ -x "$cargo_dir/cargo" ]; then
+      PATH="$cargo_dir:$PATH"
+      export PATH
+      info "cargo 不在 PATH，已临时加入 $cargo_dir"
+      break
+    fi
+  done
+fi
+
+# 平台名会拼进路径，只允许安全字符；--clean 还会再校验输出目录必须落在 release/ 下
+case "$PLATFORM" in
+  ''|.*|*..*|*[!A-Za-z0-9._-]*) die "非法平台名: ${PLATFORM}（只允许字母、数字、点、下划线、连字符，且不能以点开头或包含 ..）" ;;
+esac
+
 PRODUCT="$(json_get "$ROOT/src-tauri/tauri.conf.json" "productName")"
 VERSION="$(json_get "$ROOT/src-tauri/tauri.conf.json" "version")"
+PKG_VERSION="$(json_get "$ROOT/package.json" "version")"
+if [ "$PKG_VERSION" != "$VERSION" ]; then
+  warn "版本号不一致：tauri.conf.json=${VERSION}，package.json=${PKG_VERSION}"
+fi
+CARGO_VERSION="$(cargo --version 2>/dev/null | awk '{print $2}' || true)"
 info "产品 ${PRODUCT} ${VERSION}，目标平台 ${PLATFORM} (${ARCH_TAG})，bundles: ${BUNDLES}"
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  command -v cargo >/dev/null 2>&1 || die "未找到 cargo，请先安装 Rust 工具链（见 README 第 3 节）"
-  info "Rust $(cargo --version | awk '{print $2}')"
+  command -v cargo >/dev/null 2>&1 || die "未找到 cargo（已尝试 \$HOME/.cargo/bin）。请先执行 source \"\$HOME/.cargo/env\"，或参考 README 第 3 节安装 Rust 工具链"
+  info "Rust $CARGO_VERSION"
   if [ ! -d "$ROOT/node_modules" ]; then
     if [ "$NO_INSTALL" -eq 1 ]; then
       die "缺少 node_modules 且指定了 --no-install"
     fi
-    info "未检测到 node_modules，执行 npm install"
-    run npm install || die "npm install 失败"
+    # 有锁文件就用 npm ci：可复现，且不会悄悄改 lock
+    if [ -f "$ROOT/package-lock.json" ]; then
+      info "未检测到 node_modules，执行 npm ci"
+      run npm ci || die "npm ci 失败"
+    else
+      info "未检测到 node_modules，执行 npm install"
+      run npm install || die "npm install 失败"
+    fi
   fi
   # generate_context!() 编译期会读 icons/icon.png，缺了会直接编译失败
   run node "$ROOT/scripts/gen-icon.cjs" >/dev/null || die "生成开发态窗口图标失败"
@@ -152,7 +205,7 @@ ICON_ARGS=()
 ensure_icons() {
   local icons="$ROOT/src-tauri/icons" src
   if [ "$NO_ICONS" -eq 1 ]; then
-    warn "已指定 --no-icons，本次打包使用系统默认图标"
+    warn "已指定 --no-icons，本次打包使用 Tauri 通用占位图标"
     return 0
   fi
   if [ -f "$icons/icon.icns" ] && [ -f "$icons/icon.ico" ]; then
@@ -173,7 +226,7 @@ ensure_icons() {
       break
     fi
   done
-  warn "未找到 icon.icns / icon.ico，本次打包${YELLOW}不含自定义图标${RESET}（用系统默认图标）"
+  warn "未找到 icon.icns / icon.ico，本次打包${YELLOW}不含自定义图标${RESET}（用 Tauri 通用占位图标）"
   info "生成方式: 准备 1024x1024 PNG 后执行  npm run tauri icon <png>"
   return 0
 }
@@ -191,35 +244,53 @@ run_build() {
 if [ "$SKIP_BUILD" -eq 0 ]; then
   ensure_icons
   step "编译客户端（${PRODUCT} ${VERSION}）"
-  # DMG 单独打：它依赖 hdiutil 挂载磁盘卷，在无权限 / 沙箱环境下会失败，
-  # 但 .app 本身完全可用，不应该因为这一步整体失败。
-  PRIMARY_BUNDLES="$(printf '%s' "$BUNDLES" | tr ',' '\n' | grep -v '^dmg$' | paste -sd, - || true)"
-  if [ -z "$PRIMARY_BUNDLES" ]; then PRIMARY_BUNDLES="app"; fi
-  run_build "$PRIMARY_BUNDLES" || die "编译失败，未产出任何产物"
-
-  case ",$BUNDLES," in
-    *,dmg,*)
-      step "打包 DMG 安装镜像"
-      if run_build "dmg"; then
-        ok "DMG 生成成功"
-      else
+  # 逐个格式打：单种格式失败（如沙箱里 hdiutil 无法挂载）不应丢掉其它已产出的包。
+  # 顺序沿用 --bundles，默认 app 在 dmg 之前，DMG 依赖已生成的 .app。
+  BUILD_OK=0
+  BUNDLE_ITEMS="$(printf '%s' "$BUNDLES" | tr ',' ' ')"
+  for bundle in $BUNDLE_ITEMS; do
+    if run_build "$bundle"; then
+      BUILD_OK=$((BUILD_OK + 1))
+      continue
+    fi
+    case "$bundle" in
+      dmg)
         warn "DMG 打包失败（常见原因：hdiutil 需要挂载磁盘卷，无权限或被沙箱拦截）"
-        info "  可在本地终端重试: npm run tauri build -- --bundles dmg"
         info "  .app 与 zip 不受影响，继续收集产物"
-      fi
-      ;;
-  esac
+        ;;
+      appimage)
+        warn "AppImage 打包失败（常见原因：linuxdeploy / FUSE 不可用），deb 不受影响"
+        ;;
+      *)
+        warn "$bundle 打包失败，继续其它格式"
+        ;;
+    esac
+    info "  可单独重试: npm run tauri build -- --bundles $bundle"
+  done
+  if [ "$BUILD_OK" -eq 0 ]; then
+    die "所有格式都编译失败，未产出任何产物"
+  fi
 else
   step "跳过编译（--skip-build），直接收集已有产物"
 fi
 
 # ---------- 3. 收集产物 ----------
+mkdir -p "$OUT_ROOT"
 OUT="$OUT_ROOT/$PLATFORM"
 
-# 清理范围限制在本次平台目录内，避免误删别的平台的产物
-if [ "$DO_CLEAN" -eq 1 ] && [ -d "$OUT" ]; then
-  step "清空 $OUT"
-  find "$OUT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+# --platform / --out 都会拼进路径，--clean 前必须确认落在 <项目根>/release 之下，
+# 否则 `--platform ../..` 会删掉项目根之外的一级内容。
+if [ "$DO_CLEAN" -eq 1 ]; then
+  ROOT_REAL="$(cd "$ROOT" && pwd -P)"
+  OUT_PARENT_REAL="$(cd "$OUT_ROOT" && pwd -P)"
+  case "$OUT_PARENT_REAL/" in
+    "$ROOT_REAL/release/"*) ;;
+    *) die "拒绝在仓库外执行 --clean: ${OUT_PARENT_REAL}（输出根目录必须在 ${ROOT_REAL}/release 下）" ;;
+  esac
+  if [ -d "$OUT" ]; then
+    step "清空 $OUT"
+    find "$OUT" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  fi
 fi
 
 mkdir -p "$OUT"
@@ -227,14 +298,31 @@ mkdir -p "$OUT"
 step "收集产物到 ${OUT#"$ROOT"/}/"
 COLLECTED=0
 
-copy_dmg() {
+# bundle/ 不会自动清掉历史版本，而 dmg / deb / AppImage 的文件名带版本号：
+# 只收当前版本的产物，避免把 0.0.x 的包当成 0.1.0 一起发出去。
+collect_versioned() {
   local f
-  for f in "$BUNDLE_DIR"/dmg/*.dmg; do
+  for f in "$@"; do
     [ -e "$f" ] || continue
-    cp -f "$f" "$OUT/"
-    ok "$(basename "$f")"
-    COLLECTED=$((COLLECTED + 1))
+    case "$(basename "$f")" in
+      *"$VERSION"*)
+        cp -f "$f" "$OUT/"
+        ok "$(basename "$f")"
+        COLLECTED=$((COLLECTED + 1))
+        ;;
+      *)
+        warn "跳过旧版本产物 $(basename "$f")（当前版本 ${VERSION}）"
+        ;;
+    esac
   done
+}
+
+copy_dmg() {
+  collect_versioned "$BUNDLE_DIR"/dmg/*.dmg
+}
+
+copy_linux_pkgs() {
+  collect_versioned "$BUNDLE_DIR"/deb/*.deb "$BUNDLE_DIR"/appimage/*.AppImage "$BUNDLE_DIR"/rpm/*.rpm
 }
 
 copy_app() {
@@ -243,7 +331,12 @@ copy_app() {
     [ -e "$src" ] || continue
     name="$(basename "$src")"
     rm -rf "${OUT:?}/$name"
-    cp -R "$src" "$OUT/"
+    # 优先 ditto：复制时保留扩展属性 / 资源分叉（签名信息），cp -R 会丢
+    if command -v ditto >/dev/null 2>&1; then
+      ditto "$src" "$OUT/$name"
+    else
+      cp -R "$src" "$OUT/"
+    fi
     ok "$name"
     COLLECTED=$((COLLECTED + 1))
   done
@@ -267,13 +360,7 @@ zip_app() {
 }
 
 copy_linux_pkgs() {
-  local f
-  for f in "$BUNDLE_DIR"/deb/*.deb "$BUNDLE_DIR"/appimage/*.AppImage "$BUNDLE_DIR"/rpm/*.rpm; do
-    [ -e "$f" ] || continue
-    cp -f "$f" "$OUT/"
-    ok "$(basename "$f")"
-    COLLECTED=$((COLLECTED + 1))
-  done
+  collect_versioned "$BUNDLE_DIR"/deb/*.deb "$BUNDLE_DIR"/appimage/*.AppImage "$BUNDLE_DIR"/rpm/*.rpm
 }
 
 # 收集策略跟着「实际系统」走，--platform 只改输出目录名，避免把 mac 的 .app 收进 windows 目录
@@ -303,6 +390,18 @@ fi
 TAURI_CLI="$(npx --no-install tauri --version 2>/dev/null | awk '{print $2}' || echo '-')"
 
 step "写入构建信息"
+ICON_SUFFIX=""
+if [ "${ICON_ARGS[*]-}" != "" ]; then ICON_SUFFIX=" + bundle.icon"; fi
+if [ "$SKIP_BUILD" -eq 1 ]; then
+  BUILD_DESC="跳过编译（--skip-build），仅收集已有产物"
+else
+  BUILD_DESC="\`npm run tauri build -- --bundles $BUNDLES\`$ICON_SUFFIX"
+fi
+case "$PLATFORM" in
+  macos) SIGNING_DESC="未签名 / 未公证（首次打开需右键「打开」，或执行 xattr -dr com.apple.quarantine）" ;;
+  windows) SIGNING_DESC="未签名（SmartScreen 可能提示「未知发布者」）" ;;
+  *) SIGNING_DESC="未签名（未做 GPG 签名）" ;;
+esac
 {
   echo "# $PRODUCT 打包信息"
   echo
@@ -312,8 +411,9 @@ step "写入构建信息"
   echo "| 平台 / 架构 | $PLATFORM / $ARCH_TAG |"
   echo "| 打包时间 | $(date '+%Y-%m-%d %H:%M:%S %z') |"
   echo "| Git | $GIT_BRANCH@$GIT_COMMIT $GIT_DIRTY|"
-  echo "| 打包方式 | \`npm run tauri build -- --bundles $BUNDLES\`${ICON_ARGS:+ + bundle.icon} |"
-  echo "| 工具链 | Node $(node -v) / $(cargo --version 2>/dev/null | awk '{print "Rust "$2}') / Tauri CLI ${TAURI_CLI:-未知} |"
+  echo "| 打包方式 | $BUILD_DESC |"
+  echo "| 签名 | $SIGNING_DESC |"
+  echo "| 工具链 | Node $(node -v) / Rust ${CARGO_VERSION:-未知} / Tauri CLI ${TAURI_CLI:-未知} |"
   echo
   echo "## 文件"
   echo
@@ -321,10 +421,10 @@ step "写入构建信息"
   echo "| --- | --- |"
 } > "$OUT/BUILD-INFO.md"
 
-# du -s 才是一行一个条目；不加会在 .app 里逐层递归
+# du -s 才是一行一个条目；不加会在 .app 里逐层递归。隐藏文件（.DS_Store 等）不列
 (
   cd "$OUT" || exit 1
-  find . -mindepth 1 -maxdepth 1 ! -name 'BUILD-INFO.md' ! -name 'SHA256SUMS.txt' \
+  find . -mindepth 1 -maxdepth 1 ! -name '.*' ! -name 'BUILD-INFO.md' ! -name 'SHA256SUMS.txt' \
     -exec du -hs {} + 2>/dev/null | sort -k2 |
     awk -F'\t' '{sub(/^\.\//, "", $2); printf "| `%s` | %s |\n", $2, $1}'
 ) >> "$OUT/BUILD-INFO.md"
@@ -340,8 +440,10 @@ step "生成校验和"
   cd "$OUT" || exit 1
   if command -v shasum >/dev/null 2>&1; then
     HASHER="shasum -a 256"
-  else
+  elif command -v sha256sum >/dev/null 2>&1; then
     HASHER="sha256sum"
+  else
+    die "需要 shasum 或 sha256sum 才能生成校验和"
   fi
   # shellcheck disable=SC2086
   find . -mindepth 1 -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' ! -name 'BUILD-INFO.md' \
@@ -354,7 +456,7 @@ step "完成"
 echo "  输出目录: ${BOLD}${OUT#"$ROOT"/}${RESET}  ($(du -sh "$OUT" | awk '{print $1}'))"
 find "$OUT" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | sed 's/^/    /'
 
-if [ "$PLATFORM" = "macos" ] && [ "${#ICON_ARGS[@]}" -eq 0 ]; then
+if [ "$PLATFORM" = "macos" ] && [ "$SKIP_BUILD" -eq 0 ] && [ "${ICON_ARGS[*]-}" = "" ]; then
   echo
   warn "本次产物未带自定义应用图标（bundle.icon 为空），正式发布前请生成图标后重跑本脚本"
 fi

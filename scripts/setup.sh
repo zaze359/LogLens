@@ -39,7 +39,7 @@ LogLens 一键环境检测 / 安装 / 运行
   --no-system-install   不安装系统级依赖（Node / Rust / Homebrew / CLT），仍装项目依赖
   --no-run              装好依赖但不启动 / 不构建
   --dev                 默认；安装后运行 npm run tauri dev
-  --build               安装后运行 npm run tauri build（检查图标并自动补全 bundle.icon）
+  --build               安装后调用 scripts/package.sh 打包（产物收集到 release/，不改写 tauri.conf.json）
   --test                安装后运行 npm run build + cargo test --lib
   --report <path>       额外输出 Markdown 报告到指定文件
   -h, --help            显示本帮助
@@ -134,7 +134,7 @@ write_report() {
     echo
     echo "- 时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "- 系统: $(uname -s) $(uname -m)"
-    echo "- 模式: $MODE（check-only=$CHECK_ONLY）"
+    echo "- 模式: ${MODE}（check-only=${CHECK_ONLY}）"
     echo
     echo "| 状态 | 项目 | 当前 | 要求 |"
     echo "| --- | --- | --- | --- |"
@@ -359,36 +359,13 @@ ensure_dev_icon() {
 }
 
 ensure_build_icons() {
-  local cfg="$ROOT/src-tauri/tauri.conf.json"
+  # 图标与 bundle.icon 的注入交给 scripts/package.sh：它用 --config 覆盖，
+  # 不会写回 tauri.conf.json（旧实现会自动改配置，留下 git 改动）。
   if [ ! -f "$ROOT/src-tauri/icons/icon.icns" ] || [ ! -f "$ROOT/src-tauri/icons/icon.ico" ]; then
     echo
-    echo "  ! 打包需要应用图标：准备一张 1024x1024 PNG 后执行"
+    echo "  ! 打包建议先准备应用图标：拿一张 1024x1024 PNG 执行"
     echo "      npm run tauri icon path/to/icon.png"
-    echo "    再重新运行 bash scripts/setup.sh --build（脚本会自动补全 bundle.icon）"
-    echo "    （只想启动开发版可直接 bash scripts/setup.sh，无需图标）"
-    exit 2
-  fi
-
-  # tauri.conf.json defaults to `"icon": []` so a fresh clone can run `tauri dev`.
-  # Before building, fill in the generated icon paths automatically (one-shot build).
-  if grep -q '"icon"[[:space:]]*:[[:space:]]*\[\]' "$cfg"; then
-    echo "  → 自动补全 tauri.conf.json 的 bundle.icon"
-    if ! node --input-type=commonjs -e '
-      const fs = require("fs");
-      const p = process.argv[1];
-      const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
-      cfg.bundle.icon = [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.icns",
-        "icons/icon.ico"
-      ];
-      fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n");
-    ' "$cfg"; then
-      echo "  ! 自动补全失败，请按 README 第 5 节手动填写 bundle.icon"
-      exit 2
-    fi
+    echo "    没有图标也能打包，只是产物使用 Tauri 通用占位图标"
   fi
 }
 
@@ -442,10 +419,6 @@ echo
 echo "── 安装项目依赖 ──"
 run_cmd npm install || { echo "npm install 失败"; exit 2; }
 
-if [ "$MODE" = "build" ]; then
-  ensure_build_icons
-fi
-
 if command -v cargo >/dev/null 2>&1; then
   echo "  (预热 Rust 依赖，失败不影响后续启动)"
   if (cd "$ROOT/src-tauri" && cargo fetch); then
@@ -468,8 +441,9 @@ case "$MODE" in
     exec npm run tauri dev
     ;;
   build)
-    echo "── 构建发布包 ──"
-    exec npm run tauri build
+    ensure_build_icons
+    echo "── 打包发布包（scripts/package.sh）──"
+    exec bash "$ROOT/scripts/package.sh"
     ;;
   test)
     echo "── 运行验证 ──"

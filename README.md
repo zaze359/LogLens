@@ -113,7 +113,7 @@ rustc --version && cargo --version
 | 跳过系统级安装（仍装项目依赖） | `--no-system-install` | `-NoSystemInstall` |
 | 装完不启动 | `--no-run` | `-NoRun` |
 | 启动开发版（默认行为） | `--dev` | 默认即 dev，无需参数 |
-| 打包（检查图标并自动补全 `bundle.icon`） | `--build` | `-Build` |
+| 打包（转调 `scripts/package.sh`，产物在 `release/`） | `--build` | `-Build` |
 | 跑类型检查 + Rust 单测 | `--test` | `-Test` |
 | 输出 Markdown 报告 | `--report <path>` | `-Report <path>` |
 | 帮助 | `--help` | `-Help` |
@@ -146,6 +146,8 @@ npm run tauri dev        # 启动桌面客户端（会先拉起 Vite dev server�
 
 > 只有**完全没有跑过 npm 脚本**、直接在干净仓库里调用 `cargo build` 才会因为缺 `icon.png` 失败，此时补跑一次 `node scripts/gen-icon.cjs` 即可。
 
+**正式应用图标**：`src-tauri/icons/` 下的 `icon.png` / `32x32.png` / `128x128.png` / `128x128@2x.png` / `icon.icns` / `icon.ico` 已换成 LogLens 正式 logo（蓝色圆角方 + Android 机器人从日志面板探头 + 红黄绿三条日志行）。矢量源文件与生成脚本在 `design/logo/`（`logo-final.svg` + `render_icon.py`，纯 Pillow、无额外依赖），详见 `design/logo/README.md`。`gen-icon.cjs` 不会覆盖这些已存在的图标；打包脚本会自动注入 `bundle.icon`，无需改 `tauri.conf.json`。
+
 **一步打包（推荐）**：`scripts/package.sh` / `scripts/package.ps1` 把「编译 → 收集产物 → 写构建信息 → 生成校验和」串成一条命令，产物统一落到项目根目录的 `release/<平台>/`，不用再去 `src-tauri/target/release/bundle/` 里翻：
 
 | 系统 | 命令 | 输出目录 |
@@ -157,39 +159,31 @@ npm run tauri dev        # 启动桌面客户端（会先拉起 Vite dev server�
 
 | 选项 | macOS / Linux | Windows | 作用 |
 | --- | --- | --- | --- |
-| 清空本次平台目录后重打 | `--clean` | `-Clean` | 只删 `release/<平台>/` 里的旧产物，不动其他平台 |
+| 清空本次平台目录后重打 | `--clean` | `-Clean` | 只删 `release/<平台>/` 里的旧产物；输出目录必须在项目 `release/` 下，否则拒绝执行 |
 | 不重新编译，只收集现有产物 | `--skip-build` | `-SkipBuild` | 复用 `src-tauri/target/release/bundle/` |
-| 换输出根目录 | `--out <dir>` | `-Out <dir>` | 默认 `release/` |
-| 指定打包格式 | `--bundles app,dmg` | `-Bundles msi,nsi` | 直接透传给 `tauri build --bundles` |
+| 换输出根目录 | `--out <dir>` | `-Out <dir>` | 默认 `release/`；配合 `--clean` 时仍须位于项目 `release/` 下 |
+| 指定打包格式 | `--bundles app,dmg` | `-Bundles msi,nsi` | 直接透传给 `tauri build --bundles`，逐个格式执行 |
+| 不注入自定义图标 | `--no-icons` | `-NoIcons` | 使用 Tauri 通用占位图标 |
 | 完成后打开输出目录 | `--open` | `-Open` | Finder / 资源管理器 |
 | 帮助 | `--help` | `-Help` | 列出全部选项 |
 
 脚本的几个约定：
 
-- **某一种格式打包失败不阻断交付**。DMG 依赖 `hdiutil` 挂载磁盘卷，在无权限 / 沙箱 / CI 环境下会失败（`hdiutil: create failed - 操作不被允许`）；脚本会明确告警，然后继续把 `.app` 和 `.zip` 交付出来。
-- **不写回 `tauri.conf.json`**。图标齐全时通过 `tauri build --config` 一次性注入 `bundle.icon`，受版本控制的配置保持干净。
-- **图标可以偷懒**。把一张 1024×1024 的 `app-icon.png` 丢到项目根目录，脚本会自动执行 `tauri icon` 生成整套图标并注入；没有图标时也能出包，只是用系统默认图标（并给出告警）。
-- **zip 便携包用 `ditto` 打包**，保留签名与资源分叉，解压后双击即可运行。
+- **某一种格式打包失败不阻断交付**。脚本按 `--bundles` 逐个格式执行，全部失败才报错。DMG 依赖 `hdiutil` 挂载磁盘卷，在无权限 / 沙箱 / CI 环境下会失败；NSIS / AppImage 也可能因缺工具链失败，此时已产出的 `.app` / `zip` / `msi` / `deb` 照常交付并明确告警。
+- **只收集当前版本的产物**。`bundle/` 不会自动清历史版本，而 dmg / msi / deb / AppImage 文件名带版本号；脚本只复制文件名含当前 `version` 的产物，跳过旧版本并告警。
+- **不写回 `tauri.conf.json`**。图标齐全时通过 `tauri build --config` 一次性注入 `bundle.icon`（Windows 上写入临时 JSON 后传路径），受版本控制的配置保持干净；`setup.sh --build` / `setup.ps1 -Build` 也改为直接转调打包脚本。
+- **图标可以偷懒**。把一张 1024×1024 的 `app-icon.png` 丢到项目根目录，脚本会自动执行 `tauri icon` 生成整套图标并注入；没有图标时也能出包，只是使用 Tauri 通用占位图标（并给出告警）。
+- **cargo 不在 PATH 时自动兜底**。从 IDE / GUI 启动的终端可能没加载 `~/.cargo/env`，脚本会尝试 `$HOME/.cargo/bin`、`/opt/homebrew/bin`、`/usr/local/bin`（Windows 为 `%USERPROFILE%\.cargo\bin`）；仍找不到时会提示执行 `source "$HOME/.cargo/env"` 后重试。
+- **产物未签名**。macOS 未签名 / 未公证，首次打开需右键「打开」或 `xattr -dr com.apple.quarantine <app>`；Windows 未签名，SmartScreen 可能提示「未知发布者」。BUILD-INFO 会标注签名状态。
+- **zip 便携包用 `ditto` 打包**，保留资源分叉，解压后双击即可运行。
 
-**第一步：生成正式打包图标**（发布时需要）：
+**第一步：生成正式打包图标**（可选但推荐）：
 
 ```bash
 npm run tauri icon path/to/icon.png     # 建议 1024x1024 PNG，生成 src-tauri/icons/*
 ```
 
-然后填写 `src-tauri/tauri.conf.json` 的 `bundle.icon`：
-
-```json
-"icon": [
-  "icons/32x32.png",
-  "icons/128x128.png",
-  "icons/128x128@2x.png",
-  "icons/icon.icns",
-  "icons/icon.ico"
-]
-```
-
-> 用一键脚本打包（`setup.sh --build` / `setup.ps1 -Build`）时，脚本发现图标文件齐全会**自动补全**这个数组，无需手动改配置；只有手动执行 `npm run tauri build` 才需要按上面填写。`icon: []` 是开发态默认值，保证新克隆的仓库能直接 `tauri dev`。
+脚本会自动把 `bundle.icon` 注入到本次构建（不修改配置文件），因此**不需要手动改 `tauri.conf.json`**。只有当你绕过脚本、直接执行 `npm run tauri build` 且希望产物带图标时，才需要把上面生成的图标路径写进 `tauri.conf.json` 的 `bundle.icon`；`icon: []` 是开发态默认值，保证新克隆的仓库能直接 `tauri dev`。
 
 **第二步：在目标平台上手动构建**（不经脚本时的原始命令；Tauri 不做跨系统打包，mac 出 dmg、Windows 出 msi 需要各自系统或 CI）：
 

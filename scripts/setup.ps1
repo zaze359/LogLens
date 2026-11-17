@@ -37,7 +37,7 @@ LogLens 一键环境检测 / 安装 / 运行
   -CheckOnly         只输出环境检测报告，不安装、不运行（有缺失时退出码 2）
   -NoSystemInstall   不安装系统级依赖（Node / Rust / MSVC / WebView2），仍装项目依赖
   -NoRun             装好依赖但不启动 / 不构建
-  -Build             安装后运行 npm run tauri build（检查图标并自动补全 bundle.icon）
+  -Build             安装后调用 scripts\package.ps1 打包（产物收集到 release\，不改写 tauri.conf.json）
   -Test              安装后运行 npm run build + cargo test --lib
   -Report <path>     额外输出 Markdown 报告到指定文件
   -Help              显示本帮助
@@ -368,30 +368,13 @@ function Ensure-DevIcon {
 }
 
 function Ensure-BuildIcons {
+    # 图标与 bundle.icon 的注入交给 scripts\package.ps1：它把覆盖配置写到临时文件，
+    # 不会写回 tauri.conf.json（旧实现会自动改配置，留下 git 改动）。
     if (-not $script:HasIcons) {
         Write-Host ''
-        Write-Host '  ! 打包需要应用图标：准备一张 1024x1024 PNG 后执行' -ForegroundColor Yellow
+        Write-Host '  ! 打包建议先准备应用图标：拿一张 1024x1024 PNG 执行' -ForegroundColor Yellow
         Write-Host '      npm run tauri icon path/to/icon.png'
-        Write-Host '    再重新运行 setup.ps1 -Build（脚本会自动补全 bundle.icon）'
-        Write-Host '    （只想启动开发版可直接 setup.ps1，无需图标）'
-        exit 2
-    }
-    # tauri.conf.json defaults to "icon": [] so a fresh clone can run `tauri dev`.
-    # Before building, fill in the generated icon paths automatically (one-shot build).
-    $cfgPath = Join-Path $Root 'src-tauri\tauri.conf.json'
-    $raw = Get-Content $cfgPath -Raw
-    if ($raw -match '"icon"\s*:\s*\[\s*\]') {
-        Write-Host '  -> 自动补全 tauri.conf.json 的 bundle.icon'
-        $cfg = $raw | ConvertFrom-Json
-        $cfg.bundle.icon = @(
-            'icons/32x32.png',
-            'icons/128x128.png',
-            'icons/128x128@2x.png',
-            'icons/icon.icns',
-            'icons/icon.ico'
-        )
-        $json = $cfg | ConvertTo-Json -Depth 20
-        [IO.File]::WriteAllText($cfgPath, ($json + "`n"), $Utf8NoBom)
+        Write-Host '    没有图标也能打包，只是产物使用 Tauri 通用占位图标'
     }
 }
 
@@ -477,9 +460,9 @@ switch ($Mode) {
     }
     'build' {
         Write-Host ''
-        Write-Host '── 构建发布包 ──'
-        & npm.cmd run tauri build
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Write-Host '── 打包发布包（scripts\package.ps1）──'
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'scripts\package.ps1')
+        exit $LASTEXITCODE
     }
     'test' {
         Write-Host ''
