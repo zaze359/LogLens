@@ -655,6 +655,33 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .net-capability b { color: var(--text); font-weight: 500; }
 .net-tag { flex: none; font-size: 10px; padding: 1px 6px; border-radius: 8px; color: var(--accent); background: var(--accent-soft); }
 
+/* 时间轴：一根轴上按时间排布请求，拖拽出区间过滤表格 */
+.net-timeline { margin: 0 0 10px; }
+.net-timeline-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: 11px; }
+.net-timeline-head .btn.on { color: var(--ok); border-color: rgba(52, 211, 153, .45); }
+.net-range-label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); }
+.net-timeline-strip {
+  position: relative; height: 26px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-1); cursor: crosshair; overflow: hidden;
+  touch-action: none; user-select: none;
+}
+.net-timeline-strip::before {
+  content: ''; position: absolute; left: 0; right: 0; top: 50%; border-top: 1px dashed var(--border);
+}
+.net-tick {
+  position: absolute; top: 4px; bottom: 4px; width: 2px; margin-left: -1px;
+  border-radius: 1px; background: var(--text-faint);
+}
+.net-tick.proxy { background: var(--accent); }
+.net-tick.cdp { background: var(--ok); }
+.net-band {
+  position: absolute; top: 0; bottom: 0; pointer-events: none;
+  background: rgba(56, 189, 248, .16);
+  border-left: 1px solid rgba(56, 189, 248, .7);
+  border-right: 1px solid rgba(56, 189, 248, .7);
+}
+.net-band.dragging { background: rgba(56, 189, 248, .08); border-style: dashed; }
+
 .net-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 .net-controls .muted { font-size: 11px; }
 

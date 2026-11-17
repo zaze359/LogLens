@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { toCurl } from '../../lib/curl'
 import { errorMessage, ipc } from '../../lib/ipc'
@@ -151,6 +151,174 @@ function sourceLabel(row: NetworkRequest): string {
   return '文件'
 }
 
+// ---------- 时间轴：请求按时间排布，拖拽选区间过滤 ----------
+
+/** `HH:MM:SS.mmm` → 当日毫秒；解析失败返回 null（不猜日期，采集都是同一天的连续片段）。 */
+function timeMillis(key: string): number | null {
+  const matched = /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$/.exec(key || '')
+  if (!matched) return null
+  const [h, m, s] = [Number(matched[1]), Number(matched[2]), Number(matched[3])]
+  return (h * 3600 + m * 60 + s) * 1000 + Number((matched[4] || '0').padEnd(3, '0'))
+}
+
+function formatMillis(value: number): string {
+  const h = Math.floor(value / 3600000)
+  const m = Math.floor((value % 3600000) / 60000)
+  const s = Math.floor((value % 60000) / 1000)
+  const ms = Math.floor(value % 1000)
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms).padStart(3, '0')}`
+}
+
+/** 轴的跨度永远等于当前全部请求的首尾，过滤只改变表格，不压缩轴本身。 */
+const timeBounds = computed(() => {
+  const values = requests.value
+    .map((row) => timeMillis(row.timeKey))
+    .filter((value): value is number => value !== null)
+  if (values.length === 0) return null
+  const start = Math.min(...values)
+  const end = Math.max(...values)
+  // 只有一条请求（或瞬间连发）时给一个最小跨度，否则刻度会全部叠在最左侧。
+  return { start, end: end > start ? end : start + 1000 }
+})
+
+const ticks = computed(() => {
+  const bounds = timeBounds.value
+  if (!bounds) return []
+  const span = bounds.end - bounds.start
+  return requests.value.flatMap((row) => {
+    const at = timeMillis(row.timeKey)
+    return at === null ? [] : [{ row, left: ((at - bounds.start) / span) * 100 }]
+  })
+})
+
+/** 拖拽选中的时间区间（毫秒）；null 表示不按时间过滤。 */
+const range = ref<{ start: number; end: number } | null>(null)
+
+/** 表格里真正展示的行：时间轴选择 + 未来可能的其它过滤都收敛在这里。 */
+const filteredRequests = computed(() => {
+  const picked = range.value
+  if (!picked) return requests.value
+  return requests.value.filter((row) => {
+    const at = timeMillis(row.timeKey)
+    return at !== null && at >= picked.start && at <= picked.end
+  })
+})
+
+const tableEmptyHint = computed(() =>
+  requests.value.length > 0 ? '此时间区间内没有请求。' : emptyHint.value
+)
+
+/** 有区间时同时给出「命中 / 总数」，避免误以为请求丢了。 */
+const countLabel = computed(() =>
+  range.value
+    ? `${filteredRequests.value.length} / ${requests.value.length} 条请求`
+    : `${requests.value.length} 条请求`
+)
+
+/** 实时跟踪：停在底部时新请求自动入镜；用户向上翻看历史时暂停，滚回底部自动恢复。 */
+const followLatest = ref(true)
+const tableWrap = ref<HTMLElement | null>(null)
+
+function stickToBottom(): void {
+  const el = tableWrap.value
+  if (!el || !followLatest.value) return
+  void nextTick(() => {
+    el.scrollTop = el.scrollHeight
+  })
+}
+
+function onTableScroll(): void {
+  const el = tableWrap.value
+  if (!el) return
+  followLatest.value = el.scrollHeight - el.scrollTop - el.clientHeight < 8
+}
+
+watch(filteredRequests, stickToBottom)
+
+function toggleFollow(): void {
+  followLatest.value = !followLatest.value
+  if (followLatest.value) stickToBottom()
+}
+
+/** 拖拽状态用 0–1 的轴比例保存，指针事件换算与渲染都只依赖百分比。 */
+const strip = ref<HTMLElement | null>(null)
+const dragFrom = ref<number | null>(null)
+const dragTo = ref<number | null>(null)
+
+function ratioAt(event: PointerEvent): number | null {
+  const el = strip.value
+  if (!el) return null
+  const rect = el.getBoundingClientRect()
+  if (rect.width <= 0) return null
+  return Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width))
+}
+
+function onStripDown(event: PointerEvent): void {
+  if (!timeBounds.value) return
+  const ratio = ratioAt(event)
+  if (ratio === null) return
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  dragFrom.value = ratio
+  dragTo.value = ratio
+}
+
+function onStripMove(event: PointerEvent): void {
+  if (dragFrom.value === null) return
+  dragTo.value = ratioAt(event)
+}
+
+function onStripUp(): void {
+  const from = dragFrom.value
+  const to = dragTo.value
+  const bounds = timeBounds.value
+  dragFrom.value = null
+  dragTo.value = null
+  if (from === null || to === null || !bounds) return
+  // 点一下（几乎没拖动）就是「清除区间」，不用再找按钮。
+  const width = strip.value?.getBoundingClientRect().width ?? 0
+  if (Math.abs(to - from) * width < 6) {
+    clearRange()
+    return
+  }
+  const span = bounds.end - bounds.start
+  range.value = {
+    start: Math.round(bounds.start + Math.min(from, to) * span),
+    end: Math.round(bounds.start + Math.max(from, to) * span)
+  }
+  // 看某一段历史时不该被新请求拽走。
+  followLatest.value = false
+}
+
+function clearRange(): void {
+  range.value = null
+  followLatest.value = true
+  stickToBottom()
+}
+
+const selectedBand = computed(() => {
+  const bounds = timeBounds.value
+  const picked = range.value
+  if (!bounds || !picked) return null
+  const span = bounds.end - bounds.start
+  return {
+    left: ((picked.start - bounds.start) / span) * 100,
+    width: ((picked.end - picked.start) / span) * 100
+  }
+})
+
+const dragBand = computed(() => {
+  if (dragFrom.value === null || dragTo.value === null) return null
+  const from = Math.min(dragFrom.value, dragTo.value) * 100
+  const to = Math.max(dragFrom.value, dragTo.value) * 100
+  return { left: from, width: to - from }
+})
+
+/** 换设备、换采集通道、清空表格后，区间与跟随都回到初始状态。 */
+function resetTimeline(): void {
+  range.value = null
+  followLatest.value = true
+}
+
 /** Re-running the probe is manual (it is slow), but switching devices invalidates it. */
 async function runProbe(): Promise<void> {
   if (!canProbe.value) return
@@ -217,6 +385,7 @@ function beginLive(info: NetworkSessionInfo): void {
   if (fileMode.value || captures.value.length === 0) {
     requests.value = []
     selected.value = null
+    resetTimeline()
   }
   fileMode.value = false
   captures.value = [...captures.value, info]
@@ -243,6 +412,7 @@ async function prepareLive(): Promise<void> {
     await closeAll()
     requests.value = []
     selected.value = null
+    resetTimeline()
   }
   fileMode.value = false
   boundSerial.value = props.serial
@@ -347,6 +517,8 @@ async function pickCaptureFile(): Promise<void> {
     requests.value = await ipc.queryNetworkRequests(info.id)
     fileMode.value = true
     selected.value = null
+    resetTimeline()
+    stickToBottom()
   } catch (e) {
     error.value = errorMessage(e)
   }
@@ -361,6 +533,7 @@ async function clearRequests(): Promise<void> {
   clearEpoch += 1
   requests.value = []
   selected.value = null
+  resetTimeline()
   if (fileMode.value) return
   const settled = await Promise.allSettled(
     captures.value.map((c) => ipc.clearNetworkCapture(c.id))
@@ -564,7 +737,7 @@ defineExpose({ shutdown, isCapturing: running })
           <span v-if="running" class="live-hint">
             <span class="live-dot" />采集中 · {{ events }} 个事件
           </span>
-          <span class="muted">{{ requests.length }} 条请求</span>
+          <span class="muted">{{ countLabel }}</span>
         </div>
 
         <!-- 用户只关心能力边界：每条通道一句话说清支持什么、不支持什么 -->
@@ -579,6 +752,57 @@ defineExpose({ shutdown, isCapturing: running })
           </li>
         </ul>
 
+        <!-- 时间轴：请求按时间排布；拖拽选区间过滤，跟随最新可随时开关 -->
+        <div v-if="requests.length > 0" class="net-timeline">
+          <div class="net-timeline-head">
+            <span class="muted">时间轴</span>
+            <span v-if="timeBounds" class="muted mono">
+              {{ formatMillis(timeBounds.start) }} → {{ formatMillis(timeBounds.end) }}
+            </span>
+            <div class="spacer" />
+            <span v-if="range" class="net-range-label mono">
+              区间 {{ formatMillis(range.start) }} – {{ formatMillis(range.end) }} ·
+              {{ filteredRequests.length }} / {{ requests.length }} 条
+              <button class="btn btn-ghost btn-sm" @click="clearRange">清除区间</button>
+            </span>
+            <button
+              class="btn btn-ghost btn-sm"
+              :class="{ on: followLatest }"
+              :title="followLatest ? '新请求自动入镜（点一下关闭）' : '点一下恢复：新请求自动入镜'"
+              @click="toggleFollow"
+            >
+              {{ followLatest ? '跟随最新 · 开' : '跟随最新 · 关' }}
+            </button>
+          </div>
+          <div
+            ref="strip"
+            class="net-timeline-strip"
+            title="拖拽选择时间区间；点击空白处清除区间"
+            @pointerdown="onStripDown"
+            @pointermove="onStripMove"
+            @pointerup="onStripUp"
+            @pointercancel="onStripUp"
+          >
+            <span
+              v-for="tick in ticks"
+              :key="tick.row.source + '-' + tick.row.index"
+              class="net-tick"
+              :class="tick.row.source"
+              :style="{ left: tick.left + '%' }"
+            />
+            <span
+              v-if="selectedBand"
+              class="net-band"
+              :style="{ left: selectedBand.left + '%', width: selectedBand.width + '%' }"
+            />
+            <span
+              v-if="dragBand"
+              class="net-band dragging"
+              :style="{ left: dragBand.left + '%', width: dragBand.width + '%' }"
+            />
+          </div>
+        </div>
+
         <!-- H5 通道专属提示：只开了原生采集时这条属于噪音 -->
         <p v-if="h5NoPage" class="empty-hint warn">
           调试通道已就绪，但当前没有打开的 H5 页面。请在 App 里进入一个 WebView 页面，请求会自动出现在这里。
@@ -590,7 +814,7 @@ defineExpose({ shutdown, isCapturing: running })
         <p v-if="error" class="empty-hint error-text">{{ error }}</p>
 
         <!-- 请求列表：H5 + 原生按时间合并；点行在右侧面板看全文，不在行下展开 -->
-        <div class="net-table-wrap">
+        <div ref="tableWrap" class="net-table-wrap" @scroll="onTableScroll">
           <table class="net-table">
             <thead>
               <tr>
@@ -605,7 +829,7 @@ defineExpose({ shutdown, isCapturing: running })
             </thead>
             <tbody>
               <tr
-                v-for="row in requests"
+                v-for="row in filteredRequests"
                 :key="row.source + '-' + row.index"
                 :class="{ picked: selected?.index === row.index && selected?.source === row.source }"
                 @click="selected = row"
@@ -620,9 +844,9 @@ defineExpose({ shutdown, isCapturing: running })
                 <td class="mono">{{ row.durationMs }} ms</td>
                 <td class="mono">{{ formatSize(row.responseSize) }}</td>
               </tr>
-              <tr v-if="requests.length === 0">
+              <tr v-if="filteredRequests.length === 0">
                 <td colspan="7" class="net-empty">
-                  {{ emptyHint }}
+                  {{ tableEmptyHint }}
                 </td>
               </tr>
             </tbody>
