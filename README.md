@@ -67,6 +67,7 @@
 │       └── lib.rs / main.rs      # 应用入口
 ├── scripts/
 │   ├── setup.sh / setup.ps1      # 一键检测 / 安装 / 运行
+│   ├── package.sh / package.ps1  # 一键打包，产物收集到 release/<平台>/
 │   ├── gen-icon.cjs              # 生成 Tauri 编译期默认窗口图标（零依赖、幂等）
 │   └── mitmproxy_jsonl.py        # mitmproxy add-on：导出可导入的 JSONL 抓包
 ├── samples/logcat-sample.txt     # 示例日志，覆盖多格式 / 堆栈 / ANR / 崩溃
@@ -145,6 +146,31 @@ npm run tauri dev        # 启动桌面客户端（会先拉起 Vite dev server�
 
 > 只有**完全没有跑过 npm 脚本**、直接在干净仓库里调用 `cargo build` 才会因为缺 `icon.png` 失败，此时补跑一次 `node scripts/gen-icon.cjs` 即可。
 
+**一步打包（推荐）**：`scripts/package.sh` / `scripts/package.ps1` 把「编译 → 收集产物 → 写构建信息 → 生成校验和」串成一条命令，产物统一落到项目根目录的 `release/<平台>/`，不用再去 `src-tauri/target/release/bundle/` 里翻：
+
+| 系统 | 命令 | 输出目录 |
+| --- | --- | --- |
+| macOS | `bash scripts/package.sh`（或 `npm run package`） | `release/macos/`：`LogLens.app`、`LogLens_0.1.0_aarch64.dmg`、`LogLens_0.1.0_aarch64.zip` |
+| Windows | `powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1`（或 `npm run package:win`） | `release/windows/`：`LogLens_0.1.0_x64_en-US.msi`、`LogLens_0.1.0_x64-setup.exe` |
+
+每个平台目录都会附带 `BUILD-INFO.md`（版本 / 平台 / Git 提交 / 工具链 / 文件清单）和 `SHA256SUMS.txt`（校验和）。`release/` 已在 `.gitignore` 中，不会被误提交。
+
+| 选项 | macOS / Linux | Windows | 作用 |
+| --- | --- | --- | --- |
+| 清空本次平台目录后重打 | `--clean` | `-Clean` | 只删 `release/<平台>/` 里的旧产物，不动其他平台 |
+| 不重新编译，只收集现有产物 | `--skip-build` | `-SkipBuild` | 复用 `src-tauri/target/release/bundle/` |
+| 换输出根目录 | `--out <dir>` | `-Out <dir>` | 默认 `release/` |
+| 指定打包格式 | `--bundles app,dmg` | `-Bundles msi,nsi` | 直接透传给 `tauri build --bundles` |
+| 完成后打开输出目录 | `--open` | `-Open` | Finder / 资源管理器 |
+| 帮助 | `--help` | `-Help` | 列出全部选项 |
+
+脚本的几个约定：
+
+- **某一种格式打包失败不阻断交付**。DMG 依赖 `hdiutil` 挂载磁盘卷，在无权限 / 沙箱 / CI 环境下会失败（`hdiutil: create failed - 操作不被允许`）；脚本会明确告警，然后继续把 `.app` 和 `.zip` 交付出来。
+- **不写回 `tauri.conf.json`**。图标齐全时通过 `tauri build --config` 一次性注入 `bundle.icon`，受版本控制的配置保持干净。
+- **图标可以偷懒**。把一张 1024×1024 的 `app-icon.png` 丢到项目根目录，脚本会自动执行 `tauri icon` 生成整套图标并注入；没有图标时也能出包，只是用系统默认图标（并给出告警）。
+- **zip 便携包用 `ditto` 打包**，保留签名与资源分叉，解压后双击即可运行。
+
 **第一步：生成正式打包图标**（发布时需要）：
 
 ```bash
@@ -165,7 +191,7 @@ npm run tauri icon path/to/icon.png     # 建议 1024x1024 PNG，生成 src-taur
 
 > 用一键脚本打包（`setup.sh --build` / `setup.ps1 -Build`）时，脚本发现图标文件齐全会**自动补全**这个数组，无需手动改配置；只有手动执行 `npm run tauri build` 才需要按上面填写。`icon: []` 是开发态默认值，保证新克隆的仓库能直接 `tauri dev`。
 
-**第二步：在目标平台上构建**（Tauri 不做跨系统打包，mac 出 dmg、Windows 出 msi 需要各自系统或 CI）：
+**第二步：在目标平台上手动构建**（不经脚本时的原始命令；Tauri 不做跨系统打包，mac 出 dmg、Windows 出 msi 需要各自系统或 CI）：
 
 ```bash
 # macOS

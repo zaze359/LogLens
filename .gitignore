@@ -6,6 +6,8 @@ dist/
 .vite/
 *.tsbuildinfo
 src-tauri/target/
+# 打包脚本的统一输出目录（按平台分目录）
+release/
 # Tauri 生成的 ACL 快照：每次 build 都会重算
 src-tauri/gen/schemas/
 

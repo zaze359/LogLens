@@ -10,6 +10,8 @@
     "postinstall": "node scripts/gen-icon.cjs",
     "preview": "vite preview",
     "tauri": "tauri",
+    "package": "bash scripts/package.sh",
+    "package:win": "powershell -ExecutionPolicy Bypass -File scripts/package.ps1",
     "setup": "bash scripts/setup.sh",
     "setup:win": "powershell -ExecutionPolicy Bypass -File scripts/setup.ps1",
     "check": "bash scripts/setup.sh --check-only"
