@@ -194,25 +194,88 @@ const ticks = computed(() => {
 /** 拖拽选中的时间区间（毫秒）；null 表示不按时间过滤。 */
 const range = ref<{ start: number; end: number } | null>(null)
 
-/** 表格里真正展示的行：时间轴选择 + 未来可能的其它过滤都收敛在这里。 */
-const filteredRequests = computed(() => {
-  const picked = range.value
-  if (!picked) return requests.value
-  return requests.value.filter((row) => {
-    const at = timeMillis(row.timeKey)
-    return at !== null && at >= picked.start && at <= picked.end
-  })
+/** 关键字一次匹配 URL、域名与方法：粘贴完整 URL 或只输域名都能定位。 */
+const keyword = ref('')
+const methodFilter = ref('')
+const statusFilter = ref('')
+const slowOnly = ref(false)
+const slowThresholdMs = 1000
+
+/** 方法下拉只列当前数据里出现过的，避免给一堆永远为空的选项。 */
+const methods = computed(() => {
+  const seen = new Set<string>()
+  for (const row of requests.value) {
+    if (row.method) seen.add(row.method.toUpperCase())
+  }
+  return [...seen].sort()
 })
 
-const tableEmptyHint = computed(() =>
-  requests.value.length > 0 ? '此时间区间内没有请求。' : emptyHint.value
+const hasFilters = computed(
+  () => !!(keyword.value.trim() || methodFilter.value || statusFilter.value || slowOnly.value)
 )
 
-/** 有区间时同时给出「命中 / 总数」，避免误以为请求丢了。 */
+function matchesFilters(row: NetworkRequest): boolean {
+  const picked = range.value
+  if (picked) {
+    const at = timeMillis(row.timeKey)
+    if (at === null || at < picked.start || at > picked.end) return false
+  }
+  const text = keyword.value.trim().toLowerCase()
+  if (text && !`${row.url} ${row.host} ${row.method}`.toLowerCase().includes(text)) return false
+  if (methodFilter.value && row.method.toUpperCase() !== methodFilter.value) return false
+  switch (statusFilter.value) {
+    case '2xx':
+      if (row.status < 200 || row.status >= 300) return false
+      break
+    case '3xx':
+      if (row.status < 300 || row.status >= 400) return false
+      break
+    case '4xx':
+      if (row.status < 400 || row.status >= 500) return false
+      break
+    case '5xx':
+      if (row.status < 500) return false
+      break
+    case 'fail':
+      if (!row.error) return false
+      break
+  }
+  if (slowOnly.value && row.durationMs < slowThresholdMs) return false
+  return true
+}
+
+/** 表格里真正展示的行：时间轴区间与筛选条件在这里一次收敛。 */
+const filteredRequests = computed(() => {
+  if (!range.value && !hasFilters.value) return requests.value
+  return requests.value.filter(matchesFilters)
+})
+
+function clearFilters(): void {
+  keyword.value = ''
+  methodFilter.value = ''
+  statusFilter.value = ''
+  slowOnly.value = false
+}
+
+/** 同时清掉区间与筛选，并恢复跟随：用在「清除筛选」和换采集通道时。 */
+function resetView(): void {
+  range.value = null
+  clearFilters()
+  followLatest.value = true
+  stickToBottom()
+}
+
+const tableEmptyHint = computed(() => {
+  if (requests.value.length === 0) return emptyHint.value
+  if (hasFilters.value) return '没有符合筛选条件的请求。'
+  return '此时间区间内没有请求。'
+})
+
+/** 过滤生效时同时给出「命中 / 总数」，避免误以为请求丢了。 */
 const countLabel = computed(() =>
-  range.value
-    ? `${filteredRequests.value.length} / ${requests.value.length} 条请求`
-    : `${requests.value.length} 条请求`
+  filteredRequests.value.length === requests.value.length
+    ? `${requests.value.length} 条请求`
+    : `${filteredRequests.value.length} / ${requests.value.length} 条请求`
 )
 
 /** 实时跟踪：停在底部时新请求自动入镜；用户向上翻看历史时暂停，滚回底部自动恢复。 */
@@ -313,12 +376,6 @@ const dragBand = computed(() => {
   return { left: from, width: to - from }
 })
 
-/** 换设备、换采集通道、清空表格后，区间与跟随都回到初始状态。 */
-function resetTimeline(): void {
-  range.value = null
-  followLatest.value = true
-}
-
 /** Re-running the probe is manual (it is slow), but switching devices invalidates it. */
 async function runProbe(): Promise<void> {
   if (!canProbe.value) return
@@ -385,7 +442,7 @@ function beginLive(info: NetworkSessionInfo): void {
   if (fileMode.value || captures.value.length === 0) {
     requests.value = []
     selected.value = null
-    resetTimeline()
+    resetView()
   }
   fileMode.value = false
   captures.value = [...captures.value, info]
@@ -412,7 +469,7 @@ async function prepareLive(): Promise<void> {
     await closeAll()
     requests.value = []
     selected.value = null
-    resetTimeline()
+    resetView()
   }
   fileMode.value = false
   boundSerial.value = props.serial
@@ -517,8 +574,7 @@ async function pickCaptureFile(): Promise<void> {
     requests.value = await ipc.queryNetworkRequests(info.id)
     fileMode.value = true
     selected.value = null
-    resetTimeline()
-    stickToBottom()
+    resetView()
   } catch (e) {
     error.value = errorMessage(e)
   }
@@ -533,7 +589,7 @@ async function clearRequests(): Promise<void> {
   clearEpoch += 1
   requests.value = []
   selected.value = null
-  resetTimeline()
+  resetView()
   if (fileMode.value) return
   const settled = await Promise.allSettled(
     captures.value.map((c) => ipc.clearNetworkCapture(c.id))
@@ -751,6 +807,40 @@ defineExpose({ shutdown, isCapturing: running })
             那部分请用原生抓包。
           </li>
         </ul>
+
+        <!-- 请求筛选：与时间轴区间叠加生效，清空后只剩真实请求 -->
+        <div v-if="requests.length > 0" class="net-filters">
+          <input
+            v-model="keyword"
+            class="net-filter-input mono"
+            type="search"
+            placeholder="筛选 URL / 域名 / 方法"
+            spellcheck="false"
+          />
+          <select v-model="methodFilter" class="net-filter-select" aria-label="方法">
+            <option value="">全部方法</option>
+            <option v-for="method in methods" :key="method" :value="method">{{ method }}</option>
+          </select>
+          <select v-model="statusFilter" class="net-filter-select" aria-label="状态">
+            <option value="">全部状态</option>
+            <option value="2xx">2xx</option>
+            <option value="3xx">3xx</option>
+            <option value="4xx">4xx</option>
+            <option value="5xx">5xx</option>
+            <option value="fail">失败</option>
+          </select>
+          <label class="net-filter-check">
+            <input v-model="slowOnly" type="checkbox" />
+            仅慢请求 ≥ 1s
+          </label>
+          <button
+            v-if="hasFilters || range"
+            class="btn btn-ghost btn-sm"
+            @click="resetView"
+          >
+            清除筛选
+          </button>
+        </div>
 
         <!-- 时间轴：请求按时间排布；拖拽选区间过滤，跟随最新可随时开关 -->
         <div v-if="requests.length > 0" class="net-timeline">

@@ -655,8 +655,20 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .net-capability b { color: var(--text); font-weight: 500; }
 .net-tag { flex: none; font-size: 10px; padding: 1px 6px; border-radius: 8px; color: var(--accent); background: var(--accent-soft); }
 
-/* 时间轴：一根轴上按时间排布请求，拖拽出区间过滤表格 */
-.net-timeline { margin: 0 0 10px; }
+/* 请求筛选：一行放完，和下方时间轴共同决定表格显示哪些行 */
+.net-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; font-size: 12px; }
+.net-filter-input {
+  flex: 1 1 220px; min-width: 160px; padding: 4px 8px; font-size: 12px;
+  color: var(--text); background: var(--bg-1); border: 1px solid var(--border); border-radius: 6px;
+}
+.net-filter-input:focus { outline: none; border-color: var(--accent); }
+.net-filter-select {
+  padding: 4px 6px; font-size: 12px; color: var(--text);
+  background: var(--bg-1); border: 1px solid var(--border); border-radius: 6px;
+}
+.net-filter-check { display: inline-flex; align-items: center; gap: 5px; color: var(--text-dim); cursor: pointer; }
+
+/* 时间轴：一根轴上按时间排布请求，拖拽出区间过滤表格 */.net-timeline { margin: 0 0 10px; }
 .net-timeline-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: 11px; }
 .net-timeline-head .btn.on { color: var(--ok); border-color: rgba(52, 211, 153, .45); }
 .net-range-label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); }
