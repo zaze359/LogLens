@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="LogLens logo">
+  <title>LogLens — logcat tribute</title>
+  <desc>蓝色圆角方底上，Android 机器人从日志面板后探出，面板内是 Error / Warn / Info 三条日志</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4C9BFF"/>
+      <stop offset="1" stop-color="#2B67E0"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <rect x="88" y="156" width="336" height="222" rx="26" fill="none" stroke="#FFFFFF" stroke-width="18"/>
+
+  <circle cx="132" cy="216" r="11" fill="#FF7B72"/>
+  <rect x="160" y="208" width="176" height="16" rx="8" fill="#FFFFFF" opacity="0.95"/>
+  <circle cx="132" cy="268" r="11" fill="#FFC857"/>
+  <rect x="160" y="260" width="222" height="16" rx="8" fill="#FFFFFF" opacity="0.75"/>
+  <circle cx="132" cy="320" r="11" fill="#5BE0A0"/>
+  <rect x="160" y="312" width="140" height="16" rx="8" fill="#FFFFFF" opacity="0.55"/>
+
+  <path d="M300 156a48 48 0 0 1 96 0Z" fill="#FFFFFF"/>
+  <path d="M322 112v20M374 112v20" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="322" cy="106" r="7" fill="#FFFFFF"/>
+  <circle cx="374" cy="106" r="7" fill="#FFFFFF"/>
+  <circle cx="326" cy="140" r="7" fill="#2B67E0"/>
+  <circle cx="370" cy="140" r="7" fill="#2B67E0"/>
+</svg>
