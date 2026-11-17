@@ -29,6 +29,12 @@ use tauri::{AppHandle, Emitter, State};
 
 const MAX_OPEN_SESSIONS: usize = 4;
 
+/// How long a live stream may go without a poll before it is treated as orphaned.
+///
+/// The webview polls every 800ms. Five seconds tolerates a stalled IPC or a suspended
+/// window, but still frees a device within a few seconds of a closed tab / webview reload.
+const STREAM_LEASE: Duration = Duration::from_secs(5);
+
 /// Event name used for import progress. The payload is [`OpenProgress`].
 const IMPORT_PROGRESS_EVENT: &str = "log-open-progress";
 
@@ -311,20 +317,57 @@ fn require_ready(serial: &str) -> Result<(), String> {
     }
 }
 
-/// Refuse a second live capture of the same device.
+/// Stop streams for `serial` whose webview has stopped polling them, and drop their
+/// sessions. Scoped to one device on purpose: a global sweep could kill a *different*
+/// device's live capture that merely hasn't renewed its lease yet (e.g. the machine just
+/// woke from sleep). Reaching this function means the frontend has no busy tab for this
+/// serial, so reclaiming this serial's stale streams is always safe.
+///
+/// Locks are never nested: take the stream ids out under the stream lock, release it, then
+/// drop the sessions. Holding both would invert the order used by `register_session`.
+fn reap_orphan_streams(state: &State<'_, AppState>, serial: &str) -> Result<(), String> {
+    let orphan_ids: Vec<String> = {
+        let mut streams = state
+            .streams
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        let mut ids = Vec::new();
+        streams.retain(|id, stream| {
+            if stream.serial() == serial && stream.idle_for() >= STREAM_LEASE {
+                stream.stop();
+                ids.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ids
+    };
+    if !orphan_ids.is_empty() {
+        if let Ok(mut sessions) = state.sessions.lock() {
+            for id in &orphan_ids {
+                sessions.remove(id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a second live capture of a device that still has a tab polling it.
 ///
 /// Two `adb logcat` children would fight over one ring buffer (each replays and then
 /// follows the same lines, doubling the load), and `clear_before` on the second one would
-/// wipe the lines the first capture is in the middle of collecting. The UI checks this too
-/// so it can point at the existing tab, but the backend check is the authoritative one.
+/// wipe the lines the first capture is in the middle of collecting. Orphans are reclaimed
+/// first, so a stale stream never blocks a device that has no live tab.
 fn ensure_device_not_streaming(state: &State<'_, AppState>, serial: &str) -> Result<(), String> {
+    reap_orphan_streams(state, serial)?;
     let streams = state
         .streams
         .lock()
         .map_err(|e| format!("状态锁异常: {e}"))?;
     if streams.values().any(|stream| stream.serial() == serial) {
         return Err(format!(
-            "设备 {serial} 已经在一个会话里实时抓取了。同一台设备同时只能有一个实时抓取，请先在那个标签点「停止实时抓取」再重新开始。"
+            "设备 {serial} 的另一份日志正在实时抓取。请切到那份日志点「停止抓取」后再重新开始。"
         ));
     }
     Ok(())
@@ -390,7 +433,7 @@ pub fn start_device_stream(
             stream.stop();
             remove_session(&state, &info.session_id);
             return Err(format!(
-                "设备 {serial} 已经在一个会话里实时抓取了。同一台设备同时只能有一个实时抓取。"
+                "设备 {serial} 的另一份日志正在实时抓取。请切到那份日志点「停止抓取」后再重新开始。"
             ));
         }
         streams.insert(info.session_id.clone(), stream);
@@ -446,6 +489,41 @@ pub fn stop_device_stream(session_id: String, state: State<'_, AppState>) -> Res
         .map_err(|e| format!("状态锁异常: {e}"))?;
     if let Some(mut stream) = streams.remove(&session_id) {
         stream.stop();
+    }
+    Ok(())
+}
+
+/// Force-release every live stream attached to a serial, regardless of lease age.
+///
+/// Only called by the frontend when it has already confirmed it holds no tab for that
+/// device — e.g. right after a webview reload, before the 5s lease has lapsed. Without
+/// this the user would be told to switch to a tab that no longer exists. Each stream's
+/// `adb logcat` child is killed and its session dropped so the serial is free at once.
+#[tauri::command]
+pub fn release_device_stream(serial: String, state: State<'_, AppState>) -> Result<(), String> {
+    let orphan_ids: Vec<String> = {
+        let mut streams = state
+            .streams
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        let mut ids = Vec::new();
+        streams.retain(|id, stream| {
+            if stream.serial() == serial.trim() {
+                stream.stop();
+                ids.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        ids
+    };
+    if !orphan_ids.is_empty() {
+        if let Ok(mut sessions) = state.sessions.lock() {
+            for id in &orphan_ids {
+                sessions.remove(id);
+            }
+        }
     }
     Ok(())
 }

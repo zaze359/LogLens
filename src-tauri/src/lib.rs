@@ -29,6 +29,7 @@ pub fn run() {
             commands::start_device_stream,
             commands::poll_device_stream,
             commands::stop_device_stream,
+            commands::release_device_stream,
             commands::query_logs,
             commands::search_hits,
             commands::close_session,

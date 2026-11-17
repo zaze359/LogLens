@@ -56,11 +56,21 @@ pub struct DeviceStream {
     /// Device this stream is attached to. A device may only be captured once at a time, so
     /// the command layer uses this to refuse a second capture of the same serial.
     serial: String,
+    /// Last time the webview polled this stream. A live tab polls every ~800ms; a stream
+    /// nobody polls any more is an orphan (closed tab / webview reload) and must not keep
+    /// the device reserved forever. Refreshed by `drain`, which only polling calls.
+    last_poll: Instant,
 }
 
 impl DeviceStream {
     pub fn serial(&self) -> &str {
         &self.serial
+    }
+
+    /// How long no tab has polled this stream. The command layer reclaims streams whose
+    /// lease has lapsed instead of rejecting the device forever.
+    pub fn idle_for(&self) -> Duration {
+        self.last_poll.elapsed()
     }
 
     pub fn spawn(
@@ -101,11 +111,14 @@ impl DeviceStream {
             shared,
             session_id,
             serial: serial.to_string(),
+            last_poll: Instant::now(),
         })
     }
 
     /// Take everything parsed since the last poll and report how the stream is doing.
+    /// Called once per poll by the command layer, so it doubles as the lease heartbeat.
     pub fn drain(&mut self) -> (Vec<LogEntry>, StreamStatus) {
+        self.last_poll = Instant::now();
         let mut buffer = match self.shared.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

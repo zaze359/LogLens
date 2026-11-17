@@ -84,6 +84,9 @@ export const ipc = {
     call<StreamStatus>('poll_device_stream', { sessionId }),
   stopDeviceStream: (sessionId: string) =>
     call<void>('stop_device_stream', { sessionId }),
+  /** Force-release streams for a serial the webview no longer has a tab for. */
+  releaseDeviceStream: (serial: string) =>
+    call<void>('release_device_stream', { serial }),
 
   /** "查找"模式：只返回命中位置，不改变 queryLogs 的结果集。 */
   searchHits: (sessionId: string, filter: FilterSpec, limit: number) =>

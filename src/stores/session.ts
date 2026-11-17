@@ -793,29 +793,47 @@ export async function startDeviceStream(options: DeviceCaptureOptions): Promise<
     return false
   }
   store.error = ''
-  try {
-    // 按设备记偏好：重新开始 / 再开抓面板时只认这台设备自己的设置。
-    store.capturePrefs[options.serial] = { ...options }
-    const info = await ipc.startDeviceStream(options)
-    const stream: DeviceStreamInfo = {
-      sessionId: info.sessionId,
-      serial: options.serial,
-      label: info.fileName,
-      running: true,
-      error: '',
-      startedAt: Date.now()
+  // 后端拒绝「同设备第二份抓取」时，正常情况前端已经有那个标签（上面的 busy 分支会
+  // 激活它）。但 webview 重载后内存 store 归零、后端流还在租约期内时，会出现「后端在
+  // 抓、本地无标签」的死结。确认本地确实没有标签后，强制释放后端残留再重试一次。
+  const attempt = async (allowRecovery: boolean): Promise<boolean> => {
+    try {
+      // 按设备记偏好：重新开始 / 再开抓面板时只认这台设备自己的设置。
+      store.capturePrefs[options.serial] = { ...options }
+      const info = await ipc.startDeviceStream(options)
+      const stream: DeviceStreamInfo = {
+        sessionId: info.sessionId,
+        serial: options.serial,
+        label: info.fileName,
+        running: true,
+        error: '',
+        startedAt: Date.now()
+      }
+      await openTab(info, stream)
+      syncTimers()
+      // `adb logcat` replays the existing buffer first, so a non-empty start is normal and
+      // means "these lines already happened" — worth saying out loud once.
+      const replayed = info.entryCount > 0 ? `（含设备缓冲区已有的 ${info.entryCount} 条）` : ''
+      setNotice(`已在这台设备的「日志」工具里开始实时抓取${replayed}，切到别的工具也会继续接收`)
+      return true
+    } catch (e) {
+      const message = errorMessage(e)
+      const stillNoLocalTab = !store.tabs.some(
+        (tab) =>
+          tab.stream && tab.info.source === 'stream' && tab.info.device === options.serial
+      )
+      const refusedAsBusy =
+        message.includes('另一份日志正在实时抓取') ||
+        message.includes('已经在一个会话里实时抓取')
+      if (allowRecovery && refusedAsBusy && stillNoLocalTab) {
+        await ipc.releaseDeviceStream(options.serial).catch(() => {})
+        return attempt(false)
+      }
+      store.error = message
+      return false
     }
-    await openTab(info, stream)
-    syncTimers()
-    // `adb logcat` replays the existing buffer first, so a non-empty start is normal and
-    // means "these lines already happened" — worth saying out loud once.
-    const replayed = info.entryCount > 0 ? `（含设备缓冲区已有的 ${info.entryCount} 条）` : ''
-    setNotice(`已在这台设备的「日志」工具里开始实时抓取${replayed}，切到别的工具也会继续接收`)
-    return true
-  } catch (e) {
-    store.error = errorMessage(e)
-    return false
   }
+  return attempt(true)
 }
 
 let streamTimer: ReturnType<typeof setInterval> | null = null
