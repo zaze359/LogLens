@@ -349,3 +349,21 @@ export const LEVEL_LABELS: Record<string, string> = {
   S: 'Silent',
   '?': 'Unparsed'
 }
+
+/** 客户端自身的故障记录（与正在分析的日志无关），来自 Rust 的 error_log 模块。 */
+export interface ErrorRecord {
+  id: string
+  /** epoch 毫秒（重复发生时更新为最后一次的时间） */
+  ts: number
+  /** panic | error | warning */
+  level: string
+  /** rust | frontend */
+  source: string
+  /** 命令名、模块名或前端处理器名 */
+  scope: string
+  message: string
+  /** 调用栈，可能为空 */
+  detail: string
+  /** 短时间内相同故障折叠为一条 */
+  count: number
+}

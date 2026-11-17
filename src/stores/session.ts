@@ -6,6 +6,7 @@ import type {
   AdbDevice,
   AdbStatus,
   DeviceCaptureOptions,
+  ErrorRecord,
   FileInfo,
   FilterSpec,
   LogEntry,
@@ -179,8 +180,24 @@ export interface AppState {
   deviceOps: Record<string, DeviceOpId>
   /** The device picker: connect / switch device. Only needed when adding a device. */
   devicePicker: boolean
-  /** Last used capture options, so reopening the panel does not start from scratch. */
-  lastCapture: DeviceCaptureOptions | null
+  /**
+   * 独立的通用 JSON 格式化面板。open 控制显隐；text 是待查看 / 可编辑的原文；
+   * label 是来源（如「响应体」），从抓包带过来时显示，独立打开时为空。
+   */
+  jsonPanel: { open: boolean; text: string; label: string }
+  /**
+   * 每台设备记住自己的抓取偏好（缓冲区 / 是否先清空），按 serial 隔离。
+   * 设备工作区与设备一一绑定，偏好也必须跟着设备走：全局单例会把 A 的设置串到 B，
+   * 甚至让「重新开始」拿旧 serial 去抓（后端报「设备已不在连接列表」）。
+   */
+  capturePrefs: Record<string, DeviceCaptureOptions>
+  // ---- client self-diagnostics (this app's own failures, not analysed logs) ----
+  errorLogOpen: boolean
+  errorLog: ErrorRecord[]
+  errorLogLoading: boolean
+  errorLogPath: string
+  /** Records added since the panel was last opened; drives the top-bar badge. */
+  errorLogUnread: number
 }
 
 export const store = reactive<AppState>({
@@ -219,7 +236,13 @@ export const store = reactive<AppState>({
   deviceView: false,
   deviceOps: {},
   devicePicker: false,
-  lastCapture: null
+  jsonPanel: { open: false, text: '', label: '' },
+  capturePrefs: {},
+  errorLogOpen: false,
+  errorLog: [],
+  errorLogLoading: false,
+  errorLogPath: '',
+  errorLogUnread: 0
 })
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
@@ -235,6 +258,89 @@ export function setNotice(text: string): void {
   }, 4500)
 }
 
+/* ------------------------------------------------- client error log -------- */
+
+/** Only failures newer than this are "unread", so an old record does not badge every launch. */
+const ERROR_LOG_SEEN_KEY = 'loglens.errorLog.lastSeen'
+
+function lastSeenTs(): number {
+  try {
+    return Number(localStorage.getItem(ERROR_LOG_SEEN_KEY)) || 0
+  } catch {
+    return 0
+  }
+}
+
+function markErrorLogSeen(): void {
+  try {
+    localStorage.setItem(ERROR_LOG_SEEN_KEY, String(Date.now()))
+  } catch {
+    // Private mode / disabled storage: the badge simply updates less precisely.
+  }
+}
+
+/** Newest first, mirroring the Rust list command. */
+export async function refreshErrorLog(): Promise<void> {
+  if (!store.tauriReady) return
+  store.errorLogLoading = true
+  try {
+    const [records, path] = await Promise.all([ipc.listErrorLog(), ipc.errorLogLocation()])
+    store.errorLog = records ?? []
+    store.errorLogPath = path
+    if (!store.errorLogOpen) {
+      const seen = lastSeenTs()
+      store.errorLogUnread = store.errorLog.filter((r) => r.ts > seen).length
+    }
+  } catch (e) {
+    store.error = errorMessage(e)
+  } finally {
+    store.errorLogLoading = false
+  }
+}
+
+/**
+ * Opening marks everything read. `refreshErrorLog` only recomputes unread while closed,
+ * so a failure landing between the click and the IPC reply cannot re-light the badge.
+ */
+export function openErrorLog(): void {
+  markErrorLogSeen()
+  store.errorLogOpen = true
+  store.errorLogUnread = 0
+  void refreshErrorLog()
+}
+
+export function closeErrorLog(): void {
+  store.errorLogOpen = false
+}
+
+export async function clearErrorLog(): Promise<void> {
+  if (!store.tauriReady) return
+  try {
+    await ipc.clearErrorLog()
+    store.errorLog = []
+    store.errorLogUnread = 0
+    setNotice('已清空错误日志')
+  } catch (e) {
+    store.error = errorMessage(e)
+  }
+}
+
+export async function exportErrorLogFile(): Promise<void> {
+  if (!store.tauriReady) return
+  try {
+    const dest = await saveDialog({
+      title: '导出错误日志',
+      defaultPath: 'loglens-error-log.txt',
+      filters: [{ name: '文本文件', extensions: ['txt', 'log'] }]
+    })
+    if (!dest) return
+    await ipc.exportErrorLog(dest)
+    setNotice(`已导出错误日志到 ${dest}`)
+  } catch (e) {
+    store.error = errorMessage(e)
+  }
+}
+
 /** Every mutating rules IPC now returns the full bundle, so one call refreshes both lists. */
 export function applyRuleBundle(view: RulesView): void {
   store.categories = view.categories ?? []
@@ -244,6 +350,10 @@ export function applyRuleBundle(view: RulesView): void {
 export async function init(): Promise<void> {
   store.tauriReady = isTauri()
   if (!store.tauriReady) return
+  window.addEventListener('loglens-client-error', () => {
+    // Panel open -> its own list refresh handles it; closed -> just update the badge.
+    void refreshErrorLog()
+  })
   try {
     const [templates, bundle] = await Promise.all([
       ipc.listBuiltinTemplates(),
@@ -252,6 +362,8 @@ export async function init(): Promise<void> {
     store.templates = templates
     applyRuleBundle(bundle)
     void ipc.rulesLocation().then((p) => (store.rulesPath = p)).catch(() => {})
+    // A failure from the previous session must still be visible as a badge.
+    void refreshErrorLog()
     // Learn which devices exist without blocking the UI: the top bar can then show the
     // active device immediately, so connecting is a one-click affair instead of a detour.
     // Quiet: no adb installed is a normal state for someone who only analyses log files.
@@ -627,6 +739,7 @@ export async function closeDeviceWorkspace(serial: string): Promise<void> {
   if (index < 0) return
   store.deviceWorkspaces.splice(index, 1)
   delete store.deviceOps[serial]
+  delete store.capturePrefs[serial]
   if (!wasActive) return
   // Focus a neighbour, or fall back to the log view when no device workspace is left.
   // `deviceView` is decided last: closing the tabs above may already have switched views.
@@ -647,6 +760,15 @@ export function openDevicePicker(): void {
 
 export function closeDevicePicker(): void {
   store.devicePicker = false
+}
+
+/** 打开通用 JSON 面板：可从抓包正文带文本进来，也可空着打开让用户粘贴。 */
+export function openJsonPanel(text = '', label = ''): void {
+  store.jsonPanel = { open: true, text, label }
+}
+
+export function closeJsonPanel(): void {
+  store.jsonPanel.open = false
 }
 
 /** Follow new device lines until the user stops or adb exits. Opens in its own tab. */
@@ -672,7 +794,8 @@ export async function startDeviceStream(options: DeviceCaptureOptions): Promise<
   }
   store.error = ''
   try {
-    store.lastCapture = { ...options }
+    // 按设备记偏好：重新开始 / 再开抓面板时只认这台设备自己的设置。
+    store.capturePrefs[options.serial] = { ...options }
     const info = await ipc.startDeviceStream(options)
     const stream: DeviceStreamInfo = {
       sessionId: info.sessionId,

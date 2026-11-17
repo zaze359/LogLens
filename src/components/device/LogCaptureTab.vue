@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { startDeviceStream, store } from '../../stores/session'
 import type { DeviceCaptureOptions } from '../../types'
 
@@ -16,10 +16,19 @@ import type { DeviceCaptureOptions } from '../../types'
 const props = defineProps<{ serial: string; deviceReady: boolean }>()
 const emit = defineEmits<{ started: [] }>()
 
-const buffers = ref<string[]>([...(store.lastCapture?.buffers ?? [])])
-// Off by default: `adb logcat -c` wipes the device buffer, and the lines it destroys are
-// often exactly the ones the user opened this dialog to look at.
-const clearBefore = ref(store.lastCapture?.clearBefore ?? false)
+const buffers = ref<string[]>([])
+// 默认关：`adb logcat -c` 会清空设备缓冲区，而那批行往往正是用户打开面板想看的。
+const clearBefore = ref(false)
+// 本组件常驻挂载，serial 会随设备切换而变：每次换设备都重载它自己的偏好，
+// 否则会把上一台设备的缓冲区设置带到新设备的「抓一份」卡片上。
+watch(
+  () => props.serial,
+  (serial) => {
+    buffers.value = [...(store.capturePrefs[serial]?.buffers ?? [])]
+    clearBefore.value = store.capturePrefs[serial]?.clearBefore ?? false
+  },
+  { immediate: true }
+)
 const busy = ref(false)
 
 const BUFFERS = [

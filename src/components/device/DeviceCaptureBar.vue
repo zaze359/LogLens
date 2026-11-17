@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { activateTab, startDeviceStream, stopDeviceStream, store } from '../../stores/session'
 import type { SessionTab } from '../../stores/session'
+import type { DeviceCaptureOptions } from '../../types'
 
 /**
  * 日志工具的采集状态条 —— 抓取是这台设备的一件事，所以「是不是在抓、抓了多少、抓多久、
@@ -69,7 +70,7 @@ onBeforeUnmount(() => {
 })
 
 const buffersText = computed<string>(() => {
-  const buffers = store.lastCapture?.buffers ?? []
+  const buffers = store.capturePrefs[props.serial]?.buffers ?? []
   return buffers.length ? buffers.join(' + ') : '默认（main + system + crash）'
 })
 
@@ -95,9 +96,15 @@ async function restart(): Promise<void> {
   if (busy.value) return
   busy.value = true
   try {
-    await startDeviceStream(
-      store.lastCapture ?? { serial: props.serial, buffers: [], clearBefore: false }
-    )
+    // 只借这台设备自己记下的缓冲区偏好；serial 必须是本条状态条绑定的设备。
+    // 早先读全局 lastCapture 会把 A 的设置串到 B，甚至拿旧 serial 去抓而报「不在连接列表」。
+    const prefs = store.capturePrefs[props.serial]
+    const options: DeviceCaptureOptions = {
+      serial: props.serial,
+      buffers: [...(prefs?.buffers ?? [])],
+      clearBefore: prefs?.clearBefore ?? false
+    }
+    await startDeviceStream(options)
   } finally {
     busy.value = false
   }

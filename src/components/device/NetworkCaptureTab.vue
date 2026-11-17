@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
+import { openJsonPanel } from '../../stores/session'
 import { toCurl } from '../../lib/curl'
 import { errorMessage, ipc } from '../../lib/ipc'
 import type {
@@ -42,9 +43,6 @@ const requestHeadersOpen = ref(true)
 const responseHeadersOpen = ref(false)
 const curlCopied = ref(false)
 let curlTimer: ReturnType<typeof setTimeout> | null = null
-/** 正文复制按钮的短暂反馈：'request' | 'response' | ''。 */
-const bodyCopied = ref('')
-let bodyTimer: ReturnType<typeof setTimeout> | null = null
 
 const proxyInput = ref('')
 const proxyState = ref<ProxyState | null>(null)
@@ -633,20 +631,6 @@ async function copyCurl(): Promise<void> {
   }
 }
 
-/** 一键复制请求体 / 响应体原文（已脱敏、已解压后的文本）。 */
-async function copyBody(which: 'request' | 'response'): Promise<void> {
-  const text = which === 'request' ? selected.value?.requestBody : selected.value?.responseBody
-  if (!text) return
-  try {
-    await navigator.clipboard.writeText(text)
-    bodyCopied.value = which
-    if (bodyTimer) clearTimeout(bodyTimer)
-    bodyTimer = setTimeout(() => (bodyCopied.value = ''), 1600)
-  } catch {
-    error.value = '复制失败，请手动选中文本'
-  }
-}
-
 /**
  * Called by the device dialog before it closes: stop both channels and give the device its
  * proxy back. Kept separate from `onBeforeUnmount` so the dialog can await it and show the
@@ -699,7 +683,6 @@ watch(
 onBeforeUnmount(() => {
   stopPolling()
   if (curlTimer) clearTimeout(curlTimer)
-  if (bodyTimer) clearTimeout(bodyTimer)
   // The component can be unmounted without going through shutdown() (window close,
   // store reset). Best effort only: an IPC may not get out while the webview is
   // being torn down. The Rust CloseRequested/Exit hooks and the proxy journal are
@@ -1041,12 +1024,10 @@ defineExpose({ shutdown, isCapturing: running })
             <span>请求体</span>
             <button
               v-if="selected.requestBody"
-              class="btn btn-ghost btn-sm"
-              :class="{ copied: bodyCopied === 'request' }"
-              @click="copyBody('request')"
-            >
-              {{ bodyCopied === 'request' ? '已复制' : '复制' }}
-            </button>
+              class="btn btn-sm"
+              title="在独立面板中格式化查看请求体"
+              @click="openJsonPanel(selected.requestBody, '请求体')"
+            >格式化</button>
           </p>
           <pre v-if="selected.requestBody" class="net-body-pre mono">{{ selected.requestBody }}</pre>
           <p v-else class="muted">无请求体（或不是文本内容）</p>
@@ -1072,12 +1053,10 @@ defineExpose({ shutdown, isCapturing: running })
             <span>响应体</span>
             <button
               v-if="selected.responseBody"
-              class="btn btn-ghost btn-sm"
-              :class="{ copied: bodyCopied === 'response' }"
-              @click="copyBody('response')"
-            >
-              {{ bodyCopied === 'response' ? '已复制' : '复制' }}
-            </button>
+              class="btn btn-sm"
+              title="在独立面板中格式化查看响应体"
+              @click="openJsonPanel(selected.responseBody, '响应体')"
+            >格式化</button>
           </p>
           <pre v-if="selected.responseBody" class="net-body-pre mono">{{ selected.responseBody }}</pre>
           <p v-else class="muted">

@@ -10,6 +10,8 @@ import DeviceCaptureBar from './components/device/DeviceCaptureBar.vue'
 import DevicePickerDialog from './components/device/DevicePickerDialog.vue'
 import LogCaptureTab from './components/device/LogCaptureTab.vue'
 import ImportOverlay from './components/ImportOverlay.vue'
+import ErrorLogPanel from './components/ErrorLogPanel.vue'
+import JsonFormatPanel from './components/JsonFormatPanel.vue'
 import { init, loadFile, store } from './stores/session'
 
 let unlistenDrop: (() => void) | null = null
@@ -121,6 +123,10 @@ onBeforeUnmount(() => {
     </div>
 
     <DevicePickerDialog v-if="store.devicePicker" />
+
+    <ErrorLogPanel v-if="store.errorLogOpen" />
+
+    <JsonFormatPanel v-if="store.jsonPanel.open" />
 
     <Transition name="fade">
       <ImportOverlay v-if="store.importTask?.visible" />

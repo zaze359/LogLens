@@ -3,6 +3,8 @@ import { computed } from 'vue'
 import {
   exportFilteredFile,
   openDevicePicker,
+  openErrorLog,
+  openJsonPanel,
   pickAndLoadFile,
   resetFilter,
   store
@@ -55,6 +57,9 @@ const sourceTitle = computed(() => {
     <div class="spacer" />
     <!-- 抓取的开始 / 停止在设备工作区的「日志」工具里，顶栏不再有脱离设备的抓取按钮 -->
     <button class="btn btn-sm" @click="resetFilter">清空筛选</button>
+    <button class="btn btn-sm" title="打开通用 JSON 格式化面板，可粘贴任意 JSON" @click="openJsonPanel()">
+      JSON 格式化
+    </button>
     <button class="btn btn-sm" :disabled="!info" @click="exportFilteredFile">导出命中结果</button>
     <button
       class="btn btn-primary btn-sm"
@@ -78,6 +83,16 @@ const sourceTitle = computed(() => {
         @click="openDevicePicker"
       >
         设备
+      </button>
+      <button
+        class="btn btn-sm error-log-entry"
+        :class="{ 'has-new': store.errorLogUnread > 0 }"
+        title="查看客户端自身的崩溃与异常记录"
+        @click="openErrorLog"
+      >
+        错误日志<span v-if="store.errorLogUnread" class="error-log-badge">{{
+          store.errorLogUnread > 99 ? '99+' : store.errorLogUnread
+        }}</span>
       </button>
     </template>
   </header>
