@@ -216,15 +216,18 @@ function segments(entry: LogEntry): Segment[] {
           v-for="entry in visible"
           :key="entry.index"
           class="log-row"
-          :class="{
-            selected: store.selected?.index === entry.index,
-            hit: currentHitIndex === entry.index,
-            unparsed: !entry.parseOk
-          }"
+          :class="[
+            levelClass(entry.level),
+            {
+              selected: store.selected?.index === entry.index,
+              hit: currentHitIndex === entry.index,
+              unparsed: !entry.parseOk
+            }
+          ]"
           @click="store.selected = entry"
         >
           <span class="cell cell-index">{{ entry.index + 1 }}</span>
-          <span class="badge-level" :class="levelClass(entry.level)">{{ entry.level }}</span>
+          <span class="badge-level">{{ entry.level }}</span>
           <span class="cell cell-time">{{ entry.timestamp || '—' }}</span>
           <span class="cell cell-pid">{{ entry.pid || '—' }}</span>
           <span class="cell cell-pid">{{ entry.tid || '—' }}</span>

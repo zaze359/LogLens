@@ -5,6 +5,11 @@ import { setNotice, store } from '../stores/session'
 
 const entry = computed(() => store.selected)
 
+/** 级别类：只声明 --lv / --lv-bg，徽标与原文配色都由 CSS 变量取用。 */
+function levelClass(level: string): string {
+  return `lv-${level === '?' ? 'unknown' : level.toLowerCase()}`
+}
+
 async function copyRaw(): Promise<void> {
   if (!entry.value) return
   try {
@@ -19,7 +24,7 @@ async function copyRaw(): Promise<void> {
 <template>
   <aside v-if="entry" class="drawer">
     <div class="drawer-head">
-      <span class="badge-level" :class="`lv-${entry.level === '?' ? 'unknown' : entry.level.toLowerCase()}`">
+      <span class="badge-level" :class="levelClass(entry.level)">
         {{ entry.level }}
       </span>
       <strong>日志详情</strong>
@@ -40,7 +45,7 @@ async function copyRaw(): Promise<void> {
         <dt>解析状态</dt><dd>{{ entry.parseOk ? '已识别' : '未识别（原样保留）' }}</dd>
       </dl>
       <div class="side-title">原始内容（含堆栈等续行）</div>
-      <pre class="raw-box">{{ entry.raw }}</pre>
+      <pre class="raw-box" :class="levelClass(entry.level)">{{ entry.raw }}</pre>
     </div>
   </aside>
 </template>

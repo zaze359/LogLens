@@ -301,22 +301,27 @@ button { cursor: pointer; }
 .cell-pid { color: #7f93aa; }
 .cell-pkg { color: #86c5a8; }
 .cell-tag { color: #c7b6f7; }
-.cell-msg { color: var(--text); overflow: visible; }
+.cell-msg { color: var(--lv, var(--text)); overflow: visible; }
 .cell-msg .cont { color: var(--accent); font-size: 11px; margin-left: 8px; }
 .badge-level {
   display: inline-block; width: 20px; height: 18px; line-height: 18px;
   text-align: center; border-radius: 4px; font-weight: 700; font-size: 11px;
+  color: var(--lv, var(--text)); background: var(--lv-bg, transparent);
 }
-/* 级别配色：与 StatsPanel 的柱状图保持一致；全部用「文字色 + 同色低透明度底」，只有亮度区分优先级 */
-.lv-v { color: #ffffff; background: rgba(255,255,255,.10); }
-.lv-d { color: #299999; background: rgba(41,153,153,.16); }
-.lv-i { color: #5ac023; background: rgba(90,192,35,.14); }
-.lv-w { color: #bbb529; background: rgba(187,181,41,.16); }
-.lv-e { color: #ff6b68; background: rgba(255,107,104,.15); }
-.lv-f { color: #ff3b30; background: rgba(255,59,48,.18); }
-.lv-a { color: #ff6b68; background: rgba(255,107,104,.15); }
-.lv-s { color: #8b95a5; background: rgba(139,149,165,.14); }
-.lv-unknown { color: #64748b; background: rgba(100,116,139,.13); }
+/*
+ * 级别配色：与 StatsPanel 的柱状图保持一致。
+ * 这里只声明变量，徽标 / 消息正文 / 详情原文各自用 var() 取色，
+ * 所以加在行容器上就能同时给徽标和消息上色，不用重复写颜色。
+ */
+.lv-v { --lv: #ffffff; --lv-bg: rgba(255,255,255,.10); }
+.lv-d { --lv: #299999; --lv-bg: rgba(41,153,153,.16); }
+.lv-i { --lv: #5ac023; --lv-bg: rgba(90,192,35,.14); }
+.lv-w { --lv: #bbb529; --lv-bg: rgba(187,181,41,.16); }
+.lv-e { --lv: #ff6b68; --lv-bg: rgba(255,107,104,.15); }
+.lv-f { --lv: #ff3b30; --lv-bg: rgba(255,59,48,.18); }
+.lv-a { --lv: #ff6b68; --lv-bg: rgba(255,107,104,.15); }
+.lv-s { --lv: #8b95a5; --lv-bg: rgba(139,149,165,.14); }
+.lv-unknown { --lv: #64748b; --lv-bg: rgba(100,116,139,.13); }
 .log-row.unparsed .cell-msg { color: var(--text-faint); font-style: italic; }
 mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .table-empty { padding: 48px 20px; text-align: center; color: var(--text-faint); line-height: 2; }
@@ -343,6 +348,7 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .raw-box {
   white-space: pre-wrap; word-break: break-word; padding: 12px;
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--lv, inherit);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; line-height: 1.65;
 }
