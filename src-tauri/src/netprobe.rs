@@ -613,7 +613,7 @@ mod tests {
     fn extracts_devtools_socket_and_owner_package() {
         let row = "0000000000000000: 00000002 00000000 00010000 0001 01 381180 @webview_devtools_remote_13311";
         assert_eq!(parse_devtools_sockets(row), vec![(13311, "webview_devtools_remote_13311".to_string())]);
-        assert_eq!(parse_cmdline("com.hailiang.workcloud.teacher\0\0"), "com.hailiang.workcloud.teacher");
+        assert_eq!(parse_cmdline("com.example.sample.teacher\0\0"), "com.example.sample.teacher");
         assert_eq!(parse_cmdline("com.x:remote\0"), "com.x");
         assert_eq!(parse_proxy("null"), "");
         assert_eq!(parse_proxy("10.0.0.2:8080"), "10.0.0.2:8080");
@@ -639,7 +639,7 @@ mod tests {
             vec![DevtoolsProbe {
                 pid: 13311,
                 socket: "webview_devtools_remote_13311".into(),
-                package: "com.hailiang.workcloud.teacher".into(),
+                package: "com.example.sample.teacher".into(),
                 browser: "Chrome/124".into(),
                 pages: 1,
             }],

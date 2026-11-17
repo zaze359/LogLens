@@ -269,7 +269,7 @@ impl ProcessIndex {
     /// Fill `entry.package` when the line itself carried no package.
     ///
     /// A package spelled out in the line always wins: `1234-5678/com.foo` is authoritative,
-    /// and an accessibility foreground event (`onTopAppChanged: com.zui.launcher/...`)
+    /// and an accessibility foreground event (`onTopAppChanged: com.example.launcher/...`)
     /// describes the app on screen, not the process that printed the line.
     pub fn fill(&self, entry: &mut LogEntry) {
         if !entry.package.is_empty() || entry.pid == 0 {
@@ -848,7 +848,7 @@ mod tests {
     #[test]
     fn parses_launcher_top_app_changed_event() {
         // Real ZUI Launcher foreground-app event, emitted with `adb logcat -v brief`.
-        let line = "11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.zui.launcher/com.zui.quickstep.RecentsActivity";
+        let line = "11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.example.launcher/com.example.quickstep.RecentsActivity";
         let r = parse(&[line]);
         assert_eq!(r.entries.len(), 1);
         let e = &r.entries[0];
@@ -856,11 +856,11 @@ mod tests {
         assert_eq!(e.tag, "AccessibilityData");
         assert_eq!(e.pid, 2108);
         assert_eq!(e.time_key, "18:02:29.792");
-        assert!(e.message.contains("onTopAppChanged: com.zui.launcher/"));
-        assert_eq!(e.package, "com.zui.launcher");
-        assert_eq!(e.component, "com.zui.quickstep.RecentsActivity");
+        assert!(e.message.contains("onTopAppChanged: com.example.launcher/"));
+        assert_eq!(e.package, "com.example.launcher");
+        assert_eq!(e.component, "com.example.quickstep.RecentsActivity");
         let (_, _, _, packages) = collect_facets(&r.entries);
-        assert!(packages.contains(&"com.zui.launcher".to_string()));
+        assert!(packages.contains(&"com.example.launcher".to_string()));
     }
 
     #[test]
@@ -868,16 +868,16 @@ mod tests {
         // Any observed app, and className is not necessarily an Activity (FrameLayout
         // here is a window / popup component reported by AccessibilityEvent).
         let r = parse(&[
-            "11-03 18:02:29.830 I/AccessibilityData( 2108): onTopAppChanged: com.hljzjx.edu.student.launch/com.hljzjx.launch.ui.main.MainActivity",
-            "11-03 18:25:05.005 I/AccessibilityData( 2108): onTopAppChanged: com.hailiang.xxb.web.app/android.widget.FrameLayout",
+            "11-03 18:02:29.830 I/AccessibilityData( 2108): onTopAppChanged: com.example.sample.launch/com.example.sample.launch.ui.main.MainActivity",
+            "11-03 18:25:05.005 I/AccessibilityData( 2108): onTopAppChanged: com.example.sample.web/android.widget.FrameLayout",
         ]);
         assert_eq!(r.entries.len(), 2);
         let first = &r.entries[0];
-        assert_eq!(first.package, "com.hljzjx.edu.student.launch");
-        assert_eq!(first.component, "com.hljzjx.launch.ui.main.MainActivity");
+        assert_eq!(first.package, "com.example.sample.launch");
+        assert_eq!(first.component, "com.example.sample.launch.ui.main.MainActivity");
         assert_eq!(first.tag, "AccessibilityData");
         let second = &r.entries[1];
-        assert_eq!(second.package, "com.hailiang.xxb.web.app");
+        assert_eq!(second.package, "com.example.sample.web");
         assert_eq!(second.component, "android.widget.FrameLayout");
         let (_, _, _, packages) = collect_facets(&r.entries);
         assert_eq!(packages.len(), 2, "both observed apps must be facets: {packages:?}");
@@ -927,7 +927,7 @@ mod tests {
         // What `adb logcat -v threadtime` actually prints on a device: no `/`, no package.
         let e = parse(&[
             "11-12 17:28:02.013  1080  1161 D PowerGuruService: Already added to Heartbeat Alarms",
-            "11-12 17:28:02.014  1080  1161 D PowerGuruService: alarm info: packageName = com.hljzjx.edu.student.launch",
+            "11-12 17:28:02.014  1080  1161 D PowerGuruService: alarm info: packageName = com.example.sample.launch",
         ])
         .entries;
         assert_eq!(e[0].level, "D");
@@ -939,7 +939,7 @@ mod tests {
         assert!(e[0].message.starts_with("Already added"));
         // The colon inside the message must not be mistaken for the tag separator.
         assert_eq!(e[1].tag, "PowerGuruService");
-        assert!(e[1].message.contains("packageName = com.hljzjx"));
+        assert!(e[1].message.contains("packageName = com.example"));
     }
 
     #[test]
@@ -995,7 +995,7 @@ mod tests {
   815 vendor.lenovo.hardware.battery@1.0-service
  3924 com.android.remoteprovisioner
  5000 com.tencent.mm:push
- 6000 com.hailiang.workcloud.student
+ 6000 com.example.sample.student
 ";
 
     #[test]
@@ -1009,7 +1009,7 @@ mod tests {
 
         let mut entry = LogEntry { pid: 6000, ..Default::default() };
         index.fill(&mut entry);
-        assert_eq!(entry.package, "com.hailiang.workcloud.student");
+        assert_eq!(entry.package, "com.example.sample.student");
 
         // A sub-process is the same application.
         let mut push = LogEntry { pid: 5000, ..Default::default() };
@@ -1029,28 +1029,28 @@ mod tests {
     fn am_proc_start_names_every_following_line() {
         // Real events-buffer rows: `[userId, pid, uid, processName, type, component]`.
         let r = parse(&[
-            "11-12 17:57:17.386 19484 19519 I am_proc_start: [0,13800,10174,com.hailiang.workcloud.student,next-top-activity,{com.hailiang.workcloud.student/com.hailiang.workcloud.student.MainActivity}]",
+            "11-12 17:57:17.386 19484 19519 I am_proc_start: [0,13800,10174,com.example.sample.student,next-top-activity,{com.example.sample.student/com.example.sample.student.MainActivity}]",
             "11-12 17:57:18.001 13800 13800 D OkHttp: GET /api/paper",
             "11-12 17:57:19.002 13800 13999 D OkHttp: response 200",
         ]);
         // The announcement itself is written by system_server, so it has no package...
         assert_eq!(r.entries[0].package, "");
         // ...but every line from the announced pid resolves.
-        assert_eq!(r.entries[1].package, "com.hailiang.workcloud.student");
-        assert_eq!(r.entries[2].package, "com.hailiang.workcloud.student");
+        assert_eq!(r.entries[1].package, "com.example.sample.student");
+        assert_eq!(r.entries[2].package, "com.example.sample.student");
     }
 
     #[test]
     fn activity_manager_text_rows_name_processes_and_forget_dead_ones() {
         let r = parse(&[
-            "11-12 17:57:17.386 19484 19519 I ActivityManager: Start proc 13800:com.hailiang.workcloud.student/u0a174 for next-top-activity {com.hailiang.workcloud.student/com.hailiang.workcloud.student.MainActivity}",
+            "11-12 17:57:17.386 19484 19519 I ActivityManager: Start proc 13800:com.example.sample.student/u0a174 for next-top-activity {com.example.sample.student/com.example.sample.student.MainActivity}",
             "11-12 17:57:18.000 13800 13800 D OkHttp: first life",
             // Killed, then a *new* app reuses the same pid.
-            "11-12 17:58:00.000 19484 19518 I ActivityManager: Killing 13800:com.hailiang.workcloud.student/u0a174 (adj 200): stop com.hailiang.workcloud.student due to installPackageLI",
+            "11-12 17:58:00.000 19484 19518 I ActivityManager: Killing 13800:com.example.sample.student/u0a174 (adj 200): stop com.example.sample.student due to installPackageLI",
             "11-12 17:58:01.000 19484 19519 I ActivityManager: Start proc 13800:com.other.app/u0a200 for broadcast {com.other.app/.BootReceiver}",
             "11-12 17:58:02.000 13800 13800 D OkHttp: second life",
         ]);
-        assert_eq!(r.entries[1].package, "com.hailiang.workcloud.student");
+        assert_eq!(r.entries[1].package, "com.example.sample.student");
         assert_eq!(
             r.entries[4].package, "com.other.app",
             "a recycled pid must not inherit the dead app's name"
@@ -1065,17 +1065,17 @@ mod tests {
         // Slash format: the package is authoritative, the index must not overwrite it.
         let mut entry = LogEntry {
             pid: 2108,
-            package: "com.zui.launcher".into(),
+            package: "com.example.launcher".into(),
             ..Default::default()
         };
         index.fill(&mut entry);
-        assert_eq!(entry.package, "com.zui.launcher");
+        assert_eq!(entry.package, "com.example.launcher");
 
         // Same for an accessibility foreground event, whose package names the app on
         // screen rather than the process that printed the line.
-        let r = parse(&["11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.zui.launcher/com.zui.quickstep.RecentsActivity"]);
-        assert_eq!(r.entries[0].package, "com.zui.launcher");
-        assert_eq!(r.entries[0].component, "com.zui.quickstep.RecentsActivity");
+        let r = parse(&["11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.example.launcher/com.example.quickstep.RecentsActivity"]);
+        assert_eq!(r.entries[0].package, "com.example.launcher");
+        assert_eq!(r.entries[0].component, "com.example.quickstep.RecentsActivity");
     }
 
     #[test]

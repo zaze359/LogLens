@@ -195,7 +195,7 @@ npm run tauri build
 ```
 顶栏 [清空筛选][导出命中结果][打开日志文件] │ [设备]
 ──────────────────────────────────────────────────────────────
-标签条  [▣ HLKJ_PB_11ZTRS 设备] │ [xxx.log 5.2 万行]
+标签条  [▣ emulator-5554 设备] │ [xxx.log 5.2 万行]
 ──────────────────────────────────────────────────────────────
          ┌──┐
          │▤ │ 日志（默认）      ┐
@@ -205,7 +205,7 @@ npm run tauri build
 
 ### 日志和抓包是设备里的「工具」，不是并列的工作区标签
 
-一台设备的实时日志，本来就是「这台设备抓到的日志」。把它和设备标签并排放在标签条上，标题里又都带着设备名（`HLKJ_PB_11ZTRS` / `HLKJ_PB_11ZTRS · 实时 logcat`），看起来就是两个说同一件事的重复标签。
+一台设备的实时日志，本来就是「这台设备抓到的日志」。把它和设备标签并排放在标签条上，标题里又都带着设备名（`emulator-5554` / `emulator-5554 · 实时 logcat`），看起来就是两个说同一件事的重复标签。
 
 所以**标签条上只有工作区**，日志进了设备里面：
 
@@ -435,14 +435,14 @@ LOGLENS_JSONL=~/capture.jsonl mitmdump -s scripts/mitmproxy_jsonl.py -p 8080
 
 | 来源 | 形态 | 覆盖场景 |
 | --- | --- | --- |
-| `adb shell ps -A -o PID,NAME` | `13800 com.hailiang.workcloud.student` | 抓取开始时取一次快照，之后每 3 秒刷新一次；应用进程的进程名就是它的包名 |
+| `adb shell ps -A -o PID,NAME` | `13800 com.example.sample.student` | 抓取开始时取一次快照，之后每 3 秒刷新一次；应用进程的进程名就是它的包名 |
 | `events` 缓冲区 | `am_proc_start: [0,13800,10174,com.foo,next-top-activity,{...}]`、`am_kill: [0,13122,com.foo,200,...]` | 进程已经死了还在缓冲区里 —— 崩溃场景正需要 |
 | `ActivityManager` 文本行 | `Start proc 13800:com.foo/u0a174 for ...`、`Killing 13122:com.foo/u0a174 (adj 200)` | 默认 `main` 缓冲区里就有，不依赖 `events` |
 
 填充规则（按优先级）：
 
 1. 行内自带包名（`1234-5678/com.foo`）**永远优先**，不被 pid 映射覆盖。
-2. 前台应用事件里的包名（`onTopAppChanged: com.zui.launcher/...`）描述的是**屏幕上**的应用，也优先于 pid 映射 —— 否则 Launcher 规则会被「这条日志其实是 systemui 打的」这件事破坏。
+2. 前台应用事件里的包名（`onTopAppChanged: com.example.launcher/...`）描述的是**屏幕上**的应用，也优先于 pid 映射 —— 否则 Launcher 规则会被「这条日志其实是 systemui 打的」这件事破坏。
 3. 都没有时，才用 pid → 进程名回填，`com.tencent.mm:push` 这类子进程归并到 `com.tencent.mm`。
 4. `system_server`、`logd`、`init`、`vendor.*@*-service` 这些**没有包名**的进程不回填 —— 包名筛选保持「只关于应用」，系统进程的日志仍可用 Tag / PID 找。
 
@@ -487,12 +487,12 @@ LOGLENS_JSONL=~/capture.jsonl mitmdump -s scripts/mitmproxy_jsonl.py -p 8080
 **前台应用事件的数据规律**（来自 Android 辅助功能 `AccessibilityEvent.packageName` / `className`）：`-v brief` 日志中 `onTopAppChanged:` 后面是 `<包名>/<组件类名>`，斜杠前是**被观测的应用包名**，斜杠后是**前台页面、弹窗等组件类名**，各种应用、各种组件都可能出现：
 
 ```text
-11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.zui.launcher/com.zui.quickstep.RecentsActivity
-11-03 18:02:29.830 I/AccessibilityData( 2108): onTopAppChanged: com.hljzjx.edu.student.launch/com.hljzjx.launch.ui.main.MainActivity
-11-03 18:25:05.005 I/AccessibilityData( 2108): onTopAppChanged: com.hailiang.xxb.web.app/android.widget.FrameLayout
+11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.example.launcher/com.example.quickstep.RecentsActivity
+11-03 18:02:29.830 I/AccessibilityData( 2108): onTopAppChanged: com.example.sample.launch/com.example.sample.launch.ui.main.MainActivity
+11-03 18:25:05.005 I/AccessibilityData( 2108): onTopAppChanged: com.example.sample.web/android.widget.FrameLayout
 ```
 
-解析后 `package` = `com.hailiang.xxb.web.app`、`component` = `android.widget.FrameLayout`。因此：
+解析后 `package` = `com.example.sample.web`、`component` = `android.widget.FrameLayout`。因此：
 
 | Launcher 分组模板 | 条件 | 用途 |
 | --- | --- | --- |
@@ -595,11 +595,11 @@ npm run tauri dev
 6. 导出命中结果为 .log，内容条数应与状态栏「命中」一致；导出/导入规则 JSON 往返后规则不丢。
 7. 新建分组「星学伴学生端」（只填名称/颜色，无需包名），点分组头 `+` 新建规则 → 保存后规则出现在该分组；改名/改色立即生效，删除分组后规则不丢（回到「未分组」）。
 8. 在侧栏搜索框输入分组名、规则名或某个条件匹配值，命中分组自动展开、空分组隐藏；清空搜索后折叠状态恢复。删除自定义分组后规则不丢，出现在「未分组」。
-9. 点 Launcher 分组下的「前台应用 / 页面变更」，应命中示例文件末尾的 5 条 `onTopAppChanged` 记录；详情抽屉的「包名 / 组件类名」应分别显示 `com.hailiang.xxb.web.app` 与 `android.widget.FrameLayout`（那条弹窗事件）。
-10. 点「弹窗 / 非 Activity 组件」应只命中 1 条（`android.widget.FrameLayout`）；用规则编辑器新建 `package` = `com.hljzjx.edu.student.launch` + `message` 正则 `onTopAppChanged` 的规则，应只命中 1 条。
+9. 点 Launcher 分组下的「前台应用 / 页面变更」，应命中示例文件末尾的 5 条 `onTopAppChanged` 记录；详情抽屉的「包名 / 组件类名」应分别显示 `com.example.sample.web` 与 `android.widget.FrameLayout`（那条弹窗事件）。
+10. 点「弹窗 / 非 Activity 组件」应只命中 1 条（`android.widget.FrameLayout`）；用规则编辑器新建 `package` = `com.example.sample.launch` + `message` 正则 `onTopAppChanged` 的规则，应只命中 1 条。
 11. 顶栏「设备」打开选择器，能看到 adb 版本与路径、各设备授权状态与「已打开」标记。把手机 USB 调试关掉再刷新，对应设备应变成「未授权」且点不动（只提示先授权）；已经打开的设备工作区里显示「已断开」，右上角「换设备」可改选。
 12. 点「开始实时抓取」：日志工具顶部出现采集状态条（绿点 +「实时抓取中」+ 条数 + 条/秒 + 已抓时长 + 缓冲区），行数 / 条数不为 0（设备缓冲区里已有的日志会先回放出来），Tag 与包名下拉里有候选；点任一模板能命中。
-13. 列表「包名」列应有大量真实应用包名（如 `com.hailiang.workcloud.student`、`com.zui.launcher`），而不是一片 `—`；在筛选栏「+ 添加包名」选中其中一个，只剩该应用的行，再选第二个应变多（多选取并集）。
+13. 列表「包名」列应有大量应用包名（如 `com.example.sample.student`、`com.example.launcher`），而不是一片 `—`；在筛选栏「+ 添加包名」选中其中一个，只剩该应用的行，再选第二个应变多（多选取并集）。
 14. 在手机上随便点几下，1 秒内列表底部出现新日志（列表自动跟随最新行），状态条上的条数与「条/秒」同步变化；向上滚动后不再自动跟随并出现「↓ 回到最新」；点状态条右侧「停止抓取」后绿点变成「已停止」，新日志不再追加，已有日志仍可筛选与导出，按钮变成「重新开始」。
 15. 「先清空设备缓冲区」默认不勾选；勾选后开始抓取，行数应从 0 起算（缓冲区内旧日志已清掉）。
 16. 实时抓取期间直接关闭窗口，然后 `ps aux | grep "adb.*logcat"` 不应残留 `adb logcat` 进程。

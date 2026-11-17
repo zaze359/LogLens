@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn quick_package_filter_matches_any_selected_app() {
         let mut app = entry("D", "OkHttp", "GET /api/paper");
-        app.package = "com.hailiang.workcloud.student".to_string();
+        app.package = "com.example.sample.student".to_string();
         let mut other = entry("D", "OkHttp", "GET /api/home");
         other.package = "com.tencent.mm".to_string();
         let unnamed = entry("D", "logd", "audit");
@@ -432,7 +432,7 @@ mod tests {
         // Selecting several packages is an OR, matching the tag / pid behaviour.
         let f = FilterSpec {
             packages: vec![
-                "com.hailiang.workcloud.student".to_string(),
+                "com.example.sample.student".to_string(),
                 "com.tencent.mm".to_string(),
             ],
             ..Default::default()

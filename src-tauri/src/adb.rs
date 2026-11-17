@@ -425,8 +425,8 @@ mod tests {
     fn device_label_falls_back_to_serial() {
         let mut device = AdbDevice { serial: "ABC".into(), ..Default::default() };
         assert_eq!(device.label(), "ABC (ABC)");
-        device.model = "Pixel_7".into();
-        assert_eq!(device.label(), "Pixel_7 (ABC)");
+        device.model = "Test_Device".into();
+        assert_eq!(device.label(), "Test_Device (ABC)");
     }
 
     // The two tests below touch a real phone, so they stay opt-in:

@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn launcher_template_matches_a_real_top_app_event() {
-        let line = "11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.zui.launcher/com.zui.quickstep.RecentsActivity";
+        let line = "11-03 18:02:29.792 I/AccessibilityData( 2108): onTopAppChanged: com.example.launcher/com.example.quickstep.RecentsActivity";
         let parsed = LogcatParser::new().unwrap().parse_lines([line]);
         assert_eq!(parsed.entries.len(), 1);
 
@@ -166,8 +166,8 @@ mod tests {
         // `<packageName>/<className>` covers arbitrary apps, and className may be a
         // non-Activity component such as android.widget.FrameLayout.
         let parsed = LogcatParser::new().unwrap().parse_lines([
-            "11-03 18:02:29.830 I/AccessibilityData( 2108): onTopAppChanged: com.hljzjx.edu.student.launch/com.hljzjx.launch.ui.main.MainActivity",
-            "11-03 18:25:05.005 I/AccessibilityData( 2108): onTopAppChanged: com.hailiang.xxb.web.app/android.widget.FrameLayout",
+            "11-03 18:02:29.830 I/AccessibilityData( 2108): onTopAppChanged: com.example.sample.launch/com.example.sample.launch.ui.main.MainActivity",
+            "11-03 18:25:05.005 I/AccessibilityData( 2108): onTopAppChanged: com.example.sample.web/android.widget.FrameLayout",
         ]);
         assert_eq!(parsed.entries.len(), 2);
         assert_eq!(hits_for(&parsed.entries, "builtin-launcher-top-app"), vec![0, 1]);

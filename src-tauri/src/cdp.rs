@@ -580,8 +580,8 @@ mod tests {
 
     #[test]
     fn parses_version_and_targets() {
-        let v = parse_version(r#"{"Browser":"Chrome/124.0.6367.219","Android-Package":"com.hailiang.workcloud.teacher","Protocol-Version":"1.3"}"#);
-        assert_eq!(v.package, "com.hailiang.workcloud.teacher");
+        let v = parse_version(r#"{"Browser":"Chrome/124.0.6367.219","Android-Package":"com.example.sample.teacher","Protocol-Version":"1.3"}"#);
+        assert_eq!(v.package, "com.example.sample.teacher");
         assert_eq!(v.browser, "Chrome/124.0.6367.219");
 
         let t = parse_targets(r#"[{"id":"P1","type":"page","title":"作业","url":"https://x.cn/a","webSocketDebuggerUrl":"ws://127.0.0.1:19222/devtools/page/P1"}]"#);
