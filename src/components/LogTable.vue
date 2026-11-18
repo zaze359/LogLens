@@ -19,6 +19,7 @@ const viewportHeight = ref(600)
 /** Live tail: keep the newest rows in view unless the user scrolled up on purpose. */
 const follow = ref(true)
 let observer: ResizeObserver | null = null
+let resizeRaf = 0
 
 const startIndex = computed(() => Math.max(0, Math.floor(scrollTop.value / ROW_H) - 6))
 const endIndex = computed(() =>
@@ -80,12 +81,24 @@ onMounted(() => {
   if (!el) return
   viewportHeight.value = el.clientHeight || 600
   observer = new ResizeObserver(() => {
-    viewportHeight.value = el.clientHeight || 600
+    // Writing viewportHeight synchronously here changes the virtual row count and spacer
+    // height, which re-lays out this element and re-fires the observer in the same frame —
+    // the browser then reports "ResizeObserver loop completed with undelivered notifications".
+    // Coalesce to one read+write per animation frame (and skip no-op writes) to break it.
+    if (resizeRaf) return
+    resizeRaf = requestAnimationFrame(() => {
+      resizeRaf = 0
+      const next = el.clientHeight || 600
+      if (next !== viewportHeight.value) viewportHeight.value = next
+    })
   })
   observer.observe(el)
 })
 
-onBeforeUnmount(() => observer?.disconnect())
+onBeforeUnmount(() => {
+  if (resizeRaf) cancelAnimationFrame(resizeRaf)
+  observer?.disconnect()
+})
 
 function onScroll(e: Event): void {
   const el = e.target as HTMLElement
@@ -200,6 +213,7 @@ function segments(entry: LogEntry): Segment[] {
     </div>
   </div>
 
+  <div class="table-viewport">
   <div ref="viewport" class="table-body" :style="tableStyle" @scroll="onScroll">
     <div v-if="store.entries.length === 0" class="table-empty">
       <template v-if="store.loading">正在解析并筛选日志…</template>
@@ -243,9 +257,13 @@ function segments(entry: LogEntry): Segment[] {
         </div>
       </div>
     </div>
+  </div>
 
-    <div v-if="store.deviceStream && !follow" class="follow-jump">
-      <button class="btn btn-sm" @click="jumpToLatest">↓ 回到最新</button>
-    </div>
+  <!-- Outside the scrolling `.table-body`: a sticky overlay inside the same scroller gets
+       painted under `.table-rows`' compositor layer in WKWebView, so the pill was intermittently
+       hidden behind log lines. Absolute within the non-scrolling wrapper avoids that entirely. -->
+  <div v-if="store.deviceStream && !follow" class="follow-jump">
+    <button class="btn btn-sm" @click="jumpToLatest">↓ 回到最新</button>
+  </div>
   </div>
 </template>

@@ -12,12 +12,13 @@
 //! never invalidates a user's existing rules file.
 
 use crate::builtin;
-use crate::model::{Rule, RuleCategory};
+use crate::model::{Rule, RuleCategory, SearchHistoryEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
 pub const RULES_FILE_VERSION: u8 = 2;
@@ -39,6 +40,20 @@ fn rules_path(app: &AppHandle) -> Result<PathBuf, String> {
     fs::create_dir_all(&dir).map_err(|e| format!("无法创建配置目录 {}: {e}", dir.display()))?;
     Ok(dir.join("rules.json"))
 }
+
+/// Search history lives in its own file so a corrupt history never blocks rule loading
+/// (and vice versa). Same config directory, same backup story as `rules.json`.
+fn search_history_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("无法定位配置目录: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("无法创建配置目录 {}: {e}", dir.display()))?;
+    Ok(dir.join("search-history.json"))
+}
+
+/// Cap so a long-lived install cannot grow the file without bound.
+const SEARCH_HISTORY_LIMIT: usize = 50;
 
 /// What the frontend needs: built-in + user categories together with custom rules.
 /// Built-in templates are fetched separately (`list_builtin_templates`).
@@ -168,6 +183,96 @@ pub fn location(app: &AppHandle) -> Result<String, String> {
     rules_path(app).map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Load remembered searches, newest first. Tolerant: a missing or malformed file is an
+/// empty history, not a startup failure — this is a convenience feature, not app state.
+pub fn load_search_history(app: &AppHandle) -> Vec<SearchHistoryEntry> {
+    let path = match search_history_path(app) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    normalise_history(serde_json::from_str(&text).unwrap_or_default())
+}
+
+/// Pure list hygiene, shared by load / remember and unit-tested without an AppHandle.
+fn normalise_history(mut entries: Vec<SearchHistoryEntry>) -> Vec<SearchHistoryEntry> {
+    entries.retain(|e| !e.keyword.trim().is_empty());
+    if entries.len() > SEARCH_HISTORY_LIMIT {
+        entries.truncate(SEARCH_HISTORY_LIMIT);
+    }
+    entries
+}
+
+fn write_search_history(app: &AppHandle, entries: &[SearchHistoryEntry]) -> Result<(), String> {
+    let path = search_history_path(app)?;
+    let text = serde_json::to_string_pretty(entries)
+        .map_err(|e| format!("序列化搜索历史失败: {e}"))?;
+    fs::write(&path, text).map_err(|e| format!("写入搜索历史失败 {}: {e}", path.display()))
+}
+
+/// Remember a keyword. De-duplicated on (keyword, mode, flags): reusing an existing search
+/// bumps it to the front with a fresh timestamp instead of adding a twin. Returns the new
+/// full list so the caller can update the UI in one round trip.
+pub fn remember_search(
+    app: &AppHandle,
+    keyword: &str,
+    mode: &str,
+    is_regex: bool,
+    case_sensitive: bool,
+) -> Result<Vec<SearchHistoryEntry>, String> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Ok(load_search_history(app));
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut entries = load_search_history(app);
+    entries.retain(|e| {
+        !(e.keyword == keyword
+            && e.mode == mode
+            && e.is_regex == is_regex
+            && e.case_sensitive == case_sensitive)
+    });
+    entries.insert(
+        0,
+        SearchHistoryEntry {
+            keyword: keyword.to_string(),
+            mode: mode.to_string(),
+            is_regex,
+            case_sensitive,
+            ts,
+        },
+    );
+    if entries.len() > SEARCH_HISTORY_LIMIT {
+        entries.truncate(SEARCH_HISTORY_LIMIT);
+    }
+    write_search_history(app, &entries)?;
+    Ok(entries)
+}
+
+/// Remove one entry by index as sent by the UI (it renders the same list it receives).
+pub fn delete_search_history(
+    app: &AppHandle,
+    index: usize,
+) -> Result<Vec<SearchHistoryEntry>, String> {
+    let mut entries = load_search_history(app);
+    if index < entries.len() {
+        entries.remove(index);
+        write_search_history(app, &entries)?;
+    }
+    Ok(entries)
+}
+
+pub fn clear_search_history(app: &AppHandle) -> Result<Vec<SearchHistoryEntry>, String> {
+    write_search_history(app, &[])?;
+    Ok(Vec::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +352,31 @@ mod tests {
         assert_eq!(out.rules.len(), 1);
         assert!(out.categories.iter().any(|c| c.builtin));
         assert!(out.categories.iter().any(|c| c.id == "custom-cat-a" && !c.builtin));
+    }
+
+    #[test]
+    fn search_history_drops_blanks_and_caps_length() {
+        let entries: Vec<SearchHistoryEntry> = (0..(SEARCH_HISTORY_LIMIT + 10))
+            .map(|i| SearchHistoryEntry {
+                keyword: format!("kw-{i}"),
+                ..Default::default()
+            })
+            .chain(std::iter::once(SearchHistoryEntry {
+                keyword: "   ".to_string(),
+                ..Default::default()
+            }))
+            .collect();
+        let out = normalise_history(entries);
+        assert_eq!(out.len(), SEARCH_HISTORY_LIMIT);
+        assert_eq!(out[0].keyword, "kw-0");
+        assert!(out.iter().all(|e| !e.keyword.trim().is_empty()));
+    }
+
+    #[test]
+    fn search_history_malformed_text_is_an_empty_list() {
+        // Convenience state must never abort startup on a corrupt/truncated file.
+        let bad: Vec<SearchHistoryEntry> = serde_json::from_str("{not json").unwrap_or_default();
+        assert!(normalise_history(bad).is_empty());
     }
 
     #[test]

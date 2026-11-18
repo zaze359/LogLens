@@ -1,19 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import {
-  closeDeviceWorkspace,
-  deviceBySerial,
-  openDevicePicker,
-  registerDeviceCleanup,
-  store
-} from '../../stores/session'
+import { deviceBySerial, registerDeviceCleanup, store } from '../../stores/session'
 import NetworkCaptureTab from './NetworkCaptureTab.vue'
 
 /**
- * 设备工作区里**非日志工具**的内容区（今天是抓包）。日志工具用的是共用日志面板，所以
- * 不在这里渲染 —— 见 `LogPane.vue`。
+ * 抓包工具的内容区 —— 这里只有这一件事的状态与开关；设备连没连上、怎么重连属于设备层
+ * (`DeviceWorkbenchHead.vue`)，两个工具共用那一个头部，不在这里重复。
  *
- * 功能切换在左侧工具栏（`DeviceToolRail.vue`），所以这个组件只负责内容与它自己的清理：
  * 切工具不卸载（`v-show`），正在跑的采集不会中断。
  *
  * Adding an adb function: an entry in `operations.ts`, a `<div v-if="isNetwork">`-style body
@@ -22,20 +15,9 @@ import NetworkCaptureTab from './NetworkCaptureTab.vue'
 const props = defineProps<{ serial: string }>()
 
 const networkTab = ref<InstanceType<typeof NetworkCaptureTab> | null>(null)
-
-const device = computed(() => deviceBySerial(props.serial))
-const deviceReady = computed(() => device.value?.state === 'device')
-const deviceName = computed(() => device.value?.model || props.serial)
-
-const stateText = computed(() => {
-  const d = device.value
-  if (!d) return '已断开'
-  if (d.state === 'device') return '已授权'
-  if (d.state === 'unauthorized') return '未授权'
-  if (d.state === 'offline') return '离线'
-  if (d.state === 'no permissions') return '无权限'
-  return d.state
-})
+const connected = computed(() => !!deviceBySerial(props.serial))
+/** 采集是否在跑。adb 断开后它仍可能为 true —— 代理还在设备上生效，采集照常继续。 */
+const capturing = computed(() => !!networkTab.value?.isCapturing)
 
 /**
  * Every function's cleanup, in one place. Today only the network tab holds device-side state
@@ -58,31 +40,22 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="device-page">
-    <header class="device-page-head">
-      <span class="device-page-icon">▣</span>
-      <span class="device-page-name">{{ deviceName }}</span>
-      <span class="mono muted device-page-serial">{{ serial }}</span>
-      <span class="device-page-state" :class="{ warn: !deviceReady }">{{ stateText }}</span>
-      <div class="spacer" />
-      <button class="btn btn-ghost btn-sm" title="连接或切换到另一台设备" @click="openDevicePicker">
-        换设备
-      </button>
-      <button
-        class="btn btn-ghost btn-sm"
-        title="关闭设备工作区（连同它的日志一起关闭，并还原代理）"
-        @click="closeDeviceWorkspace(serial)"
-      >×</button>
-    </header>
-
     <div class="device-page-body">
-      <p v-if="!device" class="empty-hint warn">
-        这台设备已断开。点右上角「换设备」重新连接，或关闭本工作区。
+      <!-- adb 断开 ≠ 抓包失效：已下发到设备的代理仍然生效，内存里的采集会话也还在轮询。
+           所以这里只提示"不能再开始/停止"，绝不把仍在工作的采集面板换成一纸"不可用"。
+           面板保持挂载，采集状态和会话 id 才不会丢。 -->
+      <p v-if="!connected" class="empty-hint warn">
+        <template v-if="capturing">
+          adb 连接已断开。设备代理仍在生效，抓包会继续进行；但还原代理需要 adb，请重新连接设备以恢复设备网络。
+        </template>
+        <template v-else>
+          设备未连接，无法开始抓包。在上方设备栏重新连接后即可开始。
+        </template>
       </p>
-
       <NetworkCaptureTab
-        v-else
         ref="networkTab"
         :serial="serial"
+        :connected="connected"
         :active="(store.deviceOps[serial] ?? 'log') === 'network'"
       />
     </div>

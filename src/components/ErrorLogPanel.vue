@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
 import {
   clearErrorLog,
   closeErrorLog,
@@ -36,7 +37,20 @@ function toggle(id: string): void {
 
 async function clear(): Promise<void> {
   if (!store.errorLog.length) return
-  if (!window.confirm(`确定清空全部 ${store.errorLog.length} 条错误记录？此操作不可撤销。`)) return
+  // Use the Tauri dialog API, not window.confirm: Tauri overrides the native confirm with
+  // an async promise, so `!window.confirm(...)` is always false AND a rejected permission
+  // check lands in the global unhandledrejection handler — which writes the failure straight
+  // back into this very log, making it impossible to clear. Await + catch keeps it out.
+  let ok = false
+  try {
+    ok = await confirmDialog(`确定清空全部 ${store.errorLog.length} 条错误记录？此操作不可撤销。`, {
+      title: '清空错误日志',
+      kind: 'warning'
+    })
+  } catch {
+    return
+  }
+  if (!ok) return
   await clearErrorLog()
 }
 

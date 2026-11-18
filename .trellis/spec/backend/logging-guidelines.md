@@ -78,9 +78,11 @@ a scope and a stack trace, nothing from the data being analysed.
 
 - **Parsed log entries or line contents.** Logs contain app data and may contain user
   identifiers; and a 200MB import would emit millions of lines.
-- **HTTP headers, cookies, tokens, request/response bodies.** Network capture redacts secrets
-  in `network::redact` before the data reaches the UI; do not undo that by logging raw
-  values. `redacted: true` means the row was modified.
+- **HTTP headers, cookies, tokens, request/response bodies.** Never print these to stderr —
+  the payload may hold real credentials. `network::redact` can replace secrets before the data
+  reaches the UI, but `REDACT_ENABLED` is off by default (raw capture kept for debugging), so
+  assume the UI/session/export contain plaintext. `redacted: true` only appears when the gate
+  is enabled.
 - **Per-poll / per-keystroke diagnostics.** The stream poll runs every 800ms; a log line here
   becomes noise immediately.
 - **File paths the user did not choose**, device serials beyond what is needed, or anything

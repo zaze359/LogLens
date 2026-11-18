@@ -17,6 +17,7 @@ use crate::{adb, netprobe};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -462,14 +463,22 @@ enum HealAction {
     LeaveAlone,
     /// Still our proxy — restore the previous values.
     Restore,
+    /// A capture in this process owns the proxy: not a leftover, leave it running.
+    Skip,
 }
 
-/// Pure decision, so the two safety rules can be tested without a device:
-/// never drop a marker while the device is offline, and never delete a proxy
-/// that was put in place by somebody else since our last run.
-fn heal_decision(online: bool, current_proxy: &str, applied: &str) -> HealAction {
+/// Pure decision, so the safety rules can be tested without a device: never drop a marker
+/// while the device is offline, never delete a proxy that somebody else put in place, and
+/// never touch a proxy this process is *currently* using.
+fn heal_decision(online: bool, current_proxy: &str, applied: &str, live: bool) -> HealAction {
     if !online {
         return HealAction::Keep;
+    }
+    // Healing exists to undo a *previous run's* leftovers. A capture running right now owns
+    // this value, and restoring it would silently stop that capture mid-flight — exactly
+    // what happens when the panel's capability probe calls this while collecting.
+    if live {
+        return HealAction::Skip;
     }
     if current_proxy.is_empty() {
         return HealAction::ClearMarker;
@@ -528,8 +537,19 @@ fn heal_stale_proxies_at(path: &Path) -> String {
         } else {
             String::new()
         };
-        let action = heal_decision(is_online, &current_proxy, &entry.applied);
+        let action = heal_decision(
+            is_online,
+            &current_proxy,
+            &entry.applied,
+            // An active guard registers a generation for its serial; that is the cheapest
+            // honest answer to "is this proxy ours *right now*".
+            proxy_generation(&serial).is_some(),
+        );
         match action {
+            HealAction::Skip => {
+                // Keep the journal: the guard owns it and will clear it on restore.
+                remaining.insert(serial, entry);
+            }
             HealAction::Keep => {
                 // The device is offline right now. Retry while the app runs instead of
                 // only when it is next started; reconnect can happen minutes later.
@@ -694,7 +714,6 @@ impl Drop for ProxyGuard {
 pub struct NetworkCapture {
     session_id: String,
     serial: String,
-    port: u16,
     shared: Arc<Mutex<CaptureBuffer>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -722,6 +741,33 @@ fn publish(shared: &Arc<Mutex<CaptureBuffer>>, state: &mut CdpState, target: &st
     }
 }
 
+/// Does this `adb` failure mean "the local port is taken" rather than "the device is
+/// unreachable"? Only a port conflict is worth retrying on another number.
+fn looks_like_port_conflict(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("address already in use")
+        || lower.contains("cannot bind")
+        || lower.contains("could not bind")
+}
+
+/// Ask the OS for a free loopback port, then release it for `adb forward` to claim.
+///
+/// Inherently a small race — nothing holds the number between the probe and `adb` — but
+/// `adb` binds the local side itself, so handing over a number is the only option. The
+/// alternative (one fixed port) fails outright whenever a previous forward still owns it.
+fn pick_forward_port(taken: u16) -> Option<u16> {
+    for _ in 0..8 {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+        let port = probe.local_addr().ok()?.port();
+        drop(probe);
+        // `adb` needs an unprivileged port; 0 would mean "any" again.
+        if port != taken && port > 0 {
+            return Some(port);
+        }
+    }
+    None
+}
+
 impl NetworkCapture {
     /// Start following WebView network traffic. `socket` comes from the capability
     /// probe (`webview_devtools_remote_<pid>`).
@@ -735,8 +781,27 @@ impl NetworkCapture {
     ) -> Result<Self, String> {
         // Fail fast, before a session exists: a stale forward or a dead socket should be
         // reported as "could not start", not as an empty capture that never fills up.
-        adb::run(adb_path, &adb::forward_args(serial, port, socket))
-            .map_err(|e| format!("建立 adb forward 失败: {e}"))?;
+        let mut port = port;
+        if let Err(first) = adb::run(adb_path, &adb::forward_args(serial, port, socket)) {
+            // The local half of `adb forward` is a fixed number by default, and it stays
+            // claimed while any capture — or a forward left by a previous run — uses it.
+            // A second device must not be locked out by that, so retry once on a port the
+            // OS says is free. Only port conflicts are retried: a missing socket or an
+            // offline device would just fail again with a confusing second message.
+            let alt = if looks_like_port_conflict(&first) {
+                pick_forward_port(port)
+            } else {
+                None
+            };
+            let Some(alt) = alt else {
+                return Err(format!("建立 adb forward 失败: {first}"));
+            };
+            adb::run(adb_path, &adb::forward_args(serial, alt, socket)).map_err(|second| {
+                format!("建立 adb forward 失败: {second}（tcp:{port} 与 tcp:{alt} 均不可用）")
+            })?;
+            eprintln!("[cdp] 本地端口 tcp:{port} 不可用，改用 tcp:{alt}");
+            port = alt;
+        }
         let version = cdp::version(port).map_err(|e| {
             let _ = adb::run(adb_path, &adb::forward_remove_args(serial, port));
             format!("WebView 调试端口无响应: {e}")
@@ -760,7 +825,6 @@ impl NetworkCapture {
         Ok(Self {
             session_id,
             serial: serial.to_string(),
-            port,
             shared,
             stop,
             thread: Some(thread),
@@ -769,10 +833,6 @@ impl NetworkCapture {
 
     pub fn serial(&self) -> &str {
         &self.serial
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
     }
 
     pub fn drain(&mut self) -> (Vec<NetworkRequest>, NetworkCaptureStatus) {
@@ -964,13 +1024,6 @@ impl AnyCapture {
         }
     }
 
-    pub fn port(&self) -> u16 {
-        match self {
-            AnyCapture::Cdp(c) => c.port(),
-            AnyCapture::Proxy(c) => c.port(),
-        }
-    }
-
     /// A device has exactly one global proxy. H5 (CDP) and native capture may run
     /// together, but two native captures cannot — even on different ports, because
     /// only one of them can own the device setting at a time.
@@ -1023,20 +1076,42 @@ mod tests {
         // This is the exact bug that strands a device: an empty `settings` read
         // while offline means "adb failed", not "proxy cleared".
         assert_eq!(
-            heal_decision(false, "", "172.21.33.28:18999"),
+            heal_decision(false, "", "172.21.33.28:18999", false),
             HealAction::Keep
         );
         assert_eq!(
-            heal_decision(true, "", "172.21.33.28:18999"),
+            heal_decision(true, "", "172.21.33.28:18999", false),
             HealAction::ClearMarker
         );
         assert_eq!(
-            heal_decision(true, "172.21.33.28:18999", "172.21.33.28:18999"),
+            heal_decision(true, "172.21.33.28:18999", "172.21.33.28:18999", false),
             HealAction::Restore
         );
         assert_eq!(
-            heal_decision(true, "10.0.0.9:8080", "172.21.33.28:18999"),
+            heal_decision(true, "10.0.0.9:8080", "172.21.33.28:18999", false),
             HealAction::LeaveAlone
+        );
+    }
+
+    /// The regression behind "采集运行中但一条请求都没有": the panel's capability probe
+    /// calls the healer, which used to restore the proxy under a running capture.
+    #[test]
+    fn heal_never_touches_a_proxy_a_running_capture_owns() {
+        // Same inputs as the "restore the leftover" case above — the only difference is
+        // that a capture in this process still holds the device.
+        assert_eq!(
+            heal_decision(true, "172.21.33.28:18999", "172.21.33.28:18999", true),
+            HealAction::Skip
+        );
+        assert_eq!(
+            heal_decision(true, "", "172.21.33.28:18999", true),
+            HealAction::Skip,
+            "正在采集时连 marker 都不能清，否则退出时的还原信息就没了"
+        );
+        // Offline still means "cannot judge": the marker must survive either way.
+        assert_eq!(
+            heal_decision(false, "", "172.21.33.28:18999", true),
+            HealAction::Keep
         );
     }
 
@@ -1051,7 +1126,8 @@ mod tests {
             heal_decision(
                 true,
                 &netprobe::proxy_from_settings(text),
-                "172.21.33.28:18999"
+                "172.21.33.28:18999",
+                false
             ),
             HealAction::Restore
         );
@@ -1206,6 +1282,32 @@ mod tests {
             .find("settings put global http_proxy '10.0.0.2:8080'")
             .unwrap();
         assert!(delete_at < put_at, "必须先删再恢复，否则拆出的键会残留");
+    }
+
+    #[test]
+    fn a_forward_port_conflict_is_retried_but_other_failures_are_not() {
+        // The message shapes `adb forward` actually prints when the local port is taken.
+        assert!(looks_like_port_conflict(
+            "adb: error: cannot bind listener: Address already in use"
+        ));
+        assert!(looks_like_port_conflict(
+            "cannot bind to 127.0.0.1:19333: Address already in use"
+        ));
+        // A dead socket or an offline device must surface as the original error.
+        assert!(!looks_like_port_conflict("error: device offline"));
+        assert!(!looks_like_port_conflict("error: closed"));
+    }
+
+    #[test]
+    fn a_fallback_forward_port_is_free_and_differs_from_the_taken_one() {
+        let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let alt = pick_forward_port(taken).expect("应能找到一个空闲端口");
+        assert_ne!(alt, taken, "备用端口不能是那个已被占用的端口");
+        assert!(alt > 0, "0 对 adb 意味着“任意端口”，不能作为具体端口下发");
+        // The number must actually be bindable right now.
+        TcpListener::bind(("127.0.0.1", alt)).expect("备用端口应可用");
+        drop(held);
     }
 
     // Opt-in: cd src-tauri && cargo test --lib -- --ignored --nocapture

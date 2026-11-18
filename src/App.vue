@@ -6,6 +6,7 @@ import SessionTabs from './components/SessionTabs.vue'
 import LogPane from './components/LogPane.vue'
 import DevicePage from './components/device/DevicePage.vue'
 import DeviceToolRail from './components/device/DeviceToolRail.vue'
+import DeviceWorkbenchHead from './components/device/DeviceWorkbenchHead.vue'
 import DeviceCaptureBar from './components/device/DeviceCaptureBar.vue'
 import DevicePickerDialog from './components/device/DevicePickerDialog.vue'
 import LogCaptureTab from './components/device/LogCaptureTab.vue'
@@ -99,6 +100,12 @@ onBeforeUnmount(() => {
       />
 
       <div class="app-body-main">
+        <!-- 设备层头部：连接状态与重连只在这里出现，两个工具共用；切工具不影响它 -->
+        <DeviceWorkbenchHead
+          v-if="store.deviceView && store.activeSerial"
+          :serial="store.activeSerial"
+        />
+
         <!-- 采集状态条：抓取是这台设备的事，状态和停止入口都留在「日志」工具里 -->
         <DeviceCaptureBar v-show="store.deviceView && logVisible" :serial="store.activeSerial" />
 

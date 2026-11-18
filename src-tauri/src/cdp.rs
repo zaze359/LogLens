@@ -576,7 +576,6 @@ pub fn enable_network_message(id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::REDACTED;
 
     #[test]
     fn parses_version_and_targets() {
@@ -650,10 +649,11 @@ mod tests {
         assert_eq!(row.response_size, 512);
         assert_eq!(row.time_key, "12:12:33.417");
         assert_eq!(row.source, "cdp");
-        assert!(row.redacted);
-        assert!(!row.url.contains("abc"));
-        assert_eq!(row.request_headers[0].value, REDACTED);
-        assert!(row.request_body.contains(REDACTED));
+        // 脱敏默认关闭：原文保留（含 token / Authorization / password）。
+        assert!(!row.redacted);
+        assert!(row.url.contains("abc"));
+        assert_eq!(row.request_headers[0].value, "Bearer secret");
+        assert!(row.request_body.contains("password"));
     }
 
     #[test]

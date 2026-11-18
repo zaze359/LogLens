@@ -173,6 +173,17 @@ export interface SearchHits {
   truncated: boolean
 }
 
+/** 一条可复用的搜索历史（关键字 + 解释方式）。 */
+export interface SearchHistoryEntry {
+  keyword: string
+  /** 'filter' | 'find' */
+  mode: string
+  isRegex: boolean
+  caseSensitive: boolean
+  /** epoch millis，新的在前 */
+  ts: number
+}
+
 export interface QueryResult {
   total: number
   matched: number
@@ -236,6 +247,8 @@ export interface NetworkRequest {
   responseHeaders: HttpHeader[]
   requestBody: string
   responseBody: string
+  /** 展示用正文被上限截短；半截 JSON 不能格式化 */
+  responseTruncated: boolean
   error: string
   /** har | jsonl | cdp */
   source: string

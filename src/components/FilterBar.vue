@@ -1,11 +1,17 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { LEVELS, LEVEL_LABELS } from '../types'
+import type { SearchHistoryEntry } from '../types'
 import {
+  applySearchHistory,
   clearRule,
+  clearSearchHistory,
+  deleteSearchHistory,
+  exportFilteredFile,
   groupSummary,
   nextHit,
   prevHit,
+  resetFilter,
   setSearchMode,
   store,
   updateFilter,
@@ -40,6 +46,42 @@ function onEnter(e: KeyboardEvent): void {
   e.preventDefault()
   if (e.shiftKey) prevHit()
   else nextHit()
+}
+
+/* --------------------------------------------------- search history UI ---- */
+
+const historyOpen = ref(false)
+const historyRoot = ref<HTMLElement | null>(null)
+
+function toggleHistory(): void {
+  historyOpen.value = !historyOpen.value
+}
+
+function useHistory(entry: SearchHistoryEntry): void {
+  applySearchHistory(entry)
+  historyOpen.value = false
+}
+
+function onDocClick(e: MouseEvent): void {
+  if (historyOpen.value && historyRoot.value && !historyRoot.value.contains(e.target as Node)) {
+    historyOpen.value = false
+  }
+}
+
+document.addEventListener('click', onDocClick)
+onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
+
+function historyModeLabel(entry: SearchHistoryEntry): string {
+  const bits: string[] = [entry.mode === 'find' ? '查找' : '筛选']
+  if (entry.isRegex) bits.push('正则')
+  if (entry.caseSensitive) bits.push('区分大小写')
+  return bits.join(' · ')
+}
+
+function historyTime(ts: number): string {
+  return new Date(ts).toLocaleString('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
+  })
 }
 
 // Keep local inputs in sync when a filter is reset or a rule changes the spec.
@@ -180,6 +222,37 @@ function toggleOrder(): void {
         "
         @keydown.enter="onEnter"
       />
+
+      <div ref="historyRoot" class="search-history-root">
+        <button
+          class="btn btn-sm"
+          :class="{ 'history-on': historyOpen }"
+          title="搜索历史"
+          @click="toggleHistory"
+        >历史</button>
+        <div v-if="historyOpen" class="search-history-panel">
+          <div class="search-history-head">
+            <span>搜索历史</span>
+            <span class="spacer" />
+            <button
+              v-if="store.searchHistory.length"
+              class="btn btn-ghost btn-sm"
+              @click="clearSearchHistory"
+            >清空</button>
+          </div>
+          <div v-if="!store.searchHistory.length" class="search-history-empty">暂无历史记录</div>
+          <div v-else class="search-history-list">
+            <div v-for="(entry, i) in store.searchHistory" :key="`${entry.ts}-${i}`" class="search-history-item">
+              <button class="sh-item-main" :title="`点击复用：${entry.keyword}`" @click="useHistory(entry)">
+                <span class="sh-keyword mono">{{ entry.keyword }}</span>
+                <span class="sh-meta">{{ historyModeLabel(entry) }} · {{ historyTime(entry.ts) }}</span>
+              </button>
+              <button class="sh-del" title="删除这条" @click="deleteSearchHistory(i)">×</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <template v-if="isFind">
         <span class="hit-count" :class="{ empty: !canJump }">{{ hitLabel }}</span>
         <button class="btn btn-sm" :disabled="!canJump" title="上一个（Shift+Enter）" @click="prevHit">↑</button>
@@ -216,6 +289,13 @@ function toggleOrder(): void {
         <button class="btn btn-ghost btn-sm" @click="clearRule">移除规则</button>
       </template>
       <span v-else class="muted">未应用规则：从左侧选择内置模板或自定义规则，也可只使用上方快捷筛选</span>
+      <!-- These act on the current filter/result set, so they belong to the log panel (this
+           bar) rather than the always-on top bar; they hide with the panel. -->
+      <div class="spacer" />
+      <button class="btn btn-sm" @click="resetFilter">清空筛选</button>
+      <button class="btn btn-sm" :disabled="!store.fileInfo" @click="exportFilteredFile">
+        导出命中结果
+      </button>
     </div>
   </div>
 </template>

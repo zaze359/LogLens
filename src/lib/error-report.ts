@@ -12,6 +12,24 @@
 import { invoke } from '@tauri-apps/api/core'
 import type { App } from 'vue'
 
+/**
+ * Browser-generated conditions that are expected noise rather than app failures.
+ *
+ * When a ResizeObserver callback changes layout, the browser defers the remaining
+ * observations to the next frame and reports a bare `error` event. The observer
+ * still converges correctly, so persisting it only buries real failures in the
+ * support log. Every major error reporter ignores these for the same reason.
+ */
+const BENIGN_WINDOW_ERRORS = [
+  'ResizeObserver loop completed with undelivered notifications.',
+  // Older Blink wording for the same condition.
+  'ResizeObserver loop limit exceeded.'
+]
+
+function isBenignWindowError(message: string): boolean {
+  return BENIGN_WINDOW_ERRORS.some((known) => message.includes(known))
+}
+
 function inTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 }
@@ -66,6 +84,7 @@ export function installGlobalErrorHandlers(app: App): void {
   window.addEventListener('error', (event: ErrorEvent) => {
     // Resource load failures (img/script) have no Error object but still matter.
     const message = event.message || `资源加载失败: ${event.filename || '未知资源'}`
+    if (isBenignWindowError(message)) return
     const detail = event.error instanceof Error ? event.error.stack || '' : ''
     reportClientError('error', 'frontend', 'window.onerror', message, detail)
   })

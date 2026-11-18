@@ -13,6 +13,7 @@ import type {
   QueryResult,
   Rule,
   RuleCategory,
+  SearchHistoryEntry,
   RuleGroup,
   RulesView,
   SearchHits,
@@ -150,7 +151,9 @@ export interface AppState {
   /** Position inside `searchHits.indices`, `-1` when nothing is selected yet. */
   searchCursor: number
   searchError: string
-  /** Row the table should bring into view. `seq` forces a scroll even to the same row. */
+  /** Persisted, reusable keywords. Global — shared across tabs, not snapshotted. */
+  searchHistory: SearchHistoryEntry[]
+  /** Display row (index into `entries`, not the global index) to bring into view. `seq` forces a scroll even to the same row. */
   scrollTarget: { index: number; seq: number } | null
   // ---- global (shared by every tab) ----
   templates: Rule[]
@@ -221,6 +224,7 @@ export const store = reactive<AppState>({
   searchHits: null,
   searchCursor: -1,
   searchError: '',
+  searchHistory: [],
   scrollTarget: null,
   templates: [],
   rules: [],
@@ -355,12 +359,14 @@ export async function init(): Promise<void> {
     void refreshErrorLog()
   })
   try {
-    const [templates, bundle] = await Promise.all([
+    const [templates, bundle, history] = await Promise.all([
       ipc.listBuiltinTemplates(),
-      ipc.listRuleBundle().catch(() => ({ categories: [], rules: [] } as RulesView))
+      ipc.listRuleBundle().catch(() => ({ categories: [], rules: [] } as RulesView)),
+      ipc.listSearchHistory().catch(() => [] as SearchHistoryEntry[])
     ])
     store.templates = templates
     applyRuleBundle(bundle)
+    store.searchHistory = history
     void ipc.rulesLocation().then((p) => (store.rulesPath = p)).catch(() => {})
     // A failure from the previous session must still be visible as a badge.
     void refreshErrorLog()
@@ -659,6 +665,39 @@ export async function refreshDevices(quiet = false): Promise<void> {
   } finally {
     store.devicesLoading = false
   }
+}
+
+/**
+ * Re-check adb for a device whose workspace is still open. The workspace, tab and
+ * `activeSerial` are bound to the serial and survive an unplug, so reconnecting is just a
+ * fresh device scan — no trip through the picker to re-select the same device. Reports a
+ * concrete next step when it still isn't ready, rather than a generic failure.
+ * Returns true once the device is usable again.
+ */
+export async function reconnectDevice(serial: string): Promise<boolean> {
+  await refreshDevices()
+  const device = deviceBySerial(serial)
+  if (!device) {
+    setNotice(`还没检测到 ${serial}：插好数据线、打开 USB 调试后再点「重连」`)
+    return false
+  }
+  if (device.state !== 'device') {
+    const labels: Record<string, string> = {
+      unauthorized: '未授权',
+      offline: '离线',
+      'no permissions': '无权限'
+    }
+    const hint =
+      device.state === 'unauthorized'
+        ? '解锁手机，在「允许 USB 调试吗？」弹窗点允许'
+        : device.state === 'offline'
+          ? '重新插拔数据线，或执行 adb reconnect'
+          : '检查 USB 调试授权'
+    setNotice(`${serial} 当前是「${labels[device.state] ?? device.state}」：${hint}`)
+    return false
+  }
+  setNotice(`${serial} 已重新连接`)
+  return true
 }
 
 /**
@@ -1110,11 +1149,88 @@ export function isFindMode(): boolean {
 export function updateSearch(term: string): void {
   if (!isFindMode()) {
     updateFilter({ search: term }, true)
-    return
+  } else {
+    // 只改关键字，不 refresh：查找不改变结果集。
+    store.filter.search = term
+    scheduleFind()
   }
-  // 只改关键字，不 refresh：查找不改变结果集。
-  store.filter.search = term
-  scheduleFind()
+  scheduleRemember(term)
+}
+
+/* --------------------------------------------------- search history ---- */
+
+/**
+ * Remember the keyword once it settles, not on every keystroke — a 600ms debounce means
+ * typing "abc" records "abc" once instead of "a", "ab", "abc". Empty input is ignored
+ * (clearing the box is not something worth recalling).
+ */
+const REMEMBER_DELAY_MS = 600
+let rememberTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleRemember(term: string): void {
+  if (rememberTimer) clearTimeout(rememberTimer)
+  rememberTimer = setTimeout(() => {
+    rememberTimer = null
+    void rememberSearchNow(term)
+  }, REMEMBER_DELAY_MS)
+}
+
+async function rememberSearchNow(term: string): Promise<void> {
+  const keyword = term.trim()
+  if (!keyword || !store.tauriReady) return
+  // The user may have switched mode/flags while the timer was pending — record with the
+  // current settings, matching what they actually see.
+  try {
+    store.searchHistory = await ipc.rememberSearch(
+      keyword,
+      store.filter.searchMode,
+      store.filter.isRegex,
+      store.filter.caseSensitive
+    )
+  } catch {
+    // History is a convenience; a failed write must not surface as an error to the user.
+  }
+}
+
+export async function deleteSearchHistory(index: number): Promise<void> {
+  try {
+    store.searchHistory = await ipc.deleteSearchHistory(index)
+  } catch {
+    // best-effort: leave the in-memory list unchanged on failure
+  }
+}
+
+export async function clearSearchHistory(): Promise<void> {
+  try {
+    store.searchHistory = await ipc.clearSearchHistory()
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * Apply a remembered search. Restores the keyword *and* how it was interpreted, then runs
+ * it through the normal entry point so filtering/finding stays consistent with the store.
+ */
+export function applySearchHistory(entry: SearchHistoryEntry): void {
+  // One atomic filter update: keyword + flags + mode together. `updateFilter` runs a single
+  // refresh; that refresh already re-computes find hits when in find mode. No race, no
+  // half-applied state from calling setSearchMode separately.
+  updateFilter(
+    {
+      search: entry.keyword,
+      isRegex: entry.isRegex,
+      caseSensitive: entry.caseSensitive,
+      searchMode: entry.mode
+    },
+    false
+  )
+  if (entry.mode !== 'filter' && entry.mode !== 'find') {
+    // Defensive: an old/corrupt entry with a bad mode should not break the table.
+    updateFilter({ searchMode: 'filter' }, false)
+  }
+  // Reuse is itself an explicit search — bump it to the front of history.
+  scheduleRemember(entry.keyword)
 }
 
 export function setSearchMode(mode: 'filter' | 'find'): void {
@@ -1184,6 +1300,29 @@ async function runFind(autoJump: boolean): Promise<void> {
   }
 }
 
+/**
+ * 把命中携带的「全局 index」（entry.index，在 session.entries 里的位置）换算成它在当前
+ * 结果集 store.entries 里的显示下标——虚拟列表正是按这个下标布局的（第 k 行 → k*ROW_H）。
+ * 两者只在「无过滤 + asc」时才恰好相等；一旦有筛选条件或 desc，全局 index 会远大于显示
+ * 下标，直接拿去算 scrollTop 就会滚出列表、被 clamp 到底部，看起来就是「定位错了」。
+ *
+ * 目标行可能还没加载（分页），按需翻页直到它出现在 store.entries 中；返回 -1 表示到底
+ * 也找不到（例如期间 filter 变了）。
+ */
+async function resolveDisplayRow(globalIndex: number): Promise<number> {
+  let guard = 0
+  while (guard < 500) {
+    const pos = store.entries.findIndex((e) => e.index === globalIndex)
+    if (pos >= 0) return pos
+    const before = store.entries.length
+    await loadMore()
+    guard += 1
+    // 到底了，或者期间 filter 变了导致这页取不回来 —— 别死循环。
+    if (store.entries.length === before) break
+  }
+  return -1
+}
+
 /** 跳到第 `pos` 个命中（环形，支持 `-1` 表示上一个）。 */
 export async function gotoHit(pos: number): Promise<void> {
   const hits = store.searchHits
@@ -1191,10 +1330,10 @@ export async function gotoHit(pos: number): Promise<void> {
   const size = hits.indices.length
   const next = ((pos % size) + size) % size
   store.searchCursor = next
-  const index = hits.indices[next]
-  await ensureIndexLoaded(index)
-  // `seq` 让同一行的重复跳转也能触发滚动。
-  store.scrollTarget = { index, seq: (store.scrollTarget?.seq ?? 0) + 1 }
+  const displayRow = await resolveDisplayRow(hits.indices[next])
+  if (displayRow < 0) return
+  // `seq` 让同一行的重复跳转也能触发滚动。index 用显示下标，不是全局 index。
+  store.scrollTarget = { index: displayRow, seq: (store.scrollTarget?.seq ?? 0) + 1 }
 }
 
 export function nextHit(): void {
@@ -1203,18 +1342,6 @@ export function nextHit(): void {
 
 export function prevHit(): void {
   void gotoHit(store.searchCursor - 1)
-}
-
-/** 虚拟列表只渲染已加载的分页，命中可能落在还没取回来的页里。 */
-async function ensureIndexLoaded(index: number): Promise<void> {
-  let guard = 0
-  while (store.entries.length <= index && guard < 500) {
-    const before = store.entries.length
-    await loadMore()
-    guard += 1
-    // 到底了，或者期间 filter 变了导致这页取不回来 —— 别死循环。
-    if (store.entries.length === before) break
-  }
 }
 
 /** 当前高亮的那一行（不是已加载条目里的序号，是 entries 的 index）。 */

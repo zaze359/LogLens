@@ -12,7 +12,7 @@
 | --- | --- |
 | 日志来源 | ✅ 本地文件（.log / .txt / .logcat）+ 直连 Android 设备（adb 实时抓取） |
 | 设备工作区 | ✅ adb 探测、设备列表（授权 / 未授权 / 离线）、**设备作为工作区标签**：左侧竖排工具栏（日志 / 抓包 / 后续 adb 工具），切换即点图标且采集不中断；关掉设备会连同它的日志一起关闭 |
-| 设备网络请求 | ✅ WebView CDP（H5 明文）+ 内建代理（原生明文 HTTP、HTTPS 隧道元数据）+ HAR / JSONL 导入、落地脱敏、复制 cURL |
+| 设备网络请求 | ✅ WebView CDP（H5 明文）+ 内建代理（原生明文 HTTP、HTTPS 隧道元数据）+ HAR / JSONL 导入、复制 cURL（凭据按原文保存，脱敏可开关） |
 | macOS / Windows 桌面客户端 | ✅ Tauri 2，双平台构建脚本一致 |
 | Android Logcat 分析 | ✅ 流式解析、多格式兼容、包名从 pid 反推 |
 | 快捷筛选：包名 / 级别 / Tag / PID / 关键字 / 正则 / 排除 / 时间范围 / 排序 | ✅ |
@@ -367,10 +367,10 @@ LOGLENS_JSONL=~/capture.jsonl mitmdump -s scripts/mitmproxy_jsonl.py -p 8080
 
 需要原生 HTTPS 明文时只能走外部 MITM（可 root 装系统证书，或目标 APK 带 `debug-overrides`）；这一入口与内建原生采集互斥，避免两个代理互相打架。
 
-**复制 cURL**：选中任一请求，详情右上角「复制 cURL」会生成可直接粘贴到终端的命令（方法、URL、请求头、请求体）。自动跳过 `Host` / `Content-Length` / `Transfer-Encoding` / `Connection` / `Accept-Encoding` 这些由 curl 自行推导的字段；`CONNECT` 行（未解密的 HTTPS 隧道）不生成命令。请求头用的是**脱敏后的值**，token / Cookie 为占位符，不会把真实凭据带出去。
+**复制 cURL**：选中任一请求，详情右上角「复制 cURL」会生成可直接粘贴到终端的命令（方法、URL、请求头、请求体）。自动跳过 `Host` / `Content-Length` / `Transfer-Encoding` / `Connection` / `Accept-Encoding` 这些由 curl 自行推导的字段；`CONNECT` 行（未解密的 HTTPS 隧道）不生成命令。请求头按原文复制，含真实 token / Cookie，粘贴到终端前请确认目标环境可信。
 
 - **Android 7+ 的硬门槛**：targetSdk ≥ 24 的 App 默认不信任用户安装的 CA，`DEBUGGABLE` 本身**不**等于放行；有证书固定时即使放行也失败。所以体检不会把 `mitm-debug` 标成「可看明文」。
-- **脱敏**：token / Cookie / Authorization / 密码等字段在**导入或采集落地时**就被替换（`network.rs::redact`），不会进入会话、缓存或导出文件；URL query 里的 token 同样处理。
+- **凭据按原文保存**：`network.rs::REDACT_ENABLED` 默认 `false`，token / Cookie / 密码等不做脱敏，原文会进入会话、缓存与导出文件——仅在本地受信任环境使用；改成 `true` 即在导入 / 采集落地时替换敏感字段（含 URL query 的 token）。
 - **清理**：CDP 的 `adb forward` 由采集线程在停止 / 异常 / 窗口关闭时移除；内建代理停止时同步关闭监听并还原设备代理，不会留下占用端口或死代理。
 
 ---
@@ -690,10 +690,10 @@ npm run tauri dev
 39. 在设备工作区点「抓包」时先做一次只读体检，顶部只有一行环境信息（Android 版本 / 构建类型 / root 状态）和一段能力说明（原生：HTTP 明文全文、HTTPS 不解密；H5：WebView 内 HTTPS 明文）。**界面不展示四条路线的推理与步骤**，那部分只保留在本文档；H5 调试通道缺失时「开始 H5 采集」置灰并说明原因。
 40. 点「开始 H5 采集」后，在手机上打开一个 H5 页面：请求表出现 `H5` 来源的行，含方法、状态码、耗时、URL；没打开页面时应提示先进页面，而不是一片空白。
 41. 点「开始原生接口采集」：状态行显示代理端点；触发一次明文 HTTP 请求后，表中出现 `原生` 来源的完整请求 / 响应；HTTPS 行显示 `HTTPS 隧道（未解密）` 与 SNI，不算失败。两个开始按钮在运行时会就地变为对应的「停止 … 采集」。
-42. H5 与原生采集同时开启时，两类请求按时间混排在同一张表，「来源」列可区分；点任一行能看到请求头 / 响应头，敏感字段显示为脱敏值。时间轴上的刻度与表格行一一对应，拖拽圈选后表格只剩该区间（显示命中 / 总数），点轴面空白处恢复；「跟随最新」开启时新请求到达后表格停在底部。筛选栏输入域名后只剩该域名的请求，再叠加「仅慢请求 ≥ 1s」与时间区间应同时生效，点「清除筛选」全部复位。
+42. H5 与原生采集同时开启时，两类请求按时间混排在同一张表，「来源」列可区分；点任一行能看到请求头 / 响应头，正文按原文显示（脱敏开关默认关闭）。时间轴上的刻度与表格行一一对应，拖拽圈选后表格只剩该区间（显示命中 / 总数），点轴面空白处恢复；「跟随最新」开启时新请求到达后表格停在底部。筛选栏输入域名后只剩该域名的请求，再叠加「仅慢请求 ≥ 1s」与时间区间应同时生效，点「清除筛选」全部复位。
 43. 点「停止原生采集」后 `adb shell "settings list global | grep -i proxy"` 应为 `http_proxy=:0`（或无输出），`lsof -nP -iTCP:18999` 无监听；**在平板上重新打开被测 App 触发一次请求，logcat 里不应再出现 `18999` / `ConnectException`**。只看 Settings 无输出不足以证明恢复——Java 层代理属性可能仍在生效。
 44. 模拟异常退出：开始原生采集后直接强杀应用（或先拔线再退出），重新打开客户端、或点一次「环境体检」，设备代理应被自动清除，工作区显示「已自动修复设备代理」；`adb shell "settings get global http_proxy"` 返回 `:0`，设备恢复上网，重开被测 App 后请求成功。若设备当时不在线，重新连上后再打开该设备工作区应完成清理，期间不会出现 `failed to connect to /172.21.33.28 (port 18999)`。
-45. 选中任一条请求点「复制 cURL」：按钮短暂变「已复制」；粘贴到终端得到的命令含方法、URL、请求头与 `--data-raw` 请求体，`Host` / `Content-Length` / `Connection` / `Accept-Encoding` 不应出现；带 token 的请求复制出来是脱敏值；`CONNECT`（HTTPS 隧道）行没有该按钮。
+45. 选中任一条请求点「复制 cURL」：按钮短暂变「已复制」；粘贴到终端得到的命令含方法、URL、请求头与 `--data-raw` 请求体，`Host` / `Content-Length` / `Connection` / `Accept-Encoding` 不应出现；带 token 的请求复制出来是原值；`CONNECT`（HTTPS 隧道）行没有该按钮。
 
 客户端错误日志：
 

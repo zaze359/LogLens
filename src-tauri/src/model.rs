@@ -204,6 +204,20 @@ pub struct SearchHits {
     pub truncated: bool,
 }
 
+/// One remembered search keyword. The `mode`/flags are kept so reusing an entry restores
+/// exactly how the term was meant to be interpreted, not just the raw text.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SearchHistoryEntry {
+    pub keyword: String,
+    /// `filter` | `find`
+    pub mode: String,
+    pub is_regex: bool,
+    pub case_sensitive: bool,
+    /// Epoch millis; newest first.
+    pub ts: u64,
+}
+
 /// Progress of a file import, emitted as `log-open-progress` while `open_log_file` runs.
 ///
 /// Carries `requestId` because the frontend may have several imports in flight and must only

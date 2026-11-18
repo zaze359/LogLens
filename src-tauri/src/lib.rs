@@ -61,7 +61,11 @@ pub fn run() {
             commands::clear_error_log,
             commands::report_client_error,
             commands::error_log_location,
-            commands::export_error_log
+            commands::export_error_log,
+            commands::list_search_history,
+            commands::remember_search,
+            commands::delete_search_history,
+            commands::clear_search_history
         ])
         // A device-wide global proxy is persistent while this process is not. Clean
         // up on *every* shutdown path, not just the one Tauri happens to deliver.

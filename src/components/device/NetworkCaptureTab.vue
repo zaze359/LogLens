@@ -18,7 +18,7 @@ import type {
  * opening the log tab does not run `dumpsys` for nothing. The component stays mounted
  * (v-show) so switching tabs never interrupts a running capture.
  */
-const props = defineProps<{ serial: string; active: boolean }>()
+const props = defineProps<{ serial: string; active: boolean; connected: boolean }>()
 
 const report = ref<ProbeReport | null>(null)
 const probing = ref(false)
@@ -43,6 +43,9 @@ const requestHeadersOpen = ref(true)
 const responseHeadersOpen = ref(false)
 const curlCopied = ref(false)
 let curlTimer: ReturnType<typeof setTimeout> | null = null
+/** 正文复制按钮的短暂反馈：'request' | 'response' | ''。 */
+const bodyCopied = ref('')
+let bodyTimer: ReturnType<typeof setTimeout> | null = null
 
 const proxyInput = ref('')
 const proxyState = ref<ProxyState | null>(null)
@@ -65,7 +68,8 @@ let timer: ReturnType<typeof setInterval> | null = null
 let clearEpoch = 0
 
 const cdpSocket = computed(() => report.value?.evidence.devtools[0]?.socket ?? '')
-const canProbe = computed(() => !!props.serial && !probing.value)
+/** 体检与两条通道的启动都要走 adb；adb 断开后这些操作只会失败，直接禁用并说明。 */
+const canProbe = computed(() => !!props.serial && props.connected && !probing.value)
 const cdpRunning = computed(() =>
   captures.value.some((c) => c.source === 'cdp' && statuses.value[c.id]?.running)
 )
@@ -83,10 +87,15 @@ const targets = computed(() =>
     .join(' · ')
 )
 const canStartCdp = computed(
-  () => !!props.serial && !!cdpSocket.value && !cdpRunning.value && !busy.value
+  () => !!props.serial && props.connected && !!cdpSocket.value && !cdpRunning.value && !busy.value
 )
 const canStartProxy = computed(
-  () => !!props.serial && !proxyRunning.value && !busy.value && !proxyState.value?.active
+  () =>
+    !!props.serial &&
+    props.connected &&
+    !proxyRunning.value &&
+    !busy.value &&
+    !proxyState.value?.active
 )
 /** 空表引导文案只提当前在跑的通道，否则只开原生采集的人会被 H5 的说法带偏。 */
 const emptyHint = computed(() => {
@@ -98,9 +107,11 @@ const emptyHint = computed(() => {
   if (cdpRunning.value && proxyRunning.value) {
     return '等待设备请求…（在 App 里触发接口调用或打开 H5 页面）'
   }
+  // 原生采集只覆盖走系统代理的请求：WebView 里的 H5 不走系统代理，而部分 App 只在
+  // 启动时读取一次代理 —— 这两点最容易让人以为"抓包没生效"。
   return cdpRunning.value
     ? '等待 H5 请求…（在 App 里打开一个 WebView 页面）'
-    : '等待原生请求…（在 App 里触发接口调用）'
+    : '等待原生请求…（触发登录 / 提交等原生接口；H5 页面内的请求请用「开始 H5 采集」，部分 App 需要重启后才读取新代理）'
 })
 /**
  * 体检时调试通道在、但一个页面都没有：H5 采集收不到数据，值得单独说明。
@@ -116,11 +127,13 @@ const h5NoPage = computed(() => {
  */
 const cdpStartHint = computed(() => {
   if (!props.serial) return '先选择设备'
+  if (!props.connected) return '设备已断开，重连后才能开始新的采集'
   if (cdpSocket.value) return ''
   return '未检测到 WebView 调试通道：App 需开启 WebView 调试，或当前没有 WebView 进程'
 })
 const proxyStartHint = computed(() => {
   if (!props.serial) return '先选择设备'
+  if (!props.connected) return '设备已断开，重连后才能开始新的采集'
   if (proxyState.value?.active) return '设备上已有手动代理，先在下方还原再开始'
   return ''
 })
@@ -631,6 +644,20 @@ async function copyCurl(): Promise<void> {
   }
 }
 
+/** 一键复制请求体 / 响应体原文。 */
+async function copyBody(which: 'request' | 'response'): Promise<void> {
+  const text = which === 'request' ? selected.value?.requestBody : selected.value?.responseBody
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    bodyCopied.value = which
+    if (bodyTimer) clearTimeout(bodyTimer)
+    bodyTimer = setTimeout(() => (bodyCopied.value = ''), 1600)
+  } catch {
+    error.value = '复制失败，请手动选中文本'
+  }
+}
+
 /**
  * Called by the device dialog before it closes: stop both channels and give the device its
  * proxy back. Kept separate from `onBeforeUnmount` so the dialog can await it and show the
@@ -658,8 +685,8 @@ async function shutdown(): Promise<void> {
  * device's sockets.
  */
 watch(
-  () => [props.serial, props.active] as const,
-  async ([serial, active], previous) => {
+  () => [props.serial, props.active, props.connected] as const,
+  async ([serial, active, connected], previous) => {
     if (!active) return
     if (!serial) {
       report.value = null
@@ -674,7 +701,12 @@ watch(
       // The open detail panel shows a request from the previous device.
       selected.value = null
     }
-    if (report.value && !changed) return
+    // No adb → the probe (dumpsys) cannot run. Keep the last report if one exists: it was
+    // taken while the device was attached and is still the best information we have.
+    if (!connected) return
+    // Re-attached after being disconnected: the old report may be stale, probe again.
+    const reconnected = previous?.[2] === false && connected === true
+    if (report.value && !changed && !reconnected) return
     await runProbe()
   },
   { immediate: true }
@@ -683,6 +715,7 @@ watch(
 onBeforeUnmount(() => {
   stopPolling()
   if (curlTimer) clearTimeout(curlTimer)
+  if (bodyTimer) clearTimeout(bodyTimer)
   // The component can be unmounted without going through shutdown() (window close,
   // store reset). Best effort only: an IPC may not get out while the webview is
   // being torn down. The Rust CloseRequested/Exit hooks and the proxy journal are
@@ -706,6 +739,7 @@ defineExpose({ shutdown, isCapturing: running })
           {{ report.evidence.buildType }} ·
           {{ report.evidence.rootShell ? '有 root' : '无 root' }}
         </span>
+        <span v-else-if="!connected" class="muted">设备已断开，无法读取环境；重新连接后会自动体检。</span>
         <span v-else class="muted">正在读取设备环境，用来判断两条采集通道是否可用。</span>
         <div class="spacer" />
         <button class="btn btn-sm" :disabled="!canProbe || busy" @click="runProbe">
@@ -950,7 +984,7 @@ defineExpose({ shutdown, isCapturing: running })
       </template>
 
       <p class="empty-hint net-foot-note">
-        请求与响应中的 token / Cookie 在落盘时即脱敏。
+        抓包内容按原文保存，含 token / Cookie 等凭据，请勿随意外发导出文件。
         <span v-if="running">关闭本面板会停止采集并还原设备代理。</span>
       </p>
     </div>
@@ -968,7 +1002,7 @@ defineExpose({ shutdown, isCapturing: running })
           v-if="curlText"
           class="btn btn-ghost btn-sm"
           :class="{ copied: curlCopied }"
-          :title="selected.redacted ? '复制为 cURL 命令（token / Cookie 等为脱敏值）' : '复制为 cURL 命令'"
+          :title="selected.redacted ? '复制为 cURL 命令（敏感字段已脱敏）' : '复制为 cURL 命令'"
           @click="copyCurl"
         >
           {{ curlCopied ? '已复制' : '复制 cURL' }}
@@ -1024,6 +1058,13 @@ defineExpose({ shutdown, isCapturing: running })
             <span>请求体</span>
             <button
               v-if="selected.requestBody"
+              class="btn btn-ghost btn-sm"
+              :class="{ copied: bodyCopied === 'request' }"
+              title="复制请求体原文"
+              @click="copyBody('request')"
+            >{{ bodyCopied === 'request' ? '已复制' : '复制' }}</button>
+            <button
+              v-if="selected.requestBody"
               class="btn btn-sm"
               title="在独立面板中格式化查看请求体"
               @click="openJsonPanel(selected.requestBody, '请求体')"
@@ -1051,15 +1092,31 @@ defineExpose({ shutdown, isCapturing: running })
           </template>
           <p class="net-section-title">
             <span>响应体</span>
+            <span
+              v-if="selected.responseTruncated"
+              class="net-tag warn"
+              title="响应体超过展示上限，只保存了前 2 MB"
+            >已截断</span>
+            <button
+              v-if="selected.responseBody"
+              class="btn btn-ghost btn-sm"
+              :class="{ copied: bodyCopied === 'response' }"
+              title="复制响应体原文"
+              @click="copyBody('response')"
+            >{{ bodyCopied === 'response' ? '已复制' : '复制' }}</button>
             <button
               v-if="selected.responseBody"
               class="btn btn-sm"
-              title="在独立面板中格式化查看响应体"
+              :disabled="selected.responseTruncated"
+              :title="selected.responseTruncated ? '响应体已截断，半截 JSON 无法格式化' : '在独立面板中格式化查看响应体'"
               @click="openJsonPanel(selected.responseBody, '响应体')"
             >格式化</button>
           </p>
           <pre v-if="selected.responseBody" class="net-body-pre mono">{{ selected.responseBody }}</pre>
-          <p v-else class="muted">
+          <p v-if="selected.responseTruncated" class="net-truncate-hint">
+            响应体共 {{ formatSize(selected.responseSize) }}，仅保存前 2 MB 用于展示；截断的 JSON 无法格式化。转发给设备的内容不受影响。
+          </p>
+          <p v-if="!selected.responseBody" class="muted">
             {{ selected.method === 'CONNECT' ? 'HTTPS 隧道不解密，只有域名、SNI 与字节数' : '无响应体（或不是文本内容）' }}
           </p>
         </template>

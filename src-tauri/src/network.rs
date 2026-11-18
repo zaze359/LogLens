@@ -17,6 +17,10 @@ use std::sync::OnceLock;
 
 pub const REDACTED: &str = "[已隐藏]";
 
+/// 默认关闭脱敏：抓包正文保留原文，便于排查。改成 true 一行即可恢复落盘脱敏。
+/// 关闭时明文会进入会话、缓存与导出文件，只应在本地受信任环境下使用。
+pub const REDACT_ENABLED: bool = false;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HttpHeader {
@@ -48,6 +52,9 @@ pub struct NetworkRequest {
     pub response_headers: Vec<HttpHeader>,
     pub request_body: String,
     pub response_body: String,
+    /// 仅展示用的正文被上限截短时为 true；转发给设备的字节始终完整。
+    /// 半截 JSON 不是合法 JSON，UI 要明确说明，不能让用户对着格式化按钮猜。
+    pub response_truncated: bool,
     /// Transport-level failure (DNS, TLS, connection reset). Empty on success.
     pub error: String,
     /// `har` | `jsonl` | `cdp`
@@ -82,6 +89,14 @@ fn sensitive_body_keys() -> &'static Regex {
 /// exports rows verbatim. Redaction is therefore applied on import, not on display:
 /// a leaked credential must never reach the session, the cache or an exported file.
 pub fn redact(request: &mut NetworkRequest) {
+    if !REDACT_ENABLED {
+        return;
+    }
+    redact_into(request)
+}
+
+/// 实际脱敏逻辑，单独抽出以便测试在开关关闭时仍能验证其行为。
+fn redact_into(request: &mut NetworkRequest) {
     for header in request
         .request_headers
         .iter_mut()
@@ -221,6 +236,7 @@ fn request_from_har_entry(entry: &Value, index: u32) -> NetworkRequest {
         response_headers: har_headers(response.get("headers")),
         request_body: post.map(har_text).unwrap_or_default(),
         response_body: content.map(har_text).unwrap_or_default(),
+        response_truncated: false,
         error: str_field(entry, "_error"),
         source: "har".to_string(),
         redacted: false,
@@ -339,7 +355,8 @@ mod tests {
         let first = &rows[0];
         assert_eq!(first.method, "POST");
         assert_eq!(first.host, "api.example.com");
-        assert_eq!(first.path, "/v1/homework?token=[已隐藏]");
+        // 脱敏默认关闭，URL query 保留原值。
+        assert_eq!(first.path, "/v1/homework?token=abc123");
         assert_eq!(first.scheme, "https");
         assert_eq!(first.status, 200);
         assert_eq!(first.duration_ms, 187);
@@ -354,17 +371,43 @@ mod tests {
     }
 
     #[test]
-    fn redacts_credentials_before_they_reach_a_session() {
+    fn redaction_is_off_by_default() {
         let rows = parse_har(HAR).unwrap();
         let first = &rows[0];
-        assert!(first.redacted);
-        assert_eq!(first.request_headers[0].value, REDACTED);
-        assert_eq!(first.response_headers[0].value, REDACTED);
-        assert!(first.request_body.contains(REDACTED));
-        assert!(!first.request_body.contains("p@ss"));
-        assert!(first.response_body.contains(REDACTED));
-        assert!(!first.response_body.contains("leak"));
-        assert!(!first.url.contains("abc123"));
+        assert!(!first.redacted);
+        assert_eq!(first.request_headers[0].value, "Bearer secret-token");
+        assert!(first.request_body.contains("p@ss"));
+        assert!(first.response_body.contains("leak"));
+        assert!(first.url.contains("abc123"));
+    }
+
+    #[test]
+    fn redact_into_hides_credentials_when_enabled() {
+        // 直接测脱敏逻辑本身：开关关闭时生产路径不调用它，但能力保留，改 REDACT_ENABLED 即可恢复。
+        let mut row = NetworkRequest {
+            request_headers: vec![
+                HttpHeader { name: "Authorization".into(), value: "Bearer secret-token".into() },
+            ],
+            response_headers: vec![
+                HttpHeader { name: "Set-Cookie".into(), value: "sid=xyz".into() },
+            ],
+            request_body: "{\"title\":\"作业\",\"password\":\"p@ss\"}".into(),
+            response_body: "{\"code\":0,\"access_token\":\"leak\"}".into(),
+            url: "https://api.example.com/v1/homework?token=abc123".into(),
+            ..Default::default()
+        };
+        let (_, host, path) = split_url(&row.url);
+        row.host = host;
+        redact_into(&mut row);
+        assert!(row.redacted);
+        assert_eq!(row.request_headers[0].value, REDACTED);
+        assert_eq!(row.response_headers[0].value, REDACTED);
+        assert!(row.request_body.contains(REDACTED));
+        assert!(!row.request_body.contains("p@ss"));
+        assert!(row.response_body.contains(REDACTED));
+        assert!(!row.response_body.contains("leak"));
+        assert!(!row.url.contains("abc123"));
+        assert_eq!(path, "/v1/homework?token=abc123");
     }
 
     #[test]

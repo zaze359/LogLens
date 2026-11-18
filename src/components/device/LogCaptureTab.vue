@@ -120,7 +120,7 @@ async function start(): Promise<void> {
 
     <div class="device-op-actions">
       <span v-if="!deviceReady" class="empty-hint" style="margin-right: auto">
-        {{ serial ? '这台设备当前不可用（未授权 / 离线）' : '先选择一台设备' }}
+        {{ serial ? '设备未连接，抓取不可用' : '先选择一台设备' }}
       </span>
       <button
         class="btn btn-primary btn-sm"

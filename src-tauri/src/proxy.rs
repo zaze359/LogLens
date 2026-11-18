@@ -23,14 +23,19 @@ use crate::network::{redact, split_url, HttpHeader, NetworkRequest};
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
+};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAX_BODY: usize = 64 * 1024;
+/// 仅为展示而保留的响应体上限；转发给设备的字节不受此限制。
+/// 64 KB 装不下常见的列表接口响应，JSON 末尾被切掉后既不能格式化也不能当证据；
+/// 2 MB 覆盖绝大多数排查场景，同时限制每条请求常驻 WebView 的内存。
+const MAX_BODY: usize = 2 * 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Proxy diagnostics also go to a file: `tauri dev` relays stderr through a pipe, so a
@@ -172,13 +177,76 @@ pub fn parse_device_ip(text: &str) -> Option<Ipv4Addr> {
         .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
 }
 
+/// A "LAN" address: RFC1918 private ranges only. A public or link-local address on the
+/// device is never the one its traffic reaches us from.
+fn is_lan_ip(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 10
+        || (octets[0] == 172 && (16..32).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+}
+
+/// Rank every interface's IPv4 and take the most likely one.
+///
+/// `wlan0` is the usual name but not the only one — emulators use `eth0`, some ROMs expose
+/// `wlan1` / `swlan0`, and tethering moves the address elsewhere. Betting on a single name
+/// is how a capture ends up bound to the wrong network.
+///
+/// Handles both shapes: `ip -o` keeps the interface name on the same line as the address,
+/// plain `ip addr` puts the address on an indented line of its own.
+fn best_private_ip(text: &str) -> Option<Ipv4Addr> {
+    let mut best: Option<(u8, Ipv4Addr)> = None;
+    let mut iface = "";
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // `2: wlan0    inet 172.21.33.28/24 ...`  or  `2: wlan0: <BROADCAST,...>`
+        let starts_with_index = trimmed.starts_with(|c: char| c.is_ascii_digit());
+        if starts_with_index {
+            if let Some(name) = trimmed.split(':').nth(1) {
+                iface = name.trim();
+            }
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let Some(at) = tokens.iter().position(|token| *token == "inet") else {
+            continue;
+        };
+        let Some(addr) = tokens.get(at + 1).and_then(|raw| raw.split('/').next()) else {
+            continue;
+        };
+        let Ok(ip) = addr.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if ip.is_loopback() || !is_lan_ip(ip) {
+            continue;
+        }
+        let rank = if iface.starts_with("wlan") {
+            3
+        } else if iface == "lo" || iface.starts_with("dummy") {
+            0
+        } else {
+            2
+        };
+        if rank > 0 && best.map(|(score, _)| rank > score).unwrap_or(true) {
+            best = Some((rank, ip));
+        }
+    }
+    best.map(|(_, ip)| ip)
+}
+
 pub fn device_ip(adb_path: &Path, serial: &str) -> Option<Ipv4Addr> {
-    let wlan = adb::shell_probe(adb_path, serial, "ip -f inet addr show wlan0 | grep 'inet '");
-    if let Some(ip) = parse_device_ip(&wlan) {
+    // One round trip for every interface, then rank — see `best_private_ip`.
+    let all = adb::shell_probe(adb_path, serial, "ip -o -f inet addr show 2>/dev/null");
+    if let Some(ip) = best_private_ip(&all) {
+        return Some(ip);
+    }
+    // Older shells without `-o`; the property is also stale on some ROMs, so it is only a
+    // last resort and still has to look like a LAN address.
+    let plain = adb::shell_probe(adb_path, serial, "ip -f inet addr show");
+    if let Some(ip) = best_private_ip(&plain) {
         return Some(ip);
     }
     let prop = adb::shell_probe(adb_path, serial, "getprop dhcp.wlan0.ipaddress");
-    parse_device_ip(&prop)
+    parse_device_ip(&prop).filter(|ip| is_lan_ip(*ip))
 }
 
 fn now_millis() -> f64 {
@@ -248,22 +316,33 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
 
 /// Drain a decoder. A truncated capture makes the final block fail with `UnexpectedEof`,
 /// but the plaintext decoded so far is still useful — partial output beats discarding all.
-fn inflate<R: Read>(mut decoder: R) -> Option<Vec<u8>> {
+/// The bool reports that the plaintext exceeded the cap or the decoder ran out of input.
+fn inflate<R: Read>(mut decoder: R) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut buf = [0u8; 8 * 1024];
     loop {
         match decoder.read(&mut buf) {
-            Ok(0) => return Some(out),
+            Ok(0) => return (out, false),
             Ok(n) => {
                 out.extend_from_slice(&buf[..n]);
-                if out.len() >= MAX_BODY {
+                if out.len() > MAX_BODY {
                     out.truncate(MAX_BODY);
-                    return Some(out);
+                    return (out, true);
                 }
             }
-            Err(_) if !out.is_empty() => return Some(out),
-            Err(_) => return None,
+            Err(_) if !out.is_empty() => return (out, true),
+            Err(_) => return (Vec::new(), true),
         }
+    }
+}
+
+fn cap(data: Vec<u8>) -> (Vec<u8>, bool) {
+    if data.len() > MAX_BODY {
+        let mut data = data;
+        data.truncate(MAX_BODY);
+        (data, true)
+    } else {
+        (data, false)
     }
 }
 
@@ -274,17 +353,37 @@ fn inflate<R: Read>(mut decoder: R) -> Option<Vec<u8>> {
 /// a gzipped JSON reply looked like: the chunk length, then binary. Both layers are removed
 /// here for display only; the bytes forwarded to the device are untouched, and a body that
 /// still cannot be decoded is returned as-is instead of losing the evidence.
-fn decode_body(raw: &[u8], chunked: bool, content_encoding: &str) -> Vec<u8> {
+///
+/// The bool tells the UI that the text is incomplete: a half JSON cannot be formatted, and
+/// silently showing it as if complete is worse than saying so explicitly.
+fn decode_body_capped(raw: &[u8], chunked: bool, content_encoding: &str) -> (Vec<u8>, bool) {
     let framed = if chunked { dechunk(raw) } else { raw.to_vec() };
     match content_encoding.trim().to_ascii_lowercase().as_str() {
-        "gzip" | "x-gzip" => inflate(GzDecoder::new(&framed[..])).unwrap_or(framed),
+        "gzip" | "x-gzip" => {
+            let (out, truncated) = inflate(GzDecoder::new(&framed[..]));
+            if out.is_empty() { cap(framed) } else { (out, truncated) }
+        }
         // `deflate` is ambiguous in the wild: zlib-wrapped or raw. Try both.
-        "deflate" => inflate(ZlibDecoder::new(&framed[..]))
-            .or_else(|| inflate(DeflateDecoder::new(&framed[..])))
-            .unwrap_or(framed),
-        "br" => inflate(brotli::Decompressor::new(&framed[..], 4096)).unwrap_or(framed),
-        _ => framed,
+        "deflate" => {
+            let (zlib, zlib_truncated) = inflate(ZlibDecoder::new(&framed[..]));
+            if !zlib.is_empty() {
+                (zlib, zlib_truncated)
+            } else {
+                let (raw_deflate, raw_truncated) = inflate(DeflateDecoder::new(&framed[..]));
+                if raw_deflate.is_empty() { cap(framed) } else { (raw_deflate, raw_truncated) }
+            }
+        }
+        "br" => {
+            let (out, truncated) = inflate(brotli::Decompressor::new(&framed[..], 4096));
+            if out.is_empty() { cap(framed) } else { (out, truncated) }
+        }
+        _ => cap(framed),
     }
+}
+
+/// Request bodies are bounded before they are relayed, so no truncation flag is needed.
+fn decode_body(raw: &[u8], chunked: bool, content_encoding: &str) -> Vec<u8> {
+    decode_body_capped(raw, chunked, content_encoding).0
 }
 
 /// The listener is non-blocking so the accept loop can poll `stop`; on macOS/BSD the
@@ -453,10 +552,26 @@ fn read_response_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     }
 }
 
-fn append_capture(captured: &mut Vec<u8>, bytes: &[u8]) {
-    let room = MAX_BODY.saturating_sub(captured.len());
-    if room > 0 {
-        captured.extend_from_slice(&bytes[..bytes.len().min(room)]);
+/// 仅用于展示的响应体副本。超出上限的字节照常转发给设备，只是不再留存；
+/// `truncated` 一旦为真就保持为真，UI 据此把半截 JSON 标成不可格式化。
+#[derive(Default)]
+struct BodyCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BodyCapture {
+    fn append(&mut self, bytes: &[u8]) {
+        if self.truncated {
+            return
+        }
+        let room = MAX_BODY.saturating_sub(self.bytes.len());
+        if bytes.len() > room {
+            self.bytes.extend_from_slice(&bytes[..room]);
+            self.truncated = true;
+        } else {
+            self.bytes.extend_from_slice(bytes);
+        }
     }
 }
 
@@ -464,7 +579,7 @@ fn relay_exact(
     upstream: &mut TcpStream,
     client: &mut TcpStream,
     mut remaining: usize,
-    captured: &mut Vec<u8>,
+    captured: &mut BodyCapture,
     total: &mut u64,
 ) -> Result<(), String> {
     let mut buf = [0u8; 16 * 1024];
@@ -476,7 +591,7 @@ fn relay_exact(
         client
             .write_all(&buf[..take])
             .map_err(|e| format!("回写客户端失败: {e}"))?;
-        append_capture(captured, &buf[..take]);
+        captured.append(&buf[..take]);
         *total += take as u64;
         remaining -= take;
     }
@@ -486,7 +601,7 @@ fn relay_exact(
 fn relay_chunked(
     upstream: &mut TcpStream,
     client: &mut TcpStream,
-    captured: &mut Vec<u8>,
+    captured: &mut BodyCapture,
     total: &mut u64,
 ) -> Result<(), String> {
     loop {
@@ -495,7 +610,7 @@ fn relay_chunked(
         client
             .write_all(&line)
             .map_err(|e| format!("回写客户端失败: {e}"))?;
-        append_capture(captured, &line);
+        captured.append(&line);
         *total += line.len() as u64;
         if size == 0 {
             loop {
@@ -503,7 +618,7 @@ fn relay_chunked(
                 client
                     .write_all(&trailer)
                     .map_err(|e| format!("回写客户端失败: {e}"))?;
-                append_capture(captured, &trailer);
+                captured.append(&trailer);
                 *total += trailer.len() as u64;
                 if trailer == b"\r\n" || trailer == b"\n" {
                     return Ok(());
@@ -520,7 +635,7 @@ fn relay_chunked(
             client
                 .write_all(&buf[..take])
                 .map_err(|e| format!("回写客户端失败: {e}"))?;
-            append_capture(captured, &buf[..take]);
+            captured.append(&buf[..take]);
             *total += take as u64;
             remaining -= take;
         }
@@ -531,7 +646,7 @@ fn relay_chunked(
         client
             .write_all(&crlf)
             .map_err(|e| format!("回写客户端失败: {e}"))?;
-        append_capture(captured, &crlf);
+        captured.append(&crlf);
         *total += 2;
     }
 }
@@ -539,7 +654,7 @@ fn relay_chunked(
 fn relay_until_eof(
     upstream: &mut TcpStream,
     client: &mut TcpStream,
-    captured: &mut Vec<u8>,
+    captured: &mut BodyCapture,
     total: &mut u64,
 ) -> Result<(), String> {
     let mut buf = [0u8; 16 * 1024];
@@ -550,7 +665,7 @@ fn relay_until_eof(
                 client
                     .write_all(&buf[..n])
                     .map_err(|e| format!("回写客户端失败: {e}"))?;
-                append_capture(captured, &buf[..n]);
+                captured.append(&buf[..n]);
                 *total += n as u64;
             }
             Err(e) => return Err(format!("读取上游响应体失败: {e}")),
@@ -749,7 +864,7 @@ fn handle_http(
         &format!("{request_line}: 已回写响应头 {} 字节", out.len()),
     );
 
-    let mut captured = Vec::new();
+    let mut captured = BodyCapture::default();
     let mut total = 0u64;
     if !no_body {
         if chunked_response {
@@ -790,9 +905,11 @@ fn handle_http(
         let request_encoding = header_value(&request.request_headers, "content-encoding");
         let response_encoding = header_value(&request.response_headers, "content-encoding");
         let request_body = decode_body(&body, chunked_request, &request_encoding);
-        let response_body = decode_body(&captured, chunked_response, &response_encoding);
+        let (response_body, decode_truncated) =
+            decode_body_capped(&captured.bytes, chunked_response, &response_encoding);
         request.request_body = String::from_utf8_lossy(&request_body).into_owned();
         request.response_body = String::from_utf8_lossy(&response_body).into_owned();
+        request.response_truncated = captured.truncated || decode_truncated;
     }
     request.duration_ms = ((now_millis() - started).max(0.0) * 1000.0) as u32;
     redact(&mut request);
@@ -981,6 +1098,30 @@ fn handle_connection(
     }
 }
 
+/// Bind the LAN-side listener, treating `port` as a *preference* rather than a demand.
+///
+/// A fixed port is a single global resource, but captures are per device: a capture left
+/// running for a phone that was unplugged, a second phone, or any unrelated app on the
+/// same number makes every later start fail with `Address already in use`. Nothing in the
+/// proxy actually needs a predictable number — the device is told the real endpoint
+/// afterwards through [`bound_endpoint`] — so on a conflict we let the OS pick one instead
+/// of refusing to capture.
+fn bind_listener(lan: Ipv4Addr, port: u16) -> Result<TcpListener, String> {
+    match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(lan, port))) {
+        Ok(listener) => Ok(listener),
+        Err(e) if port != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+            let listener =
+                TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(lan, 0))).map_err(|fallback| {
+                    format!("无法监听 {lan}:{port}（{e}），改用系统分配端口也失败: {fallback}")
+                })?;
+            let actual = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
+            eprintln!("[proxy] 端口 {lan}:{port} 已被占用（{e}），改用 {lan}:{actual}");
+            Ok(listener)
+        }
+        Err(e) => Err(format!("无法监听 {lan}:{port}: {e}")),
+    }
+}
+
 /// Translate a bound listener into the endpoint the device must be told about.
 /// With `port = 0` the OS picks a free port, so using the *requested* port would point
 /// the device at `:0` and black-hole every request.
@@ -992,134 +1133,354 @@ fn bound_endpoint(listener: &TcpListener, lan: Ipv4Addr) -> Result<(u16, String)
     Ok((port, format!("{lan}:{port}")))
 }
 
+/// One device as seen by the shared listener: the address it connects from, the session it
+/// feeds, and the flag that stops its in-flight connections.
+struct Route {
+    serial: String,
+    /// `None` when adb could not tell us the address. The binding is then learned from the
+    /// first connection rather than guessed — see [`route_for`].
+    ip: Option<Ipv4Addr>,
+    offset_secs: i32,
+    shared: Arc<Mutex<ProxyBuffer>>,
+    stop: Arc<AtomicBool>,
+}
+
+/// Pick the device a connection belongs to.
+///
+/// The source address is the only thing that separates two phones behind one proxy: every
+/// device is told the same `<lan>:<port>`, and each phone carries its own address. The
+/// binding is used strictly *while it disambiguates something*:
+///
+/// * exact address match — the normal case;
+/// * exactly one device — the source has nothing to disambiguate, so it is attributed to
+///   that device. This is what keeps a capture working when the phone's address could not
+///   be read, changed after a DHCP renewal, or is reported differently by the ROM;
+/// * several devices — only an address we never learned may claim a connection, and only if
+///   it is the single such device. Anything else is refused rather than guessed.
+fn route_for(routes: &[Route], source: IpAddr) -> Option<&Route> {
+    if let IpAddr::V4(source) = source {
+        if let Some(route) = routes.iter().find(|r| r.ip == Some(source)) {
+            return Some(route);
+        }
+    }
+    if routes.len() == 1 {
+        return routes.first();
+    }
+    let mut unbound = routes.iter().filter(|r| r.ip.is_none());
+    match (unbound.next(), unbound.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
+/// The running socket, kept apart from the routing table so the accept loop never has to
+/// touch the hub's own locks.
+struct Listener {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+    endpoint: String,
+    lan: Ipv4Addr,
+}
+
+impl Listener {
+    fn shutdown(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.join();
+    }
+}
+
+/// The single proxy listener every device shares.
+///
+/// One port instead of one per device: the device is pointed at `<lan>:<port>`, so the only
+/// thing that can distinguish two phones is the source address they already carry. That
+/// removes a whole class of problems — N devices no longer need N ports, a phone that
+/// reconnects cannot collide with a capture still winding down, and a Wi-Fi change only has
+/// to rebuild one socket.
+pub struct ProxyHub {
+    /// Serialises attach/detach, so an idle shutdown can never race a fresh attach.
+    gate: Mutex<()>,
+    slot: Mutex<Option<Listener>>,
+    routes: Arc<Mutex<Vec<Route>>>,
+}
+
+impl Default for ProxyHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProxyHub {
+    pub fn new() -> Self {
+        Self {
+            gate: Mutex::new(()),
+            slot: Mutex::new(None),
+            routes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Register `route` and return the endpoint its device must be pointed at, reusing the
+    /// running listener when there is one.
+    fn attach(
+        &self,
+        route: Route,
+        lan: Ipv4Addr,
+        preferred_port: u16,
+    ) -> Result<String, String> {
+        let _gate = self.gate.lock().unwrap_or_else(|p| p.into_inner());
+        let others_attached = {
+            let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = routes.iter().find(|r| {
+                r.serial == route.serial || (r.ip.is_some() && r.ip == route.ip)
+            }) {
+                // One address, one device: two phones behind the same NAT would otherwise
+                // interleave their rows into one session with no way to tell them apart.
+                return Err(format!(
+                    "{} 已绑定设备 {}，同一个 IP 只能对应一台设备",
+                    existing.ip.map(|ip| ip.to_string()).unwrap_or_default(),
+                    existing.serial
+                ));
+            }
+            !routes.is_empty()
+        };
+        let endpoint = {
+            let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+            self.ensure_listener(&mut slot, lan, preferred_port, others_attached)?
+        };
+        self.routes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(route);
+        Ok(endpoint)
+    }
+
+    /// Drop `serial` from the routing table. The listener stays up while another device
+    /// still uses it, and closes — releasing the port — as soon as the last one leaves.
+    fn detach(&self, serial: &str) {
+        let _gate = self.gate.lock().unwrap_or_else(|p| p.into_inner());
+        let removed = {
+            let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+            let before = routes.len();
+            routes.retain(|r| r.serial != serial);
+            before != routes.len()
+        };
+        if !removed {
+            return;
+        }
+        let idle = self
+            .routes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty();
+        if !idle {
+            return;
+        }
+        // Nobody left: stop accepting so the port goes back to the OS. The next attach
+        // rebuilds the listener, which is also what picks up a changed LAN address.
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(listener) = slot.take() {
+            listener.shutdown();
+        }
+    }
+
+    fn ensure_listener(
+        &self,
+        slot: &mut Option<Listener>,
+        lan: Ipv4Addr,
+        preferred_port: u16,
+        others_attached: bool,
+    ) -> Result<String, String> {
+        if let Some(existing) = slot.as_ref() {
+            if existing.lan == lan {
+                return Ok(existing.endpoint.clone());
+            }
+            // The LAN address changed (Wi-Fi switch, VPN, a machine with two NICs). The old
+            // socket serves an interface the new device cannot reach — but rebuilding it
+            // would silently black-hole every device already pointed at the old endpoint.
+            if others_attached {
+                return Err(format!(
+                    "本机有多个网段：已有设备正在通过 {} 采集，请先停止其它设备的采集再切换网络",
+                    existing.endpoint
+                ));
+            }
+            if let Some(old) = slot.take() {
+                old.shutdown();
+            }
+        }
+        let listener = bind_listener(lan, preferred_port)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("设置非阻塞失败: {e}"))?;
+        let (port, endpoint) = bound_endpoint(&listener, lan)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let routes = Arc::clone(&self.routes);
+        let thread = std::thread::spawn(move || run_listener(listener, routes, thread_stop));
+        eprintln!("[proxy] 统一监听 {endpoint}（端口 {port}，按来源 IP 分发到设备）");
+        *slot = Some(Listener {
+            stop,
+            thread,
+            endpoint: endpoint.clone(),
+            lan,
+        });
+        Ok(endpoint)
+    }
+}
+
+/// Accept loop for the shared listener. One thread, one socket, every device.
+fn run_listener(listener: TcpListener, routes: Arc<Mutex<Vec<Route>>>, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                let source = peer.ip();
+                let (dispatch, local_offset) = {
+                    let table = routes.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        route_for(&table, source).map(|route| {
+                            (
+                                Arc::clone(&route.shared),
+                                Arc::clone(&route.stop),
+                                route.offset_secs,
+                                route.serial.clone(),
+                            )
+                        }),
+                        // A rejection has no device of its own; log it in the same clock as
+                        // the devices that are attached, so the lines interleave sensibly.
+                        table.first().map(|route| route.offset_secs).unwrap_or(0),
+                    )
+                };
+                let Some((shared, route_stop, offset_secs, serial)) = dispatch else {
+                    // Never silent: a rejected source is the one thing that explains an
+                    // empty table, so it goes to the file log as well as stderr.
+                    let reason = format!(
+                        "拒绝来源 {source}：没有登记这个 IP 的设备（多设备同时采集时按 IP 区分；IP 变化后请重新开始采集）"
+                    );
+                    eprintln!("[proxy] {reason}");
+                    proxy_log(local_offset, &reason);
+                    let mut stream = stream;
+                    write_error_response(
+                        &mut stream,
+                        "403 Forbidden",
+                        "该代理只服务已登记的 Android 设备",
+                    );
+                    continue;
+                };
+                let stream = match prepare_client(stream) {
+                    Ok(stream) => stream,
+                    Err(reason) => {
+                        proxy_log(offset_secs, &reason);
+                        continue;
+                    }
+                };
+                proxy_log(offset_secs, &format!("路由 {source} → {serial}"));
+                std::thread::spawn(move || {
+                    handle_connection(stream, &source.to_string(), shared, route_stop, offset_secs)
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            // A client can vanish between SYN and accept(); that aborts this one
+            // connection, not the capture. Treating it as fatal used to close the listener
+            // while the device proxy stayed behind.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted
+                    || e.kind() == std::io::ErrorKind::ConnectionAborted
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                // The shared listener is gone, so every device on it is dead. Report on each
+                // buffer: otherwise every UI keeps polling a session that never fills again.
+                let table = routes.lock().unwrap_or_else(|p| p.into_inner());
+                for route in table.iter() {
+                    if let Ok(mut buffer) = route.shared.lock() {
+                        if buffer.error.is_empty() {
+                            buffer.error = format!("代理监听异常: {e}");
+                        }
+                        buffer.finished = true;
+                    }
+                }
+                return;
+            }
+        }
+    }
+    let table = routes.lock().unwrap_or_else(|p| p.into_inner());
+    for route in table.iter() {
+        if let Ok(mut buffer) = route.shared.lock() {
+            buffer.finished = true;
+        }
+    }
+}
+
+/// One device's membership in the shared listener. The socket itself belongs to
+/// [`ProxyHub`]; this handle owns the device-side proxy setting and its own request buffer.
 pub struct ProxyCapture {
     session_id: String,
     serial: String,
-    port: u16,
     info: ProxyCaptureInfo,
     shared: Arc<Mutex<ProxyBuffer>>,
     stop: Arc<AtomicBool>,
     guard: Option<ProxyGuard>,
-    thread: Option<JoinHandle<()>>,
+    hub: Arc<ProxyHub>,
 }
 
 impl ProxyCapture {
-    /// Start listening, then point the device at this machine. Ordering matters: setting
-    /// the proxy before the listener exists would black-hole the device's traffic.
+    /// Join the shared listener, then point the device at it. Ordering matters twice: the
+    /// route must exist before the phone is told where to send traffic, and the proxy must
+    /// never be set for a route the hub does not have.
     pub fn start(
+        hub: &Arc<ProxyHub>,
         adb_path: &Path,
         serial: &str,
         port: u16,
         offset_secs: i32,
         session_id: String,
     ) -> Result<Self, String> {
-        let device = device_ip(adb_path, serial);
-        let lan = local_lan_ip(device).ok_or_else(|| "无法确定本机局域网地址".to_string())?;
-        let listener = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(lan, port)))
-            .map_err(|e| format!("无法监听 {lan}:{port}: {e}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| format!("设置非阻塞失败: {e}"))?;
-
-        let (bound_port, endpoint) = bound_endpoint(&listener, lan)?;
-        let guard = ProxyGuard::apply(adb_path, serial, &endpoint)?;
+        // Routing is by source address, but an address we cannot read must not be fatal:
+        // the route simply starts unbound and the first connection claims it. Guessing or
+        // refusing here is what turns "adb could not name the interface" into "no rows".
+        let ip = device_ip(adb_path, serial);
+        let lan = local_lan_ip(ip).ok_or_else(|| "无法确定本机局域网地址".to_string())?;
         let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_shared = Arc::clone(&shared);
-        let thread_stop = Arc::clone(&stop);
-        let allowed = device.map(|d| d.to_string()).unwrap_or_default();
-        let allowed_for_thread = allowed.clone();
-        let local_addr = lan.to_string();
-        let thread = std::thread::spawn(move || {
-            let allowed = allowed_for_thread.as_str();
-            let local_addr = local_addr.as_str();
-            while !thread_stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, peer)) => {
-                        let mut stream = match prepare_client(stream) {
-                            Ok(stream) => stream,
-                            Err(reason) => {
-                                proxy_log(offset_secs, &format!("{reason}"));
-                                continue;
-                            }
-                        };
-                        let source = match peer.ip() {
-                            std::net::IpAddr::V4(v4) => v4.to_string(),
-                            std::net::IpAddr::V6(v6) => v6.to_string(),
-                        };
-                        // Only the paired device (and this machine) may use the proxy.
-                        // It binds to a LAN address, so without this check anyone on the
-                        // same network could route traffic through the desktop app.
-                        if !allowed.is_empty()
-                            && source != allowed
-                            && source != local_addr
-                            && source != "127.0.0.1"
-                            && source != "::1"
-                        {
-                            // Do not close silently: a changed device IP (DHCP renew,
-                            // Wi-Fi reassociation) would otherwise look exactly like an
-                            // upstream EOF on the device, with nothing in the log.
-                            eprintln!(
-                                "[proxy] 拒绝来源 {source}：仅允许设备 {allowed} 与本机访问（设备 IP 变化时请重新开始采集）"
-                            );
-                            write_error_response(
-                                &mut stream,
-                                "403 Forbidden",
-                                "该代理仅允许已连接的 Android 设备使用",
-                            );
-                            drop(stream);
-                            continue;
-                        }
-                        let shared = Arc::clone(&thread_shared);
-                        let stop = Arc::clone(&thread_stop);
-                        std::thread::spawn(move || {
-                            handle_connection(stream, &source, shared, stop, offset_secs)
-                        });
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(40));
-                    }
-                    // A client can vanish between SYN and accept(); that aborts this one
-                    // connection, not the capture. Treating it as fatal used to close the
-                    // listener while the device proxy stayed behind.
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::Interrupted
-                            || e.kind() == std::io::ErrorKind::ConnectionAborted
-                            || e.kind() == std::io::ErrorKind::ConnectionReset =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => {
-                        if let Ok(mut buffer) = thread_shared.lock() {
-                            buffer.error = format!("代理监听异常: {e}");
-                            buffer.finished = true;
-                        }
-                        return;
-                    }
-                }
+        let endpoint = hub.attach(
+            Route {
+                serial: serial.to_string(),
+                ip,
+                offset_secs,
+                shared: Arc::clone(&shared),
+                stop: Arc::clone(&stop),
+            },
+            lan,
+            port,
+        )?;
+        let guard = match ProxyGuard::apply(adb_path, serial, &endpoint) {
+            Ok(guard) => guard,
+            Err(e) => {
+                // The route exists but the device could not be pointed at it. Leaving it
+                // behind would keep the listener alive for a device that never talks.
+                hub.detach(serial);
+                return Err(e);
             }
-            if let Ok(mut buffer) = thread_shared.lock() {
-                buffer.finished = true;
-            }
-        });
-
+        };
         Ok(Self {
             session_id,
             serial: serial.to_string(),
-            port: bound_port,
             info: ProxyCaptureInfo {
                 endpoint,
-                device_ip: device.map(|d| d.to_string()).unwrap_or_default(),
-                allowed_sources: if allowed.is_empty() {
-                    "未识别设备 IP：仅本机回环可用".to_string()
-                } else {
-                    format!("{allowed} + 127.0.0.1")
+                device_ip: ip.map(|addr| addr.to_string()).unwrap_or_default(),
+                allowed_sources: match ip {
+                    Some(addr) => format!("{addr}（按来源 IP 分发）"),
+                    // Say it out loud: the capture will still record rows, they are simply
+                    // attributed to this device without an address check.
+                    None => "未识别到设备 IP，按唯一设备归属".to_string(),
                 },
             },
             shared,
             stop,
             guard: Some(guard),
-            thread: Some(thread),
+            hub: Arc::clone(hub),
         })
     }
 
@@ -1129,10 +1490,6 @@ impl ProxyCapture {
 
     pub fn serial(&self) -> &str {
         &self.serial
-    }
-
-    pub fn port(&self) -> u16 {
-        self.port
     }
 
     /// Drop rows the UI has not polled yet. Without this, clearing the table would be
@@ -1159,10 +1516,12 @@ impl ProxyCapture {
         };
         let finished = !status.running;
         drop(buffer);
-        // The listener can die on its own (accept error) without anyone calling stop().
-        // Restore here as well: the guard must not depend on a UI button that may already
-        // be disabled because the capture reports itself as finished.
+        // The shared listener can die on its own (accept error) without anyone calling
+        // stop(). Leave the routing table and restore here as well: the guard must not
+        // depend on a UI button that may already be disabled because the capture reports
+        // itself as finished.
         if finished {
+            self.hub.detach(&self.serial);
             if let Some(mut guard) = self.guard.take() {
                 if let Err(e) = guard.restore() {
                     let message = if status.error.is_empty() {
@@ -1181,15 +1540,13 @@ impl ProxyCapture {
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
+        // Stop this device's in-flight connections, then leave the routing table: while the
+        // route exists the hub keeps the listener open and keeps accepting its traffic.
         self.stop.store(true, Ordering::Relaxed);
+        self.hub.detach(&self.serial);
         let mut errors = Vec::new();
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                errors.push("代理监听线程异常退出".to_string());
-            }
-        }
-        // Restore unconditionally: the listener being gone says nothing about whether the
-        // device still points at it.
+        // Restore unconditionally: the route being gone says nothing about whether the
+        // device still points at the proxy.
         if let Some(mut guard) = self.guard.take() {
             if let Err(e) = guard.restore() {
                 errors.push(e);
@@ -1206,6 +1563,9 @@ impl ProxyCapture {
 impl Drop for ProxyCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // A dropped capture must leave the routing table too, otherwise the hub keeps a
+        // listener open for a device nothing will ever poll.
+        self.hub.detach(&self.serial);
         // ProxyGuard::drop restores the original proxy even if stop() was never called.
     }
 }
@@ -1224,6 +1584,190 @@ mod tests {
             listener.local_addr().unwrap(),
             "设备必须被告知真正监听的端口，而不是 :0"
         );
+    }
+
+    /// The reported bug: a second device could not start a proxy capture because the
+    /// first one still held the fixed port. The capture must move to another port instead
+    /// of failing, since the device learns the real endpoint from the listener.
+    #[test]
+    fn a_taken_port_falls_back_instead_of_failing_the_capture() {
+        let held = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let listener = bind_listener(Ipv4Addr::LOCALHOST, taken).expect("占用时应回退到系统分配端口");
+        let bound = listener.local_addr().unwrap().port();
+        assert_ne!(bound, taken, "回退后不能仍是那个已被占用的端口");
+        assert_ne!(bound, 0, "回退端口必须是真实端口，否则设备无法连上");
+        drop(held);
+    }
+
+    fn route(serial: &str, ip: [u8; 4]) -> Route {
+        Route {
+            serial: serial.to_string(),
+            ip: Some(Ipv4Addr::from(ip)),
+            offset_secs: 0,
+            shared: Arc::new(Mutex::new(ProxyBuffer::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A device whose address adb could not read.
+    fn unbound_route(serial: &str) -> Route {
+        Route {
+            ip: None,
+            ..route(serial, [0, 0, 0, 0])
+        }
+    }
+
+    fn port_of(endpoint: &str) -> u16 {
+        endpoint
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse().ok())
+            .expect("endpoint 应形如 host:port")
+    }
+
+    /// The whole point of the hub: a second device joins the running listener instead of
+    /// asking the OS for another port.
+    #[test]
+    fn several_devices_share_the_same_listener() {
+        let hub = ProxyHub::new();
+        let lan = Ipv4Addr::LOCALHOST;
+        let first = hub
+            .attach(route("SERIAL-A", [192, 168, 1, 20]), lan, 0)
+            .expect("第一台设备应能启动");
+        let second = hub
+            .attach(route("SERIAL-B", [192, 168, 1, 21]), lan, 0)
+            .expect("第二台设备应复用同一个监听");
+        assert_eq!(first, second, "两台设备必须被指向同一个 endpoint");
+        assert_eq!(hub.routes.lock().unwrap().len(), 2);
+    }
+
+    /// …and the port goes back to the OS once the last device leaves, so a later capture
+    /// (or any other app) can have it again.
+    #[test]
+    fn the_listener_closes_when_the_last_device_leaves() {
+        let hub = ProxyHub::new();
+        let lan = Ipv4Addr::LOCALHOST;
+        let endpoint = hub
+            .attach(route("SERIAL-A", [192, 168, 1, 20]), lan, 0)
+            .unwrap();
+        hub.attach(route("SERIAL-B", [192, 168, 1, 21]), lan, 0).unwrap();
+
+        hub.detach("SERIAL-A");
+        assert!(
+            hub.slot.lock().unwrap().is_some(),
+            "还有设备在用时监听不能关"
+        );
+
+        hub.detach("SERIAL-B");
+        assert!(hub.slot.lock().unwrap().is_none(), "最后一台设备离开后应关闭监听");
+        TcpListener::bind((Ipv4Addr::LOCALHOST, port_of(&endpoint)))
+            .expect("端口应已释放，可以被再次绑定");
+    }
+
+    /// A machine with two NICs would need a second bind address while the first device is
+    /// still pointed at the old one; refusing is the only answer that keeps that device
+    /// working, so it must be an explicit error rather than a silent rebind.
+    #[test]
+    fn a_second_network_cannot_steal_a_listener_that_is_in_use() {
+        let hub = ProxyHub::new();
+        let endpoint = hub
+            .attach(route("SERIAL-A", [192, 168, 1, 20]), Ipv4Addr::LOCALHOST, 0)
+            .unwrap();
+        let err = hub
+            .attach(
+                route("SERIAL-B", [10, 0, 0, 21]),
+                Ipv4Addr::new(127, 0, 0, 2),
+                0,
+            )
+            .expect_err("已有设备在用旧网段时应拒绝，而不是悄悄改绑");
+        assert!(
+            err.contains(&endpoint),
+            "错误里要说明设备当前指向哪里：{err}"
+        );
+    }
+
+    #[test]
+    fn one_address_belongs_to_one_device() {
+        let hub = ProxyHub::new();
+        let lan = Ipv4Addr::LOCALHOST;
+        hub.attach(route("SERIAL-A", [192, 168, 1, 20]), lan, 0).unwrap();
+        // Same IP, different serial: the second one could never tell its rows apart.
+        let err = hub
+            .attach(route("SERIAL-B", [192, 168, 1, 20]), lan, 0)
+            .expect_err("同一个 IP 不能绑定两台设备");
+        assert!(err.contains("192.168.1.20"), "错误里应说明是哪个 IP：{err}");
+    }
+
+    #[test]
+    fn a_connection_is_attributed_by_its_source_address() {
+        let two = vec![
+            route("SERIAL-A", [192, 168, 1, 20]),
+            route("SERIAL-B", [192, 168, 1, 21]),
+        ];
+
+        let hit = route_for(&two, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 21)))
+            .expect("应按来源 IP 命中第二台设备");
+        assert_eq!(hit.serial, "SERIAL-B");
+
+        // An unregistered address must not be guessed at while several devices are bound.
+        assert!(route_for(&two, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))).is_none());
+        assert!(route_for(&two, IpAddr::V4(Ipv4Addr::LOCALHOST)).is_none());
+    }
+
+    /// The regression this guards: an address adb could not read (or that changed after a
+    /// DHCP renew) must not silently stop a capture from recording anything.
+    #[test]
+    fn one_device_claims_every_source_when_its_address_is_unknown() {
+        let unbound = vec![unbound_route("SERIAL-A")];
+        assert_eq!(
+            route_for(&unbound, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99)))
+                .map(|r| r.serial.as_str()),
+            Some("SERIAL-A"),
+            "地址未知时，唯一设备应认领未登记来源"
+        );
+
+        // A known address but a different source: still the only device, still its traffic.
+        let single = vec![route("SERIAL-A", [192, 168, 1, 20])];
+        assert_eq!(
+            route_for(&single, IpAddr::V4(Ipv4Addr::LOCALHOST)).map(|r| r.serial.as_str()),
+            Some("SERIAL-A"),
+            "只有一台设备时，来源没有歧义，本机调试流量也应归属到它"
+        );
+
+        // Several devices: only a device whose address was never learned may claim traffic,
+        // and only when it is the single such device.
+        let mixed = vec![
+            route("SERIAL-A", [192, 168, 1, 20]),
+            unbound_route("SERIAL-B"),
+        ];
+        assert_eq!(
+            route_for(&mixed, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99)))
+                .map(|r| r.serial.as_str()),
+            Some("SERIAL-B")
+        );
+        let two_unbound = vec![unbound_route("SERIAL-A"), unbound_route("SERIAL-B")];
+        assert!(
+            route_for(&two_unbound, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))).is_none(),
+            "两台地址未知的设备无法区分，应拒绝而不是瞎猜"
+        );
+    }
+
+    #[test]
+    fn the_device_address_is_read_from_any_interface_not_just_wlan0() {
+        // Real output of `ip -o -f inet addr show`, plus the usual noise.
+        let emulator = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n\
+2: eth0    inet 10.0.2.15/24 brd 10.0.2.255 scope global eth0\\       valid_lft forever\n";
+        assert_eq!(best_private_ip(emulator), Some(Ipv4Addr::new(10, 0, 2, 15)));
+
+        // A phone with both Wi-Fi and a tethered interface: Wi-Fi wins.
+        let phone = "2: dummy0    inet 192.0.2.1/24 scope global dummy0\n\
+3: wlan0    inet 172.21.33.28/24 brd 172.21.33.255 scope global wlan0\n\
+4: rndis0    inet 192.168.42.129/24 brd 192.168.42.255 scope global rndis0\n";
+        assert_eq!(best_private_ip(phone), Some(Ipv4Addr::new(172, 21, 33, 28)));
+
+        // IPv6-only and loopback-only output must not invent an address.
+        assert_eq!(best_private_ip("1: lo    inet 127.0.0.1/8 scope host lo\n"), None);
+        assert_eq!(best_private_ip(""), None);
     }
 
     /// The ignored tests below temporarily own the device-wide proxy. If the desktop
@@ -1398,6 +1942,58 @@ mod tests {
         assert_eq!(rows[0].source, "proxy");
     }
 
+    /// The path that a real device takes: shared listener → route lookup → per-device
+    /// buffer. `handle_connection` is exercised elsewhere, but a break in the hub (wrong
+    /// route, no listener, buffer not shared) shows up here as "the table stays empty".
+    #[test]
+    fn a_request_through_the_shared_listener_lands_in_its_device_buffer() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let hub = ProxyHub::new();
+        let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
+        // No address: this is exactly the case that used to route nothing at all.
+        let route = Route {
+            serial: "SERIAL-A".to_string(),
+            ip: None,
+            offset_secs: 0,
+            shared: Arc::clone(&shared),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let endpoint = hub.attach(route, Ipv4Addr::LOCALHOST, 0).expect("应能启动监听");
+
+        let mut client = TcpStream::connect(&endpoint).expect("应能连上共享监听");
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/hub-probe HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"), "客户端应收到真实响应");
+
+        let mut rows = Vec::new();
+        for _ in 0..100 {
+            rows = shared.lock().unwrap().pending.clone();
+            if !rows.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(rows.len(), 1, "经共享监听进来的请求必须落到这台设备的 buffer");
+        assert_eq!(rows[0].path, "/hub-probe");
+        assert_eq!(rows[0].status, 200);
+        server.join().unwrap();
+        hub.detach("SERIAL-A");
+    }
+
     /// The mojibake in the detail panel: a gzipped, chunked JSON reply was stored with its
     /// transport framing, so the text began with `23a` and continued with binary bytes.
     #[test]
@@ -1427,6 +2023,43 @@ mod tests {
         // A truncated capture still yields the plaintext decoded so far.
         let truncated = &chunked[..chunked.len() / 2];
         assert!(!decode_body(truncated, true, "gzip").is_empty());
+    }
+
+    #[test]
+    fn large_bodies_are_capped_and_flagged_instead_of_silently_truncated() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        // 展示副本按上限截断，但标记一旦为真就保持为真；转发字节不受影响。
+        let mut capture = BodyCapture::default();
+        let chunk = vec![b'x'; 8 * 1024];
+        for _ in 0..(MAX_BODY / chunk.len() + 2) {
+            capture.append(&chunk);
+        }
+        assert_eq!(capture.bytes.len(), MAX_BODY);
+        assert!(capture.truncated);
+        capture.append(b"more");
+        assert_eq!(capture.bytes.len(), MAX_BODY);
+
+        // 恰好等于上限是完整的，不能误报。
+        let mut exact = BodyCapture::default();
+        exact.append(&vec![b'x'; MAX_BODY]);
+        assert!(!exact.truncated);
+
+        // gzip 压缩比高：原始字节未超限，解压后的 JSON 也可能超限，必须同样标记。
+        let json = format!(r#"{{"code":0,"data":"{}"}}"#, "a".repeat(MAX_BODY));
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json.as_bytes()).unwrap();
+        let gz = encoder.finish().unwrap();
+        assert!(gz.len() < MAX_BODY);
+        let (out, truncated) = decode_body_capped(&gz, false, "gzip");
+        assert!(truncated);
+        assert_eq!(out.len(), MAX_BODY);
+
+        // 短响应照常完整返回，不标记。
+        let (out, truncated) = decode_body_capped(br#"{"code":0}"#, false, "");
+        assert!(!truncated);
+        assert_eq!(out, br#"{"code":0}"#);
     }
 
     #[test]
@@ -1663,7 +2296,8 @@ mod tests {
                 .unwrap();
         });
 
-        let mut capture = ProxyCapture::start(&adb_path, &serial, 0, 0, "test".into())
+        let hub = Arc::new(ProxyHub::new());
+        let mut capture = ProxyCapture::start(&hub, &adb_path, &serial, 0, 0, "test".into())
             .expect("应能启动原生接口采集");
         let endpoint = capture.info().endpoint.clone();
         let mut client = TcpStream::connect(&endpoint).expect("应能连上内建代理");

@@ -7,11 +7,12 @@
 use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult, SearchHits};
 use crate::netcapture::{AnyCapture, ProxyGuard};
 use crate::network::NetworkRequest;
+use crate::proxy::ProxyHub;
 use crate::rules::{compute_matches, CompiledFilter, TextMatcher};
 use crate::stream::DeviceStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 const MAX_CACHED_QUERIES: usize = 12;
@@ -80,7 +81,14 @@ impl LogSession {
         let matcher = TextMatcher::new(&filter.search, filter.is_regex, filter.case_sensitive)?
             .ok_or_else(|| "请先输入查找关键字".to_string())?;
         let compiled = CompiledFilter::compile(filter)?;
-        let indices = self.matched_indices(filter, &compiled);
+        let mut indices = self.matched_indices(filter, &compiled);
+
+        // Hit list is documented as "display order". `matched_indices` is always file order,
+        // so a descending view has to flip it — otherwise "next" walks up the screen while
+        // the counter still reads 3/27. Reversing the clone leaves the cached list untouched.
+        if filter.order.eq_ignore_ascii_case("desc") {
+            indices.reverse();
+        }
 
         let mut hits: Vec<u32> = Vec::new();
         let mut total: u32 = 0;
@@ -186,6 +194,14 @@ pub struct AppState {
     pub network_sessions: Mutex<HashMap<String, NetworkSession>>,
     /// One proxy guard per device. Dropping the guard restores the previous setting.
     pub proxy_guards: Mutex<HashMap<String, ProxyGuard>>,
+    /// Serials whose proxy capture is *currently starting*. The duplicate check and the
+    /// actual start are separated by several `adb` round trips, so without a reservation
+    /// two near-simultaneous starts would both install a guard — and the second would
+    /// remember the first's endpoint as "the original setting" to restore.
+    starting_proxies: Mutex<HashSet<String>>,
+    /// One proxy listener shared by every device. Created on first use so the tests and the
+    /// file-import paths never bind a socket they do not need.
+    proxy_hub: OnceLock<Arc<ProxyHub>>,
     /// Abort flags for in-flight file imports, keyed by the frontend's request id. The flag
     /// is shared with the parsing thread because a cancelled import cannot use the session
     /// lock (it has no session yet).
@@ -201,6 +217,8 @@ impl Default for AppState {
             network_captures: Mutex::new(HashMap::new()),
             network_sessions: Mutex::new(HashMap::new()),
             proxy_guards: Mutex::new(HashMap::new()),
+            starting_proxies: Mutex::new(HashSet::new()),
+            proxy_hub: OnceLock::new(),
             import_cancels: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
         }
@@ -210,6 +228,29 @@ impl Default for AppState {
 impl AppState {
     pub fn next_id(&self) -> String {
         format!("s{}", self.seq.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The process-wide proxy listener. Every native capture joins it, so all devices share
+    /// one port and are told apart by source address.
+    pub fn proxy_hub(&self) -> Arc<ProxyHub> {
+        Arc::clone(self.proxy_hub.get_or_init(|| Arc::new(ProxyHub::new())))
+    }
+
+    /// Claim the right to start a proxy capture for `serial`. `None` means another start
+    /// for the same device is already in flight. The returned guard releases the claim on
+    /// drop (success *or* failure), so a failed start never locks the device out.
+    pub fn begin_proxy_start(&self, serial: &str) -> Option<ProxyStartGuard<'_>> {
+        let mut starting = self
+            .starting_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !starting.insert(serial.to_string()) {
+            return None;
+        }
+        Some(ProxyStartGuard {
+            state: self,
+            serial: serial.to_string(),
+        })
     }
 
     /// Kill every live capture and undo every device-side change. Called when the window
@@ -235,6 +276,24 @@ impl AppState {
         }
         let mut guards = self.proxy_guards.lock().unwrap_or_else(|p| p.into_inner());
         guards.clear(); // ProxyGuard::drop restores the original proxy
+    }
+}
+
+/// Releases a [`AppState::begin_proxy_start`] claim. Dropping it is the only way to free
+/// the device for the next start, which is why it is returned instead of a bool.
+pub struct ProxyStartGuard<'a> {
+    state: &'a AppState,
+    serial: String,
+}
+
+impl Drop for ProxyStartGuard<'_> {
+    fn drop(&mut self) {
+        let mut starting = self
+            .state
+            .starting_proxies
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        starting.remove(&self.serial);
     }
 }
 
@@ -290,6 +349,16 @@ mod tests {
         let result = s.query(&filter, 0, 50).expect("查询应成功");
         assert_eq!(result.matched, 4, "find 模式不能改变结果集");
         assert_eq!(result.total, 4);
+    }
+
+    #[test]
+    fn find_follows_display_order_when_descending() {
+        let mut s = session();
+        let mut filter = find_filter("alpha");
+        filter.order = "desc".to_string();
+        let hits = s.find(&filter, 100).expect("查找应成功");
+        // 显示顺序是倒序：文件里靠后的命中要先出现。
+        assert_eq!(hits.indices, vec![2, 0]);
     }
 
     #[test]

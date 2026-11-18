@@ -13,6 +13,7 @@ import type {
   Rule,
   RuleCategory,
   RulesView,
+  SearchHistoryEntry,
   SearchHits,
   StreamStatus,
   CdpCaptureOptions,
@@ -123,6 +124,14 @@ export const ipc = {
     call<RulesView>('import_rules_from_file', { path }),
   exportRulesJson: () => call<string>('export_rules_json'),
   importRulesJson: (json: string) => call<RulesView>('import_rules_json', { json }),
+
+  // --- search keyword history ---
+  listSearchHistory: () => call<SearchHistoryEntry[]>('list_search_history'),
+  rememberSearch: (keyword: string, mode: string, isRegex: boolean, caseSensitive: boolean) =>
+    call<SearchHistoryEntry[]>('remember_search', { keyword, mode, isRegex, caseSensitive }),
+  deleteSearchHistory: (index: number) =>
+    call<SearchHistoryEntry[]>('delete_search_history', { index }),
+  clearSearchHistory: () => call<SearchHistoryEntry[]>('clear_search_history'),
 
   listCapturePackages: (serial: string) =>
     call<string[]>('list_capture_packages', { serial }),

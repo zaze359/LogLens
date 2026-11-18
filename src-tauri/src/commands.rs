@@ -8,7 +8,7 @@ use crate::logcat::{self, LogcatParser, ParseOutcome};
 use crate::model::{
     CdpCaptureOptions, DeviceCaptureOptions, FileInfo, FilterSpec, LogEntry, NetworkPollResult,
     NetworkSessionInfo, OpenProgress, ProxyCaptureOptions, ProxyState, QueryResult, Rule,
-    RuleCategory, SearchHits, StreamStatus,
+    RuleCategory, SearchHistoryEntry, SearchHits, StreamStatus,
 };
 use crate::rules::CompiledFilter;
 use crate::session::{AppState, LogSession, NetworkSession};
@@ -802,11 +802,17 @@ pub fn import_rules_json(app: AppHandle, json: String) -> Result<RulesView, Stri
 
 // --- Device network capture -------------------------------------------------
 
-/// Default local port for a CDP capture. Different from `netprobe::PROBE_PORT` so a
+/// Preferred local port for a CDP capture. Different from `netprobe::PROBE_PORT` so a
 /// one-shot capability probe never steals the port of a running capture.
+///
+/// Both ports below are **preferences only**: the local end of a capture is a single
+/// machine-wide resource while captures are per device, so when the number is already
+/// taken (a capture left on an unplugged phone, a second device, another app) the capture
+/// moves to an OS-assigned port instead of failing with `Address already in use`.
 const CDP_PORT: u16 = 19333;
-/// Built-in proxy port. Distinct from CDP_PORT and netprobe::PROBE_PORT so the three
-/// channels can run at the same time without stealing each other's local port.
+/// Preferred local port for the built-in proxy. Distinct from CDP_PORT and
+/// netprobe::PROBE_PORT so the three channels can run at the same time without stealing
+/// each other's local port.
 const PROXY_PORT: u16 = 18999;
 
 fn require_adb() -> Result<std::path::PathBuf, String> {
@@ -867,14 +873,16 @@ pub fn start_cdp_capture(
     };
     let port = if options.port == 0 { CDP_PORT } else { options.port };
 
-    // Unlike logcat, one device may have several WebView sockets, but one local port can
-    // only be forwarded once. Refuse a second capture on the same (serial, port) pair.
+    // One CDP capture per device. The panel follows the device's first devtools socket, so
+    // a second capture would duplicate every row and fight over the same `adb forward`.
+    // Comparing by serial rather than by port also keeps this correct now that `start_cdp`
+    // may move to a fallback port when the preferred one is taken.
     {
         let captures = state
             .network_captures
             .lock()
             .map_err(|e| format!("状态锁异常: {e}"))?;
-        if captures.values().any(|c| c.serial() == serial && c.port() == port) {
+        if captures.values().any(|c| c.serial() == serial && !c.is_proxy()) {
             return Err("该设备已有一个正在运行的 WebView 采集，请先停止它".to_string());
         }
     }
@@ -926,6 +934,14 @@ pub fn start_proxy_capture(
     let adb_path = require_adb()?;
     let port = if options.port == 0 { PROXY_PORT } else { options.port };
 
+    // The checks below are check-then-act, and `ProxyCapture::start` does several `adb`
+    // round trips afterwards. Two rapid clicks (or two windows) used to be caught by the
+    // port conflict; now that a taken port falls back instead of failing, only this
+    // reservation keeps a device from ending up with two guards and no way to restore.
+    let Some(_starting) = state.begin_proxy_start(&serial) else {
+        return Err("该设备正在启动原生接口采集，请稍候再试".to_string());
+    };
+
     {
         let guards = state
             .proxy_guards
@@ -945,6 +961,7 @@ pub fn start_proxy_capture(
 
     let id = format!("net-{}", state.next_id());
     let capture = ProxyCapture::start(
+        &state.proxy_hub(),
         &adb_path,
         &serial,
         port,
@@ -1257,4 +1274,35 @@ pub fn export_error_log(dest_path: String) -> Result<usize, String> {
     let text = crate::error_log::export_text();
     fs::write(&dest_path, &text).map_err(|e| format!("写入错误日志文件失败: {e}"))?;
     Ok(text.len())
+}
+
+// --- search keyword history (persisted convenience state) ---
+
+#[tauri::command]
+pub fn list_search_history(app: tauri::AppHandle) -> Vec<SearchHistoryEntry> {
+    config_store::load_search_history(&app)
+}
+
+#[tauri::command]
+pub fn remember_search(
+    app: tauri::AppHandle,
+    keyword: String,
+    mode: String,
+    is_regex: bool,
+    case_sensitive: bool,
+) -> Result<Vec<SearchHistoryEntry>, String> {
+    config_store::remember_search(&app, &keyword, &mode, is_regex, case_sensitive)
+}
+
+#[tauri::command]
+pub fn delete_search_history(
+    app: tauri::AppHandle,
+    index: usize,
+) -> Result<Vec<SearchHistoryEntry>, String> {
+    config_store::delete_search_history(&app, index)
+}
+
+#[tauri::command]
+pub fn clear_search_history(app: tauri::AppHandle) -> Result<Vec<SearchHistoryEntry>, String> {
+    config_store::clear_search_history(&app)
 }
