@@ -41,6 +41,56 @@ function sourceLabel(source: string): string {
   return source
 }
 
+/**
+ * 流程 scope 的短标签。列表里显示人话，完整 scope 放在 title 里，排查时仍能精确检索。
+ * 未登记的 scope 原样显示，新模块不需要改这里。
+ */
+function scopeLabel(scope: string): string {
+  const known: Array<[RegExp, string]> = [
+    [/^capture\.poll\./, '采集轮询'],
+    [/^capture\.ui\.poll$/, 'UI 合并'],
+    [/^capture\.rows$/, '收到请求'],
+    [/^capture\.ui\.start$/, '抓包启动'],
+    [/^capture\.start$/, '抓包启动'],
+    [/^capture\.cdp\./, 'H5 读取'],
+    [/^capture\.file$/, '抓包文件'],
+    [/^proxy\.apply$/, '设备代理'],
+    [/^proxy\./, '代理'],
+    [/^device\.stream/, '设备实时流'],
+    [/^file\.open/, '日志导入'],
+    [/^app\./, '应用'],
+    [/^ui\.notice$/, '操作提示'],
+    [/^ui\.tab$/, '标签'],
+    [/^session\.close$/, '会话'],
+    [/^export\./, '导出'],
+    [/^import\./, '导入']
+  ]
+  return known.find(([pattern]) => pattern.test(scope))?.[1] ?? scope
+}
+
+/** 流程 detail 直接铺成一行，不用点开也能看到新增/累计/可见等关键数字。 */
+function flowDetail(r: ErrorRecord): string {
+  if (!r.detail) return ''
+  try {
+    const parsed: unknown = JSON.parse(r.detail)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return Object.entries(parsed as Record<string, unknown>)
+        .map(([key, value]) => {
+          const text = Array.isArray(value)
+            ? value.join(',')
+            : typeof value === 'object' && value !== null
+              ? JSON.stringify(value)
+              : String(value)
+          return `${key}=${text}`
+        })
+        .join(' · ')
+    }
+  } catch {
+    // 后端 detail 是 `id=… rows=…` 形式，不是 JSON，按原文显示。
+  }
+  return r.detail
+}
+
 /** New modules can start emitting their own source without a UI change. */
 const sourceOptions = computed<string[]>(() => {
   const options = ['', 'rust', 'frontend', 'flow', 'capture']
@@ -146,17 +196,32 @@ async function copyVisible(): Promise<void> {
         </div>
 
         <div v-for="r in records" :key="r.id" class="error-row" :class="`el-${r.level}`">
-          <div class="error-row-head" @click="r.detail && toggle(r.id)">
+          <div
+            class="error-row-head"
+            @click="r.level !== 'info' && r.detail && toggle(r.id)"
+          >
             <span class="el-time mono">{{ time(r.ts) }}</span>
             <span class="el-level" :class="`el-lv-${r.level}`">{{ r.level }}</span>
             <span class="el-source">{{ r.source }}</span>
-            <span class="el-scope mono">{{ r.scope }}</span>
+            <span class="el-scope mono" :title="r.scope">{{ scopeLabel(r.scope) }}</span>
             <span v-if="r.count > 1" class="el-count">×{{ r.count }}</span>
             <div class="spacer" />
-            <span v-if="r.detail" class="el-caret" :class="{ open: expanded.has(r.id) }">▸</span>
+            <span
+              v-if="r.level !== 'info' && r.detail"
+              class="el-caret"
+              :class="{ open: expanded.has(r.id) }"
+              >▸</span
+            >
           </div>
           <div class="error-message">{{ r.message }}</div>
-          <pre v-if="r.detail && expanded.has(r.id)" class="error-detail mono">{{ r.detail }}</pre>
+          <div v-if="r.level === 'info' && r.detail" class="error-flow-detail mono">
+            {{ flowDetail(r) }}
+          </div>
+          <pre
+            v-if="r.level !== 'info' && r.detail && expanded.has(r.id)"
+            class="error-detail mono"
+            >{{ r.detail }}</pre
+          >
         </div>
       </div>
 

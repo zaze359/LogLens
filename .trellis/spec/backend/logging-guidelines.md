@@ -58,7 +58,9 @@ symptom; a checkpoint trail names the last stage reached and the counters at tha
 - UI filter: level `info` is labelled 流程, source `flow` is labelled 流程
   (`capture` is kept only for records written before this convention). All notices are
   recorded through `setNotice`, so a workflow that already reports to the user is covered
-  automatically. Badge counts only non-`info` records.
+  automatically. Badge counts only non-`info` records. `info` details render inline
+  (no click) and scopes map to short stage names, so a successful capture still shows
+  "start → proxy → first rows → poll/UI" at a glance.
 
 ---
 

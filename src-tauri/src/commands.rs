@@ -1090,14 +1090,27 @@ pub fn poll_network_capture(
         .ok_or_else(|| "网络请求会话已失效".to_string())?;
     let source = session.source.clone();
     let serial = session.device.clone();
+    let first_batch = session.requests.is_empty() && added > 0;
     for mut request in pending {
         request.index = session.requests.len() as u32;
         session.requests.push(request);
     }
     status.entry_count = session.requests.len() as u32;
+    if first_batch {
+        // A clear success marker: with only "poll" rows in the log, "did any traffic
+        // ever arrive?" is impossible to answer at a glance.
+        capture_flow(
+            "capture.rows",
+            "收到第一批请求",
+            &format!(
+                "id={id} source={source} serial={serial} rows={} events={}",
+                status.entry_count, status.events
+            ),
+        );
+    }
     capture_flow(
         &format!("capture.poll.{id}"),
-        "采集轮询",
+        "后端快照",
         &format!(
             "id={id} source={source} serial={serial} added={added} rows={} events={} running={} error={}",
             status.entry_count, status.events, status.running, status.error

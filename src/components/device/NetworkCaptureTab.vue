@@ -75,9 +75,10 @@ let clearEpoch = 0
 function traceFlow(scope: string, message: string, detail: Record<string, unknown>): void {
   reportClientFlow(scope, message, JSON.stringify(detail))
 }
-const POLL_TRACE_INTERVAL = 5000
+const POLL_HEARTBEAT_MS = 30_000
 let lastPollSignature = ''
 let lastPollTraceAt = 0
+let lastUiHadRows = false
 
 const cdpSocket = computed(() => report.value?.evidence.devtools[0]?.socket ?? '')
 /** 体检与两条通道的启动都要走 adb；adb 断开后这些操作只会失败，直接禁用并说明。 */
@@ -463,18 +464,28 @@ async function pollAll(): Promise<void> {
   const anyRunning = snapshots.some((s) => s.running)
   const errors = snapshots.map((s) => s.error).filter(Boolean)
   const visible = filteredRequests.value.length
-  const signature = [backendRows, backendEvents, merged.length, visible, anyRunning, errors.join('|')].join('/')
+  // Counts change on every row; using them in the signature would write one record per
+  // request. Log state transitions instead, plus a 30s heartbeat that refreshes detail.
+  const signature = [
+    anyRunning,
+    errors.join('|'),
+    backendRows > 0,
+    merged.length > 0,
+    visible > 0
+  ].join('/')
   let checkpoint = '轮询快照'
   if (backendRows > 0 && merged.length === 0) checkpoint = '⚠ 后端已有请求，UI 未收到'
   else if (merged.length > 0 && visible === 0) checkpoint = '⚠ 请求被筛选或时间区间隐藏'
   else if (backendEvents > 0 && backendRows === 0) checkpoint = '⚠ 有抓包事件，但还没有完整请求'
+  else if (merged.length > 0 && !lastUiHadRows) checkpoint = 'UI 已收到请求'
   const traceAt = Date.now()
   if (
     signature !== lastPollSignature ||
-    (anyRunning && traceAt - lastPollTraceAt >= POLL_TRACE_INTERVAL)
+    (anyRunning && traceAt - lastPollTraceAt >= POLL_HEARTBEAT_MS)
   ) {
     lastPollSignature = signature
     lastPollTraceAt = traceAt
+    lastUiHadRows = merged.length > 0
     traceFlow('capture.ui.poll', checkpoint, {
       captures: captures.value.length,
       backendRows,
