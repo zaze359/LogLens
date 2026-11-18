@@ -862,6 +862,14 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .json-modal-body > .jv { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .json-modal-body .jv-edit,
 .json-modal-body .jv-tree { flex: 1; min-height: 320px; }
+/* 全屏：铺满应用窗口，去掉圆角、边框和暗色遮罩；树区同时放开 420px 的高度上限，
+   否则"全屏"只是把外框放大，内容区还是矮的。 */
+.modal-mask.is-fullscreen { background: var(--bg-1); }
+.json-modal.is-fullscreen {
+  width: 100vw; height: 100vh; max-width: none; max-height: none;
+  border: 0; border-radius: 0; box-shadow: none;
+}
+.json-modal.is-fullscreen .jv-tree { max-height: none; }
 .jv-tree {
   padding: 8px 6px 10px; font-size: 11.5px; line-height: 1.7;
   max-height: 420px; overflow: auto;
