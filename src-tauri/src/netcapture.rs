@@ -101,6 +101,35 @@ pub struct ProxyGuard {
 ///    change that actually flushes it.
 const NO_PROXY: &str = ":0";
 
+/// Build the shell script that points the device at our listener.
+///
+/// Mirror `restore_script`: delete every proxy key (a stale split host/port can keep
+/// dialling the *previous* capture's dead port), write the standard no-proxy value to
+/// force ConnectivityService to refresh, then set both the legacy `http_proxy` and the
+/// Android 15 split host/port keys. Without this, a capture can report success while
+/// traffic still follows an old setting.
+fn apply_script(proxy: &str, host: &str, port: &str) -> String {
+    let mut script = String::new();
+    for key in netprobe::PROXY_KEYS {
+        script.push_str(&format!("settings delete global {key} 2>/dev/null; "));
+    }
+    // The value change to `:0` is what actually flushes the inherited Java-level proxy.
+    script.push_str(&format!(
+        "settings put global http_proxy {NO_PROXY} 2>/dev/null; "
+    ));
+    script.push_str(&format!(
+        "settings put global http_proxy '{proxy}' 2>/dev/null; "
+    ));
+    script.push_str(&format!(
+        "settings put global global_http_proxy_host '{host}' 2>/dev/null; "
+    ));
+    script.push_str(&format!(
+        "settings put global global_http_proxy_port '{port}' 2>/dev/null; "
+    ));
+    script.push_str("true");
+    script
+}
+
 fn restore_script(original: &HashMap<String, String>) -> String {
     let mut script = String::new();
     for key in netprobe::PROXY_KEYS {
@@ -290,7 +319,11 @@ fn schedule_restore_retry(
                 &netprobe::proxy_settings_script(),
             ));
             if !current.is_empty() && current != applied {
-                eprintln!("[proxy] {serial}: 设备代理已由其他程序改写，不再自动恢复");
+                crate::error_log::flow_echo(
+                    "proxy.restore",
+                    "设备代理已被其他程序改写，停止自动恢复",
+                    &serial,
+                );
                 break;
             }
             match restore_settings(&adb, &serial, &original) {
@@ -299,13 +332,21 @@ fn schedule_restore_retry(
                     if let Some(generation) = generation {
                         forget_proxy_generation(&serial, generation);
                     }
-                    eprintln!("[proxy] {serial}: 设备重新上线，已补做代理恢复");
+                    crate::error_log::flow_echo(
+                        "proxy.restore",
+                        "设备重新上线，已补做代理恢复",
+                        &serial,
+                    );
                     break;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[proxy] {serial}: 补做代理恢复失败，{} 秒后重试: {e}",
-                        RESTORE_RETRY_INTERVAL.as_secs()
+                    crate::error_log::flow_echo(
+                        "proxy.restore",
+                        "补做代理恢复失败，稍后重试",
+                        &format!(
+                            "serial={serial} retry={}s error={e}",
+                            RESTORE_RETRY_INTERVAL.as_secs()
+                        ),
                     );
                 }
             }
@@ -614,11 +655,13 @@ impl ProxyGuard {
         let original = netprobe::parse_proxy_settings(&before);
         let original_display = netprobe::proxy_from_settings(&before);
 
-        adb::run(
-            adb_path,
-            &proxy_args(serial, &format!("settings put global http_proxy {proxy}")),
-        )
-        .map_err(|e| format!("设置设备代理失败: {e}"))?;
+        crate::error_log::record_flow(
+            "proxy.apply",
+            "设置设备代理",
+            &format!("serial={serial} proxy={proxy} before={original_display}"),
+        );
+        adb::run(adb_path, &proxy_args(serial, &apply_script(proxy, host, port)))
+            .map_err(|e| format!("设置设备代理失败: {e}"))?;
 
         let after_text = adb::shell_probe(adb_path, serial, &script);
         let after = netprobe::parse_proxy_settings(&after_text);
@@ -634,8 +677,23 @@ impl ProxyGuard {
                     .unwrap_or(false));
         if !applied_ok {
             let _ = restore_settings(adb_path, serial, &original);
+            crate::error_log::record_flow(
+                "proxy.apply",
+                "设备代理设置未被接受",
+                &format!("serial={serial} proxy={proxy}"),
+            );
             return Err("设备拒绝了全局代理设置（部分厂商 ROM 忽略该设置）。请在 系统设置 → WLAN → 当前网络 → 高级 → 代理 中手动填写。".to_string());
         }
+        crate::error_log::record_flow(
+            "proxy.apply",
+            "设备代理已生效",
+            &format!(
+                "serial={serial} proxy={proxy} actual={} split_host={} split_port={} note=已运行进程需重启才会走代理",
+                netprobe::proxy_from_settings(&after_text),
+                after.get("global_http_proxy_host").cloned().unwrap_or_default(),
+                after.get("global_http_proxy_port").cloned().unwrap_or_default()
+            ),
+        );
         // Journal *before* returning: if the process is killed a millisecond later,
         // the next start must still know this device needs undoing. If the journal
         // cannot be persisted, refuse to keep the device proxy: otherwise a crash or
@@ -701,7 +759,11 @@ impl Drop for ProxyGuard {
     fn drop(&mut self) {
         if self.active {
             if let Err(e) = self.restore() {
-                eprintln!("恢复设备代理失败（{}）: {e}", self.serial);
+                crate::error_log::flow_echo(
+                    "proxy.restore",
+                    "设备代理恢复失败",
+                    &format!("serial={} error={e}", self.serial),
+                );
             }
         }
     }
@@ -720,6 +782,9 @@ pub struct NetworkCapture {
 }
 
 fn set_error(shared: &Arc<Mutex<CaptureBuffer>>, error: String) {
+    // The UI shows `status.error`, but "nothing on screen" reports rarely mention it.
+    // A flow checkpoint keeps the last reader failure next to the poll counters.
+    crate::error_log::record_flow("capture.cdp.error", "CDP 读取器报错", &error);
     if let Ok(mut buffer) = shared.lock() {
         if buffer.error.is_empty() {
             buffer.error = error;
@@ -800,12 +865,22 @@ impl NetworkCapture {
                 format!("建立 adb forward 失败: {second}（tcp:{port} 与 tcp:{alt} 均不可用）")
             })?;
             eprintln!("[cdp] 本地端口 tcp:{port} 不可用，改用 tcp:{alt}");
+            crate::error_log::record_flow(
+                "capture.cdp.forward",
+                "改用备用转发端口",
+                &format!("serial={serial} preferred={port} actual={alt}"),
+            );
             port = alt;
         }
         let version = cdp::version(port).map_err(|e| {
             let _ = adb::run(adb_path, &adb::forward_remove_args(serial, port));
             format!("WebView 调试端口无响应: {e}")
         })?;
+        crate::error_log::record_flow(
+            "capture.cdp.start",
+            "CDP 调试端口就绪",
+            &format!("id={session_id} serial={serial} port={port} package={}", version.package),
+        );
 
         let shared = Arc::new(Mutex::new(CaptureBuffer {
             target: version.package.clone(),
@@ -816,8 +891,17 @@ impl NetworkCapture {
         let thread_stop = Arc::clone(&stop);
         let adb_path = adb_path.to_path_buf();
         let serial_owned = serial.to_string();
+        let thread_session = session_id.clone();
         let thread = std::thread::spawn(move || {
-            run_cdp_loop(&adb_path, &serial_owned, port, offset_secs, &thread_shared, &thread_stop);
+            run_cdp_loop(
+                &adb_path,
+                &serial_owned,
+                port,
+                offset_secs,
+                &thread_shared,
+                &thread_stop,
+                &thread_session,
+            );
             // The forward belongs to this capture, even if the loop died early.
             let _ = adb::run(&adb_path, &adb::forward_remove_args(&serial_owned, port));
         });
@@ -883,10 +967,12 @@ fn run_cdp_loop(
     offset_secs: i32,
     shared: &Arc<Mutex<CaptureBuffer>>,
     stop: &Arc<AtomicBool>,
+    session_id: &str,
 ) {
     let mut state = CdpState::new(offset_secs);
     let mut failures = 0u32;
     let mut next_id = 1u64;
+    let mut reported_no_page = false;
 
     while !stop.load(Ordering::Relaxed) {
         let targets = match cdp::targets(port) {
@@ -905,10 +991,25 @@ fn run_cdp_loop(
             .iter()
             .find(|t| t.kind == "page" && !t.ws_path.is_empty())
         else {
-            // No H5 page open yet. This is normal right after starting a capture.
+            // No H5 page open yet. This is normal right after starting a capture, but it
+            // is also the most common reason for an empty table — record it once.
+            if !reported_no_page {
+                reported_no_page = true;
+                crate::error_log::record_flow(
+                    "capture.cdp.attach",
+                    "暂无可附加的 H5 页面",
+                    &format!("id={session_id} serial={serial} port={port}"),
+                );
+            }
             idle_sleep(stop);
             continue;
         };
+        reported_no_page = false;
+        crate::error_log::record_flow(
+            "capture.cdp.attach",
+            "已附加 H5 页面",
+            &format!("id={session_id} serial={serial} port={port}"),
+        );
 
         let target_url = if page.url.is_empty() { page.title.clone() } else { page.url.clone() };
         if let Ok(mut buffer) = shared.lock() {
@@ -951,6 +1052,7 @@ fn run_cdp_loop(
                 }
                 Err(e) => {
                     // A dropped WebSocket is recoverable; a real protocol error is not.
+                    crate::error_log::record_flow("capture.cdp.socket", "WebSocket 断开", &e);
                     if let Ok(mut buffer) = shared.lock() {
                         if buffer.error.is_empty() {
                             buffer.error = e;
@@ -964,11 +1066,17 @@ fn run_cdp_loop(
     }
 
     let rows = state.flush();
+    let flushed = rows.len();
     if !rows.is_empty() {
         if let Ok(mut buffer) = shared.lock() {
             buffer.pending.extend(rows);
         }
     }
+    crate::error_log::record_flow(
+        "capture.cdp.end",
+        "CDP 读取结束",
+        &format!("id={session_id} serial={serial} flushed={flushed}"),
+    );
     if let Ok(mut buffer) = shared.lock() {
         buffer.finished = true;
     }
@@ -1266,6 +1374,22 @@ mod tests {
             "http_proxy=:0\nglobal_http_proxy_host=null\nglobal_http_proxy_port=null\n"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn apply_script_clears_stale_keys_and_sets_both_proxy_forms() {
+        let script = apply_script("10.0.0.2:8899", "10.0.0.2", "8899");
+        let delete_at = script
+            .find("settings delete global global_http_proxy_host")
+            .unwrap();
+        let no_proxy_at = script.find("settings put global http_proxy :0").unwrap();
+        let put_at = script
+            .find("settings put global http_proxy '10.0.0.2:8899'")
+            .unwrap();
+        assert!(delete_at < no_proxy_at && no_proxy_at < put_at);
+        assert!(script.contains("settings put global global_http_proxy_host '10.0.0.2'"));
+        assert!(script.contains("settings put global global_http_proxy_port '8899'"));
+        assert!(script.ends_with("true"));
     }
 
     #[test]

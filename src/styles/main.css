@@ -707,6 +707,12 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 
 /* 能力边界：用户只关心支持 / 不支持，所以压成两行，不铺路线推理 */
 .net-capability { margin: 0 0 10px; padding-left: 18px; color: var(--text-dim); font-size: 12px; line-height: 1.7; }
+.net-start-hint {
+  margin: 0 0 10px; padding: 7px 10px; border-radius: 6px;
+  color: #fcd34d; background: rgba(251, 191, 36, .10); border: 1px solid rgba(251, 191, 36, .28);
+  font-size: 12px; line-height: 1.6;
+}
+.net-start-hint b { color: var(--warning); font-weight: 600; }
 .net-capability b { color: var(--text); font-weight: 500; }
 .net-tag { flex: none; font-size: 10px; padding: 1px 6px; border-radius: 8px; color: var(--accent); background: var(--accent-soft); }
 .net-tag.warn { color: var(--warning); background: rgba(251, 191, 36, .14); }
@@ -875,8 +881,14 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
   max-height: 420px; overflow: auto;
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
 }
-.jv-line { display: flex; align-items: baseline; min-height: 19px; white-space: pre-wrap; word-break: break-all; }
+/* 换行只允许发生在 value 自身。key / 标点必须 flex:none + nowrap：
+   否则超长 value 触发 break-all 时，flex-shrink 会把同一行的 key 一起压窄，
+   break-all 再把窄 key 切成碎片（studentAnswerDetail -> st/ude/ntA/...），UI 就散了。
+   value 用 min-width:0 才能在 flex 里真正收缩并换行，续行对齐 value 起始列。 */
+.jv-line { display: flex; align-items: baseline; min-height: 19px; }
 .jv-caret, .jv-caret-space { flex: none; width: 14px; margin-right: 2px; align-self: center; }
+.jv-key, .jv-punc, .jv-folded { flex: none; white-space: nowrap; }
+.jv-value { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; word-break: break-all; }
 .jv-caret {
   height: 14px; padding: 0; background: transparent; border: 0; position: relative;
 }
@@ -947,6 +959,8 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .el-lv-panic { background: rgba(248,113,113,.18); color: #fca5a5; }
 .el-lv-error { background: rgba(251,146,60,.18); color: #fdba74; }
 .el-lv-warning { background: rgba(251,191,36,.18); color: var(--warning); }
+.el-lv-info { background: rgba(56,189,248,.16); color: #7dd3fc; }
+.error-row.el-info { border-left-color: #38bdf8; }
 .el-source { flex: none; color: var(--text-faint); font-size: 10px; }
 .el-scope { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .el-count { flex: none; color: var(--warning); font-size: 10px; }

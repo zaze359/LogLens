@@ -85,10 +85,10 @@ const sourceTitle = computed(() => {
       <button
         class="btn btn-sm error-log-entry"
         :class="{ 'has-new': store.errorLogUnread > 0 }"
-        title="查看客户端自身的崩溃与异常记录"
+        title="查看客户端异常与抓包流程记录"
         @click="openErrorLog"
       >
-        错误日志<span v-if="store.errorLogUnread" class="error-log-badge">{{
+        诊断日志<span v-if="store.errorLogUnread" class="error-log-badge">{{
           store.errorLogUnread > 99 ? '99+' : store.errorLogUnread
         }}</span>
       </button>

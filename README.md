@@ -27,7 +27,7 @@
 | 大文件友好 | ✅ 虚拟滚动 + 后端分页 + 命中索引缓存 |
 | 长行完整显示 | ✅ 消息列按最长行自适应宽度，整表左右滚动，不再用省略号截断 |
 | 导入进度 | ✅ 后台解析 + 按字节的进度卡片，可取消，导入期间界面不冻结 |
-| 客户端错误日志 | ✅ 崩溃 / 未捕获异常 / 命令失败自动落盘，顶栏入口查看、筛选、复制、导出 |
+| 客户端诊断日志 | ✅ 故障 + 各模块流程快照统一落盘，顶栏入口查看、筛选、复制、导出 |
 | 无线配对 / 多文件合并 / 压缩文件 / 其他日志类型 | ⛔ 规划中（见第 13 节） |
 
 ---
@@ -350,6 +350,7 @@ npm run tauri build
 **为什么不解密原生 HTTPS**：Android 7+（targetSdk ≥ 24）默认不信任用户安装的 CA；真机上目标包的 `network_security_config.xml` 只有 `<base-config cleartextTrafficPermitted="true"/>`，**没有 `<debug-overrides>` 放行用户 CA**，且 dex 里能查到 `CertificatePinner` 调用痕迹。设备是 `user` 构建、无 `su`、`adb root` 被拒、系统 CA 位于只读的 APEX conscrypt 内——在「不改 App、不 root、不装 CA」的前提下 MITM 走不通，所以这里明确只做元数据，不把「看见域名」伪装成「看见明文」。反过来，`cleartextTrafficPermitted=true` 让明文 HTTP 能拿到完整内容。
 
 - **代理安全**：绑定本机 LAN IP，只放行配对设备 IP、本机 LAN IP 与回环地址，同网段其他人借不了道；设置前记录原值，停止采集 / 关闭面板 / 退出应用（`ProxyGuard::drop`）都会还原。同一设备只允许一个原生采集（全局代理只有一个），H5 采集可与它并行。
+- **代理只影响新进程**：如果被测 App 在「开始原生接口采集」之前已经在运行，它的进程内 `http.proxyHost` 是启动时从 Zygote 继承的，运行中改 `settings` 不会刷新；已有 keep-alive 连接也会继续复用并绕过代理。表现就是**代理已设置、面板在采集、App 继续请求，但表里一条都没有**。开始采集后面板会常驻提示：请完全退出并重新打开被测 App，再触发请求。设置代理时已同步清掉所有旧键、写入 `:0` 触发刷新，并设置 `http_proxy` 与 Android 15 拆分键两份，确保新进程拿到正确代理。
 - **AOSP 拆键陷阱**：`settings put global http_proxy <host>:<port>` 在真机上会被拆成 `global_http_proxy_host` / `global_http_proxy_port` 存储，只 `settings delete global http_proxy` **清不干净**，会残留一个指向已停监听的死代理，让设备断网。因此还原时把 `http_proxy`、`global_http_proxy_host`、`global_http_proxy_port`、`global_http_proxy_exclusion_list`、`global_proxy_pac_url` 全部删除后再恢复原值，体检也读全套键。
 - **「看着干净」不等于「真的清了」（Android 15 实测）**：`settings delete global http_proxy` 之后 Settings 里读不到任何代理，但 `ConnectivityService` 持有的 Java 层 `http.proxyHost`（由 Zygote 继承）可能仍下发给**新启动**的 App 进程，表现为 `failed to connect to /172.21.33.28 (port 18999)`；force-stop 后重开 App 也一样。因此还原脚本删完所有键后会**显式写入 Android 标准无代理值 `settings put global http_proxy :0`**，触发真正的刷新，`:0` 也按「无代理」解析。**验证是否恢复要看 App 的实际请求日志，不能只看 `settings` 无输出。**
 - **崩溃安全（关键）**：设备全局代理是**持久设置**，桌面进程却是易失的——Cmd+Q、强杀、崩溃、先拔线再退出都可能跳过全部析构函数，设备会一直指向已停监听的端口，表现为 `failed to connect to /172.21.33.28 (port 18999)`。所以每次设置成功后都会把「设备 serial + adb 路径 + 原值」写入 `~/Library/Application Support/com.zaze.loglens/proxy-state.json`（Windows 为 `%APPDATA%\com.zaze.loglens\`），还原成功才删除；**应用启动和每次环境体检都会读这份记录自动清理残留**（面板会显示「已自动修复设备代理」）。设备离线时保留记录，等重新连上再清；代理若已被其他程序改写则保持原样，绝不误删用户自己配置的代理。
@@ -577,21 +578,22 @@ LOGLENS_JSONL=~/capture.jsonl mitmdump -s scripts/mitmproxy_jsonl.py -p 8080
 
 ---
 
-## 12b. 客户端错误日志（排查客户端自身异常）
+## 12b. 客户端诊断日志（排查客户端自身异常与流程）
 
-这里记的是 **LogLens 自己** 的故障，不是正在分析的那份日志：
+这里记的是 **LogLens 自己** 的故障和流程快照，不是正在分析的那份日志：
 
-| 来源 | 捕获点 |
+| 类型 | 捕获点 |
 | --- | --- |
 | Rust 崩溃 | 全局 panic hook，记录 panic 文本、位置与调用栈 |
 | 前端未捕获异常 | `window.onerror`、`unhandledrejection`、Vue `errorHandler` |
 | 命令失败 | `ipc.ts` 的 `call()` 包装：任何 Tauri 命令返回 `Err` 都记一条（轮询类命令除外，避免拆台时刷屏） |
+| 流程快照（`info` / 来源 `flow`） | 启动、文件导入、标签切换、设备流、H5/原生抓包、代理恢复、导出，以及所有 `setNotice` 的用户提示；只记阶段、计数与状态 |
 
 - 落盘位置：与 `rules.json` 同目录的 `error-log.jsonl`（macOS `~/Library/Application Support/com.zaze.loglens/`，Windows `%APPDATA%/com.zaze.loglens/`）。
-- 上限 500 条，只留最新的；10 秒内完全相同的故障折叠成一条并累计次数，防止高频失败撑爆日志。
-- 顶栏「错误日志」入口（有新记录时显示角标）：按级别 / 来源筛选，展开看调用栈，复制当前筛选，或导出为纯文本贴到 issue。
-- **不会**记录日志正文、请求体、Cookie/Token 或文件路径等敏感数据；只记故障动作 + 原因 + 栈。
-- 错误日志的初始化与写入永不让客户端崩溃；即使落盘失败也会退化到 stderr。
+- 上限 500 条，只留最新的；10 秒内完全相同的记录折叠成一条并累计次数（流程快照折叠时保留最新计数），防止高频轮询撑爆日志。
+- 顶栏「诊断日志」入口（**只有故障**会产生角标；流程快照不会）：按级别 / 来源筛选，级别选 `流程` 或来源选 `流程` 即可只看全流程；展开看 detail，复制当前筛选，或导出为纯文本贴到 issue。
+- **不会**记录日志正文、请求体、Cookie/Token、URL 或文件路径等敏感数据；流程记录只有阶段、计数、状态与用户自选文件名。
+- 诊断日志的初始化与写入永不让客户端崩溃；即使落盘失败也会退化到 stderr。遇到「UI 上什么都没出现 / 点了没反应」时，先导出这份日志，按流程快照看最后到达哪个阶段。
 
 ---
 
@@ -695,9 +697,9 @@ npm run tauri dev
 44. 模拟异常退出：开始原生采集后直接强杀应用（或先拔线再退出），重新打开客户端、或点一次「环境体检」，设备代理应被自动清除，工作区显示「已自动修复设备代理」；`adb shell "settings get global http_proxy"` 返回 `:0`，设备恢复上网，重开被测 App 后请求成功。若设备当时不在线，重新连上后再打开该设备工作区应完成清理，期间不会出现 `failed to connect to /172.21.33.28 (port 18999)`。
 45. 选中任一条请求点「复制 cURL」：按钮短暂变「已复制」；粘贴到终端得到的命令含方法、URL、请求头与 `--data-raw` 请求体，`Host` / `Content-Length` / `Connection` / `Accept-Encoding` 不应出现；带 token 的请求复制出来是原值；`CONNECT`（HTTPS 隧道）行没有该按钮。
 
-客户端错误日志：
+客户端诊断日志：
 
-46. 顶栏点「错误日志」：面板显示路径 `…/com.zaze.loglens/error-log.jsonl`。此时`error-log.jsonl` 尚不存在或未记录属正常——只有真正发生异常才写入。
-47. 制造一次命令失败（任何会让界面弹出红色错误横幅、即某条 Tauri 命令返回 `Err` 的操作）：关闭并重开「错误日志」，应看到级别 `error`、来源 `rust`、scope 为对应命令名的记录；同一失败在 10 秒内重复多次只累计 `×N` 而不新增行。
-48. 按级别 / 来源 chip 筛选应只保留对应记录；有调用栈的行可点开看 detail；「复制当前筛选」与「导出」应包含所见记录；「清空」后列表归零且角标消失，重启客户端不会复活。
+46. 顶栏点「诊断日志」：面板显示路径 `…/com.zaze.loglens/error-log.jsonl`。启动流程本身就会写入 `info` 记录，因此正常使用后文件即存在；角标仍只统计故障。
+47. 制造一次命令失败（任何会让界面弹出红色错误横幅、即某条 Tauri 命令返回 `Err` 的操作）：关闭并重开「诊断日志」，应看到级别 `error`、来源 `rust`、scope 为对应命令名的记录；同一失败在 10 秒内重复多次只累计 `×N` 而不新增行。
+48. 按级别 / 来源 chip 筛选应只保留对应记录；级别选 `流程` 应能看到启动、切标签、打开日志、抓包等快照；有调用栈或 detail 的行可点开看；「复制当前筛选」与「导出」应包含所见记录；「清空」后列表归零且角标消失，重启客户端不会复活。
 49. 顶栏角标计数只统计上次打开面板之后的新记录，不会每次启动把旧记录都算成「新」。

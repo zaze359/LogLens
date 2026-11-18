@@ -1053,7 +1053,11 @@ fn handle_connection(
                 offset_secs,
                 &format!("{source}: 请求头不完整（已读 {read} 字节）: {reason}"),
             );
-            eprintln!("[proxy] 请求头不完整（已读 {read} 字节）: {reason}");
+            crate::error_log::flow_echo(
+                "proxy.request",
+                "请求头不完整",
+                &format!("bytes={read} reason={reason}"),
+            );
             write_bad_request(&mut client, &reason);
             return;
         }
@@ -1076,7 +1080,7 @@ fn handle_connection(
         // A failed connection is evidence, not noise: "the app tried to reach X and the
         // DNS/TLS/connect step failed" is often the whole bug. Record it as a row, and
         // also put it on stderr so a foreground `tauri dev` session shows the exact stage.
-        eprintln!("[proxy] {request_line}: {reason}");
+        crate::error_log::flow_echo("proxy.request", "上游请求失败", &reason);
         proxy_log(offset_secs, &format!("{request_line}: 失败 {reason}"));
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
@@ -1115,7 +1119,11 @@ fn bind_listener(lan: Ipv4Addr, port: u16) -> Result<TcpListener, String> {
                     format!("无法监听 {lan}:{port}（{e}），改用系统分配端口也失败: {fallback}")
                 })?;
             let actual = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
-            eprintln!("[proxy] 端口 {lan}:{port} 已被占用（{e}），改用 {lan}:{actual}");
+            crate::error_log::flow_echo(
+                "proxy.listen",
+                "端口占用，改用系统分配端口",
+                &format!("lan={lan} preferred={port} actual={actual} error={e}"),
+            );
             Ok(listener)
         }
         Err(e) => Err(format!("无法监听 {lan}:{port}: {e}")),
@@ -1315,7 +1323,11 @@ impl ProxyHub {
         let thread_stop = Arc::clone(&stop);
         let routes = Arc::clone(&self.routes);
         let thread = std::thread::spawn(move || run_listener(listener, routes, thread_stop));
-        eprintln!("[proxy] 统一监听 {endpoint}（端口 {port}，按来源 IP 分发到设备）");
+        crate::error_log::flow_echo(
+            "proxy.listen",
+            "统一监听就绪",
+            &format!("endpoint={endpoint} port={port}"),
+        );
         *slot = Some(Listener {
             stop,
             thread,
@@ -1354,7 +1366,7 @@ fn run_listener(listener: TcpListener, routes: Arc<Mutex<Vec<Route>>>, stop: Arc
                     let reason = format!(
                         "拒绝来源 {source}：没有登记这个 IP 的设备（多设备同时采集时按 IP 区分；IP 变化后请重新开始采集）"
                     );
-                    eprintln!("[proxy] {reason}");
+                    crate::error_log::flow_echo("proxy.route", "拒绝未登记来源", &reason);
                     proxy_log(local_offset, &reason);
                     let mut stream = stream;
                     write_error_response(
@@ -1460,10 +1472,27 @@ impl ProxyCapture {
             Err(e) => {
                 // The route exists but the device could not be pointed at it. Leaving it
                 // behind would keep the listener alive for a device that never talks.
+                crate::error_log::record_flow(
+                    "capture.proxy.start",
+                    "设备代理设置失败",
+                    &format!("id={session_id} serial={serial} endpoint={endpoint} error={e}"),
+                );
                 hub.detach(serial);
                 return Err(e);
             }
         };
+        crate::error_log::record_flow(
+            "capture.proxy.start",
+            "原生采集已就绪",
+            &format!(
+                "id={session_id} serial={serial} endpoint={endpoint} device_ip={} source={}",
+                ip.map(|v| v.to_string()).unwrap_or_default(),
+                match ip {
+                    Some(_) => "按来源 IP 分发",
+                    None => "未识别设备 IP",
+                }
+            ),
+        );
         Ok(Self {
             session_id,
             serial: serial.to_string(),

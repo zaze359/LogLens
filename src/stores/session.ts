@@ -1,6 +1,7 @@
 import { computed, reactive } from 'vue'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
 import { errorMessage, ipc, isTauri } from '../lib/ipc'
+import { reportClientFlow } from '../lib/error-report'
 import { UNCATEGORIZED } from '../types'
 import type {
   AdbDevice,
@@ -253,8 +254,11 @@ function clone<T>(value: T): T {
 }
 
 let noticeTimer: ReturnType<typeof setTimeout> | null = null
-export function setNotice(text: string): void {
+export function setNotice(text: string, recordFlow = true): void {
   store.notice = text
+  // A notice is a user-visible milestone; persisting it here means every workflow that
+  // already reports success/failure through the UI automatically leaves a trail.
+  if (recordFlow) reportClientFlow('ui.notice', text)
   if (noticeTimer) clearTimeout(noticeTimer)
   noticeTimer = setTimeout(() => {
     store.notice = ''
@@ -293,7 +297,11 @@ export async function refreshErrorLog(): Promise<void> {
     store.errorLogPath = path
     if (!store.errorLogOpen) {
       const seen = lastSeenTs()
-      store.errorLogUnread = store.errorLog.filter((r) => r.ts > seen).length
+      // `info` records are capture-flow checkpoints, not failures: they must not light
+      // the badge every time a poll advances a counter.
+      store.errorLogUnread = store.errorLog.filter(
+        (r) => r.ts > seen && r.level !== 'info'
+      ).length
     }
   } catch (e) {
     store.error = errorMessage(e)
@@ -323,7 +331,7 @@ export async function clearErrorLog(): Promise<void> {
     await ipc.clearErrorLog()
     store.errorLog = []
     store.errorLogUnread = 0
-    setNotice('已清空错误日志')
+    setNotice('已清空诊断日志', false)
   } catch (e) {
     store.error = errorMessage(e)
   }
@@ -333,13 +341,13 @@ export async function exportErrorLogFile(): Promise<void> {
   if (!store.tauriReady) return
   try {
     const dest = await saveDialog({
-      title: '导出错误日志',
+      title: '导出诊断日志',
       defaultPath: 'loglens-error-log.txt',
       filters: [{ name: '文本文件', extensions: ['txt', 'log'] }]
     })
     if (!dest) return
     await ipc.exportErrorLog(dest)
-    setNotice(`已导出错误日志到 ${dest}`)
+    setNotice(`已导出诊断日志到 ${dest}`)
   } catch (e) {
     store.error = errorMessage(e)
   }
@@ -367,6 +375,12 @@ export async function init(): Promise<void> {
     store.templates = templates
     applyRuleBundle(bundle)
     store.searchHistory = history
+    reportClientFlow('app.init', '应用数据加载完成', JSON.stringify({
+      templates: templates.length,
+      rules: store.rules.length,
+      categories: store.categories.length,
+      searches: history.length
+    }))
     void ipc.rulesLocation().then((p) => (store.rulesPath = p)).catch(() => {})
     // A failure from the previous session must still be visible as a badge.
     void refreshErrorLog()
@@ -467,6 +481,7 @@ export function activateTab(id: string): void {
   clearFind()
   // Set last: `LogTable` watches it to restore the scroll offset.
   store.activeId = id
+  reportClientFlow('ui.tab', '切换日志标签', JSON.stringify({ id, title: target.title }))
 
   syncTimers()
   if (store.filter.searchMode === 'find' && store.filter.search) scheduleFind()
@@ -486,6 +501,7 @@ export function closeTab(id: string): void {
   // Drop the tab first so the strip reacts instantly; the backend session (and that tab's
   // `adb logcat` child) is released in the background.
   store.tabs.splice(index, 1)
+  reportClientFlow('ui.tab', '关闭日志标签', JSON.stringify({ id, title: closing.title }))
   void ipc.closeSession(id).catch(() => {})
 
   if (!wasActive) {
@@ -564,10 +580,11 @@ export async function loadFile(path: string): Promise<void> {
   }
   store.error = ''
   const requestId = `open-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const fileName = path.split(/[\\/]/).pop() || path
   store.importTask = {
     requestId,
     path,
-    fileName: path.split(/[\\/]/).pop() || path,
+    fileName,
     bytesRead: 0,
     totalBytes: 0,
     entries: 0,
@@ -575,6 +592,7 @@ export async function loadFile(path: string): Promise<void> {
     visible: false,
     cancelling: false
   }
+  reportClientFlow('file.open', '开始导入日志', JSON.stringify({ requestId, fileName }))
   // Small files finish before the card would even be readable, so hold it back briefly.
   const revealTimer = setTimeout(() => {
     const task = store.importTask
@@ -840,6 +858,11 @@ export async function startDeviceStream(options: DeviceCaptureOptions): Promise<
       // 按设备记偏好：重新开始 / 再开抓面板时只认这台设备自己的设置。
       store.capturePrefs[options.serial] = { ...options }
       const info = await ipc.startDeviceStream(options)
+      reportClientFlow('device.stream', '实时抓取已启动', JSON.stringify({
+        sessionId: info.sessionId,
+        serial: options.serial,
+        entries: info.entryCount
+      }))
       const stream: DeviceStreamInfo = {
         sessionId: info.sessionId,
         serial: options.serial,
@@ -865,10 +888,17 @@ export async function startDeviceStream(options: DeviceCaptureOptions): Promise<
         message.includes('另一份日志正在实时抓取') ||
         message.includes('已经在一个会话里实时抓取')
       if (allowRecovery && refusedAsBusy && stillNoLocalTab) {
+        reportClientFlow('device.stream', '强制释放残留流后重试', JSON.stringify({
+          serial: options.serial
+        }))
         await ipc.releaseDeviceStream(options.serial).catch(() => {})
         return attempt(false)
       }
       store.error = message
+      reportClientFlow('device.stream.error', '启动实时抓取失败', JSON.stringify({
+        serial: options.serial,
+        error: message
+      }))
       return false
     }
   }
@@ -953,6 +983,14 @@ function applyStreamStatus(info: FileInfo, status: StreamStatus): void {
   info.totalLines = status.totalLines
   info.entryCount = status.entryCount
   info.unparsedLines = status.unparsedLines
+  if (!status.running) {
+    reportClientFlow('device.stream', '实时抓取已结束', JSON.stringify({
+      sessionId: info.sessionId,
+      entries: status.entryCount,
+      unparsed: status.unparsedLines,
+      error: status.error
+    }))
+  }
   if (status.facetsUpdated) {
     info.levels = status.levels
     info.tags = status.tags

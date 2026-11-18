@@ -15,41 +15,71 @@
 - Stderr logging is sparse: startup/cleanup, skipped malformed input, and background-thread
   failures. There is no per-entry or per-request logging.
 
-### Client error log (`error_log.rs`)
+### Client diagnostics log (`error_log.rs`)
 
 - File: `<app_config_dir>/error-log.jsonl` — the same directory as `rules.json`.
-- Records **only** this app's own failures: Rust panics (global hook with backtrace),
-  uncaught frontend errors (window/Vue/rejection handlers → `report_client_error`), and
-  Tauri commands that returned `Err` (captured by the `call()` wrapper in `ipc.ts`).
-- Bounded: `MAX_RECORDS = 500`, newest kept; identical failures inside 10s fold into one
-  record with an incrementing `count`. This is what makes per-poll failures safe to include.
+- One bounded file carries two kinds of records: **failures** (Rust panics with backtrace,
+  uncaught frontend errors via `report_client_error`, Tauri `Err` from `call()`) and
+  **`info` flow checkpoints** (see below). There is no second log file to collect.
+- Bounded: `MAX_RECORDS = 500`, newest kept; identical records inside 10s fold into one
+  with an incrementing `count`. For `info`, the folded record keeps the newest `detail`.
 - Deliberately excludes `poll_device_stream` / `poll_network_capture` (`SILENT_COMMANDS` in
   `ipc.ts`): teardown makes them fail routinely, and their real errors already reach the UI
-  through `StreamStatus.error` / capture status.
+  through `StreamStatus.error` / capture status. Their **successful** polls still produce
+  flow checkpoints; only their `Err` is excluded.
 - The UI in `ErrorLogPanel.vue` lists / filters / exports / clears it. It is user-visible
   support data, so export is plain text (not JSONL) and the path is shown in the panel.
 - Initialising the log or recording into it must never panic or abort startup — a poisoned
   mutex is recovered with `into_inner()`, and init failures fall back to stderr.
 
+### Flow checkpoints (`info` / `source=flow`)
+
+Every user-visible workflow leaves checkpoints in the same file: startup/shutdown, file and
+session open/close, device streams, H5/native capture, rules, import/export, proxy restore,
+and frontend notices. They exist because "点了没反应 / UI 上看不到" only reports the final
+symptom; a checkpoint trail names the last stage reached and the counters at that moment.
+
+- **API**: `error_log::record_flow(scope, message, detail)` in Rust,
+  `reportClientFlow(scope, message, detail)` in frontend. Use `flow_echo` when replacing a
+  workflow `eprintln!` so the terminal copy survives. Both write `info` / `source=flow`.
+- **Scope** is `<module>.<step>`, optionally with an id for per-session steps
+  (`app.start`, `file.open`, `device.stream`, `capture.poll.net-3`, `ui.notice`, …).
+  `message` names the state; a new module needs no UI change.
+- **Coverage**: add a checkpoint at each boundary the user can observe — request accepted,
+  ready/completed, state change, cancel, cleanup failure. Aggregate hot loops into one
+  boundary summary (`import.parse` records skipped-line count, not one line per row).
+- `detail` carries **ids, counts, booleans and short status strings only**. Never URLs,
+  query strings, headers, cookies, tokens, bodies, or file paths the user did not choose.
+  A status/error already shown in the UI is allowed.
+- Identical signatures fold inside 10s with the newest `detail`, so a high-frequency poll
+  stays one record. Frontend capture poll additionally de-duplicates by signature and adds
+  a 5s heartbeat while running. `reportClientFlow` does not dispatch `loglens-client-error`,
+  so checkpoints never trigger the badge or refresh the panel.
+- UI filter: level `info` is labelled 流程, source `flow` is labelled 流程
+  (`capture` is kept only for records written before this convention). All notices are
+  recorded through `setNotice`, so a workflow that already reports to the user is covered
+  automatically. Badge counts only non-`info` records.
+
 ---
 
 ## Log Levels
 
-There are no levels; use the message to convey severity.
+Diagnostics records use `panic` / `error` / `warning` for failures and `info` for flow
+checkpoints. Stderr itself has no levels; use the message to convey severity.
 
 | Situation | Prefix / wording | Example |
 |-----------|------------------|---------|
-| Startup self-heal | `[proxy]` | `eprintln!("[proxy] 启动自愈: {healed}")` in `lib.rs` |
-| Cleanup failed but the app continues | action + reason | `eprintln!("恢复设备代理失败: {e}")` in `proxy.rs` |
-| Skipped malformed external input | what + where | `eprintln!("跳过第 {} 行 JSONL: {e}", line_no + 1)` |
-| Test/helper diagnostics | free-form | `eprintln!("记录到 {} 条请求...", rows.len())` |
+| Startup self-heal | `flow_echo` | `flow_echo("proxy.heal", "启动自愈", &healed)` in `lib.rs` |
+| Cleanup failed but the app continues | `flow_echo` + reason | `flow_echo("proxy.restore", "设备代理恢复失败", …)` |
+| Skipped malformed external input | boundary summary | `record_flow("import.parse", "跳过损坏的 JSONL 行", "skipped=N")` |
+| Test/helper diagnostics | free-form `eprintln!` | `eprintln!("记录到 {} 条请求...", rows.len())` |
 
 Rules:
 
-- Keep one-line, greppable messages. Include the failing action and the cause.
-- A prefix in brackets is used only for the startup proxy heal today (`[proxy]`); do not
-  invent a prefix taxonomy.
+- Keep one-line, greppable messages. Include the action and the cause.
 - Failure of a *user-initiated* action is returned as `Err`, not logged and dropped.
+- Test-only `eprintln!` is not a flow checkpoint: it is invisible to shipped users and
+  must not write into the diagnostics file.
 
 ---
 
@@ -63,18 +93,21 @@ a logging framework for one call site.
 
 ## What to Log
 
+- Every user-visible workflow boundary as a flow checkpoint (request → ready/completed,
+  state change, cancel, cleanup failure), across startup, files/sessions, device streams,
+  capture, rules, import/export and proxy restore.
 - Startup self-healing results (`heal_stale_proxies`).
 - Device-side cleanup failures that cannot be reported to the UI because the window is going
   away (proxy restore, guard drop).
-- Malformed lines in external capture files (JSONL/HAR) so a user can diagnose a truncated
-  export. These are skips, not failures.
+- Malformed lines in external capture files (JSONL/HAR) — as one aggregate count, not one
+  record per line.
 - Reader-thread errors after the associated data has been flushed.
 
 ## What NOT to Log
 
-The rules below apply to **both** stderr and the client error log. The error log additionally
-never stores parsed entries, request bodies or file contents — it stores an error string,
-a scope and a stack trace, nothing from the data being analysed.
+The rules below apply to **both** stderr and the client diagnostics log. The diagnostics log
+additionally never stores parsed entries, request bodies or file contents — it stores a
+message, a scope, counters and optionally a stack trace, nothing from the data being analysed.
 
 - **Parsed log entries or line contents.** Logs contain app data and may contain user
   identifiers; and a 200MB import would emit millions of lines.
@@ -84,7 +117,10 @@ a scope and a stack trace, nothing from the data being analysed.
   assume the UI/session/export contain plaintext. `redacted: true` only appears when the gate
   is enabled.
 - **Per-poll / per-keystroke diagnostics.** The stream poll runs every 800ms; a log line here
-  becomes noise immediately.
+  becomes noise immediately. The one exception is the *folded* flow snapshot above: one
+  record per boundary/session, refreshed in place, never one line per request or row.
+- **URLs, query strings or payloads in a flow checkpoint.** Counters and status strings only —
+  this file gets pasted into bug reports.
 - **File paths the user did not choose**, device serials beyond what is needed, or anything
   that would be surprising to see in a bug report.
 - **Errors that are already returned to the UI** — log only when the UI cannot show them

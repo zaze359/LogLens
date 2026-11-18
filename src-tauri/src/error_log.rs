@@ -1,17 +1,24 @@
-//! Client self-diagnostics: a small, bounded file log for *this app's* failures.
+//! Client self-diagnostics: one bounded local file for every failure and every
+//! **flow checkpoint** in this app.
 //!
-//! This is deliberately not a general logging framework. It records three things the
+//! This is deliberately not a general logging framework. It records four things the
 //! user can no longer see once the window is gone:
 //!   1. Rust panics (global hook, with backtrace),
 //!   2. uncaught frontend errors forwarded over IPC,
-//!   3. Tauri commands that returned `Err`.
+//!   3. Tauri commands that returned `Err`,
+//!   4. `info`-level flow checkpoints (`record_flow`) at the boundaries of every
+//!      user-visible workflow — startup, file/session, device streams, capture, rules,
+//!      import/export, proxy restore and UI notices. They name the stage reached and
+//!      carry counters/status, so "看不到内容 / 点了没反应" can be traced without a
+//!      debugger. Flow records hold counters only — never URLs, headers or bodies.
 //!
 //! Records are kept in memory and mirrored as JSONL at
 //! `<app_config_dir>/error-log.jsonl` (same directory as `rules.json`), so a support
 //! bundle can be assembled without asking the user to dig through OS-specific paths.
 //!
-//! Bounded on purpose: `MAX_RECORDS` caps the file, and identical consecutive failures
-//! are folded into a `count` instead of filling the log with one line per 800ms poll.
+//! Bounded on purpose: `MAX_RECORDS` caps the file; identical records inside a short
+//! window fold into a `count` (flow checkpoints keep their newest counters). This makes
+//! high-frequency boundaries safe without introducing a logging framework.
 //! See `.trellis/spec/backend/logging-guidelines.md` for what must NOT end up here.
 
 use crate::model::ErrorRecord;
@@ -181,6 +188,11 @@ pub fn record(level: &str, source: &str, scope: &str, message: &str, detail: &st
     }) {
         existing.count += 1;
         existing.ts = ts;
+        // A flow checkpoint is the newest snapshot of a step, not a repeated failure:
+        // keep its latest counters so "the poll right before it went blank" survives.
+        if level == "info" {
+            existing.detail = detail.to_string();
+        }
         persist(&state);
         return;
     }
@@ -201,6 +213,22 @@ pub fn record(level: &str, source: &str, scope: &str, message: &str, detail: &st
         state.records.drain(..drain);
     }
     persist(&state);
+}
+
+/// Append one flow checkpoint. `scope` is a dotted step name (`<module>.<step>`),
+/// `message` names the state, and `detail` carries only counts / booleans / ids —
+/// never URLs, headers or bodies. All workflows share `source=flow`; the UI filters
+/// them with level `info` or source `flow`.
+pub fn record_flow(scope: &str, message: &str, detail: &str) {
+    record("info", "flow", scope, message, detail);
+}
+
+/// Flow checkpoint that also stays visible in a foreground `tauri dev` terminal.
+/// Use this when replacing an `eprintln!` that describes a workflow boundary; the
+/// terminal copy keeps its prefixed, greppable wording.
+pub fn flow_echo(scope: &str, message: &str, detail: &str) {
+    eprintln!("[{}] {}{}{}", scope, message, if detail.is_empty() { "" } else { " " }, detail);
+    record_flow(scope, message, detail);
 }
 
 /// Newest first, so the UI can render straight down the list.
@@ -235,7 +263,7 @@ pub fn location() -> Result<String, String> {
 pub fn export_text() -> String {
     let records = list();
     let mut out = String::new();
-    out.push_str("LogLens 错误日志\n");
+    out.push_str("LogLens 诊断日志\n");
     out.push_str(&format!("导出时间: {}\n", now_millis()));
     out.push_str(&format!("记录数: {}\n", records.len()));
     out.push_str("------------------------------------------------------------\n");
@@ -306,6 +334,35 @@ mod tests {
         found.unwrap().count += 1;
         assert_eq!(state.records.len(), 1);
         assert_eq!(state.records[0].count, 2);
+    }
+
+    #[test]
+    fn flow_folding_keeps_the_latest_snapshot() {
+        let (mut state, _path) = temp_state();
+        let ts = now_millis();
+        state.records.push(ErrorRecord {
+            id: "f1".into(),
+            ts,
+            level: "info".into(),
+            source: "flow".into(),
+            scope: "capture.poll.net-1".into(),
+            message: "采集轮询".into(),
+            detail: "rows=0".into(),
+            count: 1,
+        });
+        let from = state.records.len().saturating_sub(FOLD_SCAN);
+        let found = state.records[from..].iter_mut().rev().find(|r| {
+            r.level == "info"
+                && r.source == "flow"
+                && r.scope == "capture.poll.net-1"
+                && r.message == "采集轮询"
+                && (ts - r.ts).abs() <= FOLD_WINDOW_MS
+        });
+        let found = found.expect("同一采集步骤在窗口内应折叠");
+        found.count += 1;
+        found.detail = "rows=7".into();
+        assert_eq!(state.records.len(), 1, "轮询不能每 800ms 新增一条");
+        assert_eq!(state.records[0].detail, "rows=7", "折叠后应保留最新计数");
     }
 
     #[test]

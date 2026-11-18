@@ -320,9 +320,9 @@ pub struct ErrorRecord {
     pub id: String,
     /// Epoch millis when the failure happened (or last repeated).
     pub ts: i64,
-    /// `panic` | `error` | `warning`
+    /// `panic` | `error` | `warning` | `info`（抓包流程快照）
     pub level: String,
-    /// `rust` | `frontend`
+    /// `rust` | `frontend` | `flow`（统一流程快照）
     pub source: String,
     /// Command name, module or JS handler that reported it.
     pub scope: String,

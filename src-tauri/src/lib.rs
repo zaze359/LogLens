@@ -72,9 +72,10 @@ pub fn run() {
         .setup(|app| {
             // Install the panic hook + load previous records before anything else can fail.
             error_log::init(app.handle());
+            error_log::record_flow("app.start", "应用启动", "");
             let healed = netcapture::heal_stale_proxies();
             if !healed.is_empty() {
-                eprintln!("[proxy] 启动自愈: {healed}");
+                error_log::flow_echo("proxy.heal", "启动自愈", &healed);
             }
             Ok(())
         })

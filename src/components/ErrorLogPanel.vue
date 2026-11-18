@@ -28,6 +28,28 @@ function time(ts: number): string {
   return new Date(ts).toLocaleString('zh-CN', { hour12: false })
 }
 
+/** `info` 是抓包流程快照，不是错误；在筛选按钮上用「流程」更直白。 */
+function levelLabel(level: string): string {
+  if (!level) return '全部'
+  return level === 'info' ? '流程' : level
+}
+
+function sourceLabel(source: string): string {
+  if (!source) return '全部'
+  if (source === 'flow') return '流程'
+  if (source === 'capture') return '抓包(历史)'
+  return source
+}
+
+/** New modules can start emitting their own source without a UI change. */
+const sourceOptions = computed<string[]>(() => {
+  const options = ['', 'rust', 'frontend', 'flow', 'capture']
+  for (const r of store.errorLog) {
+    if (!options.includes(r.source)) options.push(r.source)
+  }
+  return options
+})
+
 function toggle(id: string): void {
   const next = new Set(expanded.value)
   if (next.has(id)) next.delete(id)
@@ -43,8 +65,8 @@ async function clear(): Promise<void> {
   // back into this very log, making it impossible to clear. Await + catch keeps it out.
   let ok = false
   try {
-    ok = await confirmDialog(`确定清空全部 ${store.errorLog.length} 条错误记录？此操作不可撤销。`, {
-      title: '清空错误日志',
+    ok = await confirmDialog(`确定清空全部 ${store.errorLog.length} 条诊断记录？此操作不可撤销。`, {
+      title: '清空诊断日志',
       kind: 'warning'
     })
   } catch {
@@ -68,7 +90,7 @@ async function copyVisible(): Promise<void> {
       )
       .join('\n')
     await navigator.clipboard.writeText(text)
-    setNotice(`已复制 ${records.value.length} 条错误记录`)
+    setNotice(`已复制 ${records.value.length} 条诊断记录`)
   } catch (e) {
     setNotice(`复制失败: ${e instanceof Error ? e.message : String(e)}`)
   }
@@ -79,7 +101,7 @@ async function copyVisible(): Promise<void> {
   <div class="modal-mask" @click.self="closeErrorLog">
     <div class="modal error-log-modal">
       <div class="modal-head">
-        <span>错误日志</span>
+        <span>诊断日志</span>
         <span class="badge">{{ store.errorLog.length }} 条</span>
         <span v-if="store.errorLogUnread" class="badge badge-new">{{ store.errorLogUnread }} 新</span>
         <div class="spacer" />
@@ -92,24 +114,24 @@ async function copyVisible(): Promise<void> {
       <div class="error-log-toolbar">
         <span class="error-log-label">级别</span>
         <button
-          v-for="lv in ['', 'panic', 'error', 'warning']"
+          v-for="lv in ['', 'panic', 'error', 'warning', 'info']"
           :key="lv || 'all'"
           class="chip"
           :class="{ active: levelFilter === lv }"
           @click="levelFilter = lv"
         >
-          {{ lv || '全部' }}
+          {{ levelLabel(lv) }}
         </button>
         <span class="divider-v" />
         <span class="error-log-label">来源</span>
         <button
-          v-for="src in ['', 'rust', 'frontend']"
+          v-for="src in sourceOptions"
           :key="src || 'all'"
           class="chip"
           :class="{ active: sourceFilter === src }"
           @click="sourceFilter = src"
         >
-          {{ src || '全部' }}
+          {{ sourceLabel(src) }}
         </button>
         <div class="spacer" />
         <span class="muted error-log-count">{{ records.length }} / {{ store.errorLog.length }}</span>
@@ -118,7 +140,9 @@ async function copyVisible(): Promise<void> {
       <div class="modal-body error-log-body">
         <div v-if="!records.length" class="error-log-empty">
           <template v-if="store.errorLog.length">当前筛选下没有记录</template>
-          <template v-else>暂无错误记录。客户端异常（崩溃、未捕获异常、命令失败）会自动记在这里。</template>
+          <template v-else>
+            暂无记录。客户端异常会自动记在这里；流程快照（info / 流程）覆盖启动、文件、设备、抓包、规则等，只含计数，不含 URL 或正文。
+          </template>
         </div>
 
         <div v-for="r in records" :key="r.id" class="error-row" :class="`el-${r.level}`">

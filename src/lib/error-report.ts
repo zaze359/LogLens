@@ -65,6 +65,24 @@ export function reportClientError(
     .catch(() => {})
 }
 
+/**
+ * Send one capture-flow checkpoint (counts only) to the same bounded log.
+ *
+ * Unlike `reportClientError` this does NOT dispatch `loglens-client-error`: a poll
+ * checkpoint is not a failure, so it must not refresh the error badge or the panel
+ * every 800ms. Opening the panel reads the latest records from Rust on demand.
+ */
+export function reportClientFlow(scope: string, message: string, detail = ''): void {
+  if (!inTauri()) return
+  void invoke<void>('report_client_error', {
+    level: 'info',
+    source: 'flow',
+    scope,
+    message,
+    detail
+  }).catch(() => {})
+}
+
 /** Install the three global collectors once, right after `createApp` and before `mount`. */
 export function installGlobalErrorHandlers(app: App): void {
   if (typeof window === 'undefined') return

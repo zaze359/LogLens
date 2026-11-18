@@ -260,22 +260,31 @@ impl AppState {
         // A poisoned lock must NOT stop cleanup: leaving the device pointing at a
         // dead proxy is far worse than a panicked worker thread.
         let mut streams = self.streams.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stopped_streams = 0u32;
         for (_, mut stream) in streams.drain() {
             stream.stop();
+            stopped_streams += 1;
         }
         let mut captures = self
             .network_captures
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let mut stopped_captures = 0u32;
         for (_, mut capture) in captures.drain() {
+            stopped_captures += 1;
             // The device may already be gone; the failure is logged instead of ignored,
             // and the journal entry is kept for `heal_stale_proxies` / the retry thread.
             if let Err(e) = capture.stop() {
-                eprintln!("[proxy] 退出时恢复设备代理失败: {e}");
+                crate::error_log::record_flow("proxy.restore", "退出时恢复设备代理失败", &e);
             }
         }
         let mut guards = self.proxy_guards.lock().unwrap_or_else(|p| p.into_inner());
         guards.clear(); // ProxyGuard::drop restores the original proxy
+        crate::error_log::record_flow(
+            "app.shutdown",
+            "已停止所有实时采集",
+            &format!("streams={stopped_streams} captures={stopped_captures}"),
+        );
     }
 }
 

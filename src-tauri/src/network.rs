@@ -269,6 +269,7 @@ pub fn parse_har(text: &str) -> Result<Vec<NetworkRequest>, String> {
 /// crashed mid-write should still leave every earlier request analysable.
 pub fn parse_jsonl(text: &str) -> Result<Vec<NetworkRequest>, String> {
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for (line_no, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -277,6 +278,7 @@ pub fn parse_jsonl(text: &str) -> Result<Vec<NetworkRequest>, String> {
         let value: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
+                skipped += 1;
                 eprintln!("跳过第 {} 行 JSONL: {e}", line_no + 1);
                 continue;
             }
@@ -284,6 +286,7 @@ pub fn parse_jsonl(text: &str) -> Result<Vec<NetworkRequest>, String> {
         let mut request: NetworkRequest = match serde_json::from_value(value) {
             Ok(r) => r,
             Err(e) => {
+                skipped += 1;
                 eprintln!("跳过第 {} 行 JSONL: {e}", line_no + 1);
                 continue;
             }
@@ -308,6 +311,15 @@ pub fn parse_jsonl(text: &str) -> Result<Vec<NetworkRequest>, String> {
         request.source = "jsonl".to_string();
         redact(&mut request);
         out.push(request);
+    }
+    // One summary at the boundary: a truncated export can skip thousands of lines, and
+    // per-line records would bury the rest of the diagnostic log.
+    if skipped > 0 {
+        crate::error_log::record_flow(
+            "import.parse",
+            "跳过损坏的 JSONL 行",
+            &format!("skipped={skipped}"),
+        );
     }
     if out.is_empty() {
         return Err("文件里没有可识别的网络请求".to_string());

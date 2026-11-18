@@ -4,6 +4,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { openJsonPanel } from '../../stores/session'
 import { toCurl } from '../../lib/curl'
 import { errorMessage, ipc } from '../../lib/ipc'
+import { reportClientFlow } from '../../lib/error-report'
 import type {
   NetworkCaptureStatus,
   NetworkRequest,
@@ -66,6 +67,17 @@ const curlText = computed(() => (selected.value ? toCurl(selected.value) : ''))
 let timer: ReturnType<typeof setInterval> | null = null
 /** 清空表格时递增：清空之前发出、清空之后才返回的轮询结果必须丢弃，否则历史会被回填。 */
 let clearEpoch = 0
+
+/**
+ * 抓包流程快照。只记计数与状态，不记 URL / 正文；写入同一个有上限的诊断日志，
+ * 用 source=capture 过滤即可只看流程。签名没变时最多 5 秒记一次，避免 800ms 轮询刷屏。
+ */
+function traceFlow(scope: string, message: string, detail: Record<string, unknown>): void {
+  reportClientFlow(scope, message, JSON.stringify(detail))
+}
+const POLL_TRACE_INTERVAL = 5000
+let lastPollSignature = ''
+let lastPollTraceAt = 0
 
 const cdpSocket = computed(() => report.value?.evidence.devtools[0]?.socket ?? '')
 /** 体检与两条通道的启动都要走 adb；adb 断开后这些操作只会失败，直接禁用并说明。 */
@@ -426,17 +438,55 @@ async function pollAll(): Promise<void> {
   const next = { ...statuses.value }
   const merged: NetworkRequest[] = []
   let ok = 0
-  for (const result of settled) {
-    if (result.status !== 'fulfilled') continue
+  settled.forEach((result, i) => {
+    if (result.status !== 'fulfilled') {
+      traceFlow('capture.ui.poll.error', '轮询采集失败', {
+        id: captures.value[i]?.id ?? '',
+        error: errorMessage(result.reason)
+      })
+      return
+    }
     ok += 1
     next[result.value.id] = result.value.status
     merged.push(...result.value.requests)
-  }
+  })
   statuses.value = next
   merged.sort((a, b) =>
     (a.timeKey || '99:99:99.999').localeCompare(b.timeKey || '99:99:99.999')
   )
   requests.value = merged
+  // UI-side half of the trail: compare what the backend claims with what the table can
+  // actually render. The wording names the boundary, so a screenshot-free report is enough.
+  const snapshots = Object.values(next)
+  const backendRows = snapshots.reduce((sum, s) => sum + s.entryCount, 0)
+  const backendEvents = snapshots.reduce((sum, s) => sum + s.events, 0)
+  const anyRunning = snapshots.some((s) => s.running)
+  const errors = snapshots.map((s) => s.error).filter(Boolean)
+  const visible = filteredRequests.value.length
+  const signature = [backendRows, backendEvents, merged.length, visible, anyRunning, errors.join('|')].join('/')
+  let checkpoint = '轮询快照'
+  if (backendRows > 0 && merged.length === 0) checkpoint = '⚠ 后端已有请求，UI 未收到'
+  else if (merged.length > 0 && visible === 0) checkpoint = '⚠ 请求被筛选或时间区间隐藏'
+  else if (backendEvents > 0 && backendRows === 0) checkpoint = '⚠ 有抓包事件，但还没有完整请求'
+  const traceAt = Date.now()
+  if (
+    signature !== lastPollSignature ||
+    (anyRunning && traceAt - lastPollTraceAt >= POLL_TRACE_INTERVAL)
+  ) {
+    lastPollSignature = signature
+    lastPollTraceAt = traceAt
+    traceFlow('capture.ui.poll', checkpoint, {
+      captures: captures.value.length,
+      backendRows,
+      backendEvents,
+      received: merged.length,
+      visible,
+      running: anyRunning,
+      fileMode: fileMode.value,
+      filtered: hasFilters.value || !!range.value,
+      errors
+    })
+  }
   // The drawer holds the object from a previous poll: once the request completes, swap in
   // the fresh copy or the response body would never appear while it is being watched.
   const picked = selected.value
@@ -469,6 +519,12 @@ function beginLive(info: NetworkSessionInfo): void {
     }
   }
   if (timer === null) timer = setInterval(() => void pollAll(), 800)
+  traceFlow('capture.ui.start', '开始接收采集', {
+    id: info.id,
+    source: info.source,
+    serial: info.device,
+    total: captures.value.length
+  })
 }
 
 /**
@@ -496,6 +552,7 @@ async function startCdp(): Promise<void> {
     beginLive(await ipc.startCdpCapture({ serial: props.serial, socket: cdpSocket.value, port: 0 }))
   } catch (e) {
     error.value = errorMessage(e)
+    traceFlow('capture.ui.start', '启动 H5 采集失败', { serial: props.serial, error: error.value })
   } finally {
     busy.value = false
     busyChannel.value = ''
@@ -509,9 +566,15 @@ async function startProxy(): Promise<void> {
   error.value = ''
   try {
     await prepareLive()
-    beginLive(await ipc.startProxyCapture({ serial: props.serial, port: 0 }))
+    const info = await ipc.startProxyCapture({ serial: props.serial, port: 0 })
+    beginLive(info)
+    traceFlow('capture.ui.start', '已提示重启被测 App', {
+      id: info.id,
+      reason: '运行中的进程不继承新代理，已有连接也会复用直连'
+    })
   } catch (e) {
     error.value = errorMessage(e)
+    traceFlow('capture.ui.start', '启动原生采集失败', { serial: props.serial, error: error.value })
   } finally {
     busy.value = false
     busyChannel.value = ''
@@ -541,6 +604,12 @@ async function stopSource(source: 'cdp' | 'proxy'): Promise<void> {
       if (status) next[c.id] = { ...status, running: false }
     }
     statuses.value = next
+    traceFlow('capture.ui.stop', '停止采集通道', {
+      source,
+      stopped: target.length,
+      rows: requests.value.length,
+      failures: failures.length
+    })
     if (Object.values(next).every((s) => !s.running)) stopPolling()
     if (failures.length > 0) {
       const channel = source === 'proxy' ? '原生采集' : 'H5 采集'
@@ -565,6 +634,10 @@ async function closeAll(): Promise<void> {
   }
   captures.value = []
   statuses.value = {}
+  traceFlow('capture.ui.close', '关闭采集会话', {
+    rows: requests.value.length,
+    failures: failures.length
+  })
   if (failures.length > 0) {
     error.value = `关闭采集时未能恢复设备代理：${failures.join('；')}。可在设备代理区域手动恢复。`
   }
@@ -583,6 +656,7 @@ async function pickCaptureFile(): Promise<void> {
     await closeAll()
     const info = await ipc.importNetworkCapture(picked)
     requests.value = await ipc.queryNetworkRequests(info.id)
+    traceFlow('capture.file', '导入抓包文件', { id: info.id, rows: requests.value.length })
     fileMode.value = true
     selected.value = null
     resetView()
@@ -598,9 +672,11 @@ async function pickCaptureFile(): Promise<void> {
 async function clearRequests(): Promise<void> {
   if (requests.value.length === 0) return
   clearEpoch += 1
+  const removed = requests.value.length
   requests.value = []
   selected.value = null
   resetView()
+  traceFlow('capture.ui.clear', '清空请求列表', { removed, fileMode: fileMode.value })
   if (fileMode.value) return
   const settled = await Promise.allSettled(
     captures.value.map((c) => ipc.clearNetworkCapture(c.id))
@@ -812,6 +888,12 @@ defineExpose({ shutdown, isCapturing: running })
           </span>
           <span class="muted">{{ countLabel }}</span>
         </div>
+
+        <!-- 原生代理只影响新进程：已运行的 App 继续直连，是"开启后仍看不到"的常见原因 -->
+        <p v-if="proxyRunning" class="net-start-hint">
+          原生采集已开启。如果被测 App 在此之前已经在运行，请<b>完全退出并重新打开它</b>；
+          已运行的进程不会继承新代理，继续请求仍会直连。
+        </p>
 
         <!-- 用户只关心能力边界：每条通道一句话说清支持什么、不支持什么 -->
         <ul class="net-capability">

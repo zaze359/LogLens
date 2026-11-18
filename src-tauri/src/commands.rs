@@ -156,6 +156,11 @@ pub async fn open_log_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
+    capture_flow(
+        "file.open",
+        "开始读取日志",
+        &format!("requestId={request_id} file={file_name} bytes={total_bytes}"),
+    );
 
     // Registering the flag before the read starts is what makes `cancel_open_log` able to
     // reach a parse that is already underway.
@@ -232,21 +237,32 @@ pub async fn open_log_file(
     }
     match outcome {
         ParseOutcome::Cancelled => Err("已取消导入".to_string()),
-        ParseOutcome::Done(parsed) => register_session_with_facets(
-            &state,
-            parsed.entries,
-            parsed.total_lines,
-            parsed.unparsed_lines,
-            facets.unwrap_or_default(),
-            SessionSeed {
-                path,
-                file_name,
-                size_bytes: total_bytes,
-                source: "file",
-                device: String::new(),
-                streaming: false,
-            },
-        ),
+        ParseOutcome::Done(parsed) => {
+            let lines = parsed.total_lines;
+            let entries = parsed.entries.len() as u32;
+            let unparsed = parsed.unparsed_lines;
+            let info = register_session_with_facets(
+                &state,
+                parsed.entries,
+                lines,
+                unparsed,
+                facets.unwrap_or_default(),
+                SessionSeed {
+                    path,
+                    file_name,
+                    size_bytes: total_bytes,
+                    source: "file",
+                    device: String::new(),
+                    streaming: false,
+                },
+            )?;
+            capture_flow(
+                "file.open",
+                "日志导入完成",
+                &format!("lines={lines} entries={entries} unparsed={unparsed}"),
+            );
+            Ok(info)
+        }
     }
 }
 
@@ -260,6 +276,7 @@ pub fn cancel_open_log(request_id: String, state: State<'_, AppState>) -> Result
         .map_err(|e| format!("状态锁异常: {e}"))?;
     if let Some(flag) = cancels.get(&request_id) {
         flag.store(true, Ordering::Relaxed);
+        capture_flow("file.open", "取消日志导入", &format!("requestId={request_id}"));
     }
     Ok(())
 }
@@ -344,6 +361,11 @@ fn reap_orphan_streams(state: &State<'_, AppState>, serial: &str) -> Result<(), 
         ids
     };
     if !orphan_ids.is_empty() {
+        capture_flow(
+            "device.stream",
+            "自愈已租约过期的实时流",
+            &format!("serial={serial} streams={}", orphan_ids.len()),
+        );
         if let Ok(mut sessions) = state.sessions.lock() {
             for id in &orphan_ids {
                 sessions.remove(id);
@@ -438,6 +460,11 @@ pub fn start_device_stream(
         }
         streams.insert(info.session_id.clone(), stream);
     }
+    capture_flow(
+        "device.stream",
+        "后端实时抓取已启动",
+        &format!("id={} serial={}", info.session_id, serial),
+    );
     Ok(info)
 }
 
@@ -489,6 +516,11 @@ pub fn stop_device_stream(session_id: String, state: State<'_, AppState>) -> Res
         .map_err(|e| format!("状态锁异常: {e}"))?;
     if let Some(mut stream) = streams.remove(&session_id) {
         stream.stop();
+        capture_flow(
+            "device.stream",
+            "后端停止实时抓取",
+            &format!("id={session_id} serial={}", stream.serial()),
+        );
     }
     Ok(())
 }
@@ -519,6 +551,11 @@ pub fn release_device_stream(serial: String, state: State<'_, AppState>) -> Resu
         ids
     };
     if !orphan_ids.is_empty() {
+        capture_flow(
+            "device.stream",
+            "强制释放残留实时流",
+            &format!("serial={serial} streams={}", orphan_ids.len()),
+        );
         if let Ok(mut sessions) = state.sessions.lock() {
             for id in &orphan_ids {
                 sessions.remove(id);
@@ -584,6 +621,7 @@ pub fn close_session(session_id: String, state: State<'_, AppState>) -> Result<(
         .lock()
         .map_err(|e| format!("状态锁异常: {e}"))?;
     sessions.remove(&session_id);
+    capture_flow("session.close", "关闭日志会话", &format!("id={session_id}"));
     Ok(())
 }
 
@@ -620,7 +658,13 @@ pub fn export_filtered(
         writeln!(writer, "{line}").map_err(|e| format!("写入导出文件失败: {e}"))?;
     }
     writer.flush().map_err(|e| format!("写入导出文件失败: {e}"))?;
-    Ok(lines.len() as u32)
+    let count = lines.len() as u32;
+    capture_flow(
+        "export.log",
+        "筛选日志已导出",
+        &format!("id={session_id} rows={count}"),
+    );
+    Ok(count)
 }
 
 #[tauri::command]
@@ -853,6 +897,13 @@ pub fn probe_network_capture(
     Ok(report)
 }
 
+/// One bounded checkpoint in the capture pipeline. The UI can show `streaming: true`
+/// while a row is stuck in any of: reader → buffer → poll → merge → render. Counters at
+/// each boundary make the actual boundary obvious; never put a URL or body in here.
+fn capture_flow(scope: &str, message: &str, detail: &str) {
+    crate::error_log::record_flow(scope, message, detail);
+}
+
 #[tauri::command]
 pub fn start_cdp_capture(
     options: CdpCaptureOptions,
@@ -872,6 +923,11 @@ pub fn start_cdp_capture(
         options.socket.trim().to_string()
     };
     let port = if options.port == 0 { CDP_PORT } else { options.port };
+    capture_flow(
+        "capture.start",
+        "请求启动 H5 采集",
+        &format!("serial={serial} socket={socket} port={port}"),
+    );
 
     // One CDP capture per device. The panel follows the device's first devtools socket, so
     // a second capture would duplicate every row and fight over the same `adb forward`.
@@ -900,10 +956,15 @@ pub fn start_cdp_capture(
         requests: Vec::new(),
         label: format!("{} · WebView 请求", device_label(&serial)),
         source: "cdp".to_string(),
-        device: serial,
+        device: serial.clone(),
         streaming: true,
     };
     let info = network_info(&id, &session);
+    capture_flow(
+        "capture.start",
+        "H5 采集已就绪",
+        &format!("id={id} serial={serial} socket={socket} port={port}"),
+    );
     state
         .network_sessions
         .lock()
@@ -933,6 +994,11 @@ pub fn start_proxy_capture(
     }
     let adb_path = require_adb()?;
     let port = if options.port == 0 { PROXY_PORT } else { options.port };
+    capture_flow(
+        "capture.start",
+        "请求启动原生采集",
+        &format!("serial={serial} port={port}"),
+    );
 
     // The checks below are check-then-act, and `ProxyCapture::start` does several `adb`
     // round trips afterwards. Two rapid clicks (or two windows) used to be caught by the
@@ -973,13 +1039,18 @@ pub fn start_proxy_capture(
         requests: Vec::new(),
         label: format!("{} · 原生接口", device_label(&serial)),
         source: "proxy".to_string(),
-        device: serial,
+        device: serial.clone(),
         streaming: true,
     };
     let info = NetworkSessionInfo {
         label: format!("{}（{}）", session.label, endpoint),
         ..network_info(&id, &session)
     };
+    capture_flow(
+        "capture.start",
+        "原生采集已就绪",
+        &format!("id={id} serial={serial} endpoint={endpoint}"),
+    );
     state
         .network_sessions
         .lock()
@@ -1017,11 +1088,21 @@ pub fn poll_network_capture(
     let session = sessions
         .get_mut(&id)
         .ok_or_else(|| "网络请求会话已失效".to_string())?;
+    let source = session.source.clone();
+    let serial = session.device.clone();
     for mut request in pending {
         request.index = session.requests.len() as u32;
         session.requests.push(request);
     }
     status.entry_count = session.requests.len() as u32;
+    capture_flow(
+        &format!("capture.poll.{id}"),
+        "采集轮询",
+        &format!(
+            "id={id} source={source} serial={serial} added={added} rows={} events={} running={} error={}",
+            status.entry_count, status.events, status.running, status.error
+        ),
+    );
     if !status.running {
         session.streaming = false;
     }
@@ -1059,6 +1140,11 @@ pub fn clear_network_capture(id: String, state: State<'_, AppState>) -> Result<(
     }
     if let Ok(mut sessions) = state.network_sessions.lock() {
         if let Some(session) = sessions.get_mut(&id) {
+            capture_flow(
+                &format!("capture.clear.{id}"),
+                "清空抓包请求",
+                &format!("id={id} rows={} source={}", session.requests.len(), session.source),
+            );
             session.requests.clear();
         }
     }
@@ -1070,6 +1156,12 @@ pub fn stop_network_capture(id: String, state: State<'_, AppState>) -> Result<()
     let mut stop_error = None;
     if let Ok(mut captures) = state.network_captures.lock() {
         if let Some(mut capture) = captures.remove(&id) {
+            let channel = if capture.is_proxy() { "proxy" } else { "cdp" };
+            capture_flow(
+                &format!("capture.stop.{id}"),
+                "停止抓包",
+                &format!("id={id} source={channel} serial={}", capture.serial()),
+            );
             if let Err(e) = capture.stop() {
                 stop_error = Some(e);
             }
@@ -1091,6 +1183,12 @@ pub fn close_network_capture(id: String, state: State<'_, AppState>) -> Result<(
     let mut stop_error = None;
     if let Ok(mut captures) = state.network_captures.lock() {
         if let Some(mut capture) = captures.remove(&id) {
+            let channel = if capture.is_proxy() { "proxy" } else { "cdp" };
+            capture_flow(
+                &format!("capture.close.{id}"),
+                "关闭抓包会话",
+                &format!("id={id} source={channel} serial={}", capture.serial()),
+            );
             if let Err(e) = capture.stop() {
                 stop_error = Some(e);
             }
@@ -1133,6 +1231,11 @@ pub fn import_network_capture(
         streaming: false,
     };
     let info = network_info(&id, &session);
+    capture_flow(
+        "capture.file",
+        "抓包文件已导入",
+        &format!("id={id} rows={}", session.requests.len()),
+    );
     state
         .network_sessions
         .lock()
