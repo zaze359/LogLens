@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "校验：测试、并发与线程生命周期约束"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验：错误信息是否面向用户且中文"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "校验：前端构建与禁止模式"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端视图层与 IPC 边界约定"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "跨层：命令签名变化需同步前端类型"}

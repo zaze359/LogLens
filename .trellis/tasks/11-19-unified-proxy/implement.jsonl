@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端总览：命令注册、测试与构建命令"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "proxy.rs 职责与模块边界，重构需同步更新"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Result<_, String> 与中文错误信息约定"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "线程生命周期、锁、边界与禁止模式"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "流程日志只记计数/ID，新增 proxy.runtime scope 需遵守"}
