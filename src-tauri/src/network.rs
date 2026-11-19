@@ -59,6 +59,9 @@ pub struct NetworkRequest {
     pub error: String,
     /// `har` | `jsonl` | `cdp`
     pub source: String,
+    /// Which client produced this row: an adb serial for device captures, `ip` for the
+    /// standalone proxy, empty for imported files.
+    pub device: String,
     pub redacted: bool,
 }
 
@@ -239,6 +242,7 @@ fn request_from_har_entry(entry: &Value, index: u32) -> NetworkRequest {
         response_truncated: false,
         error: str_field(entry, "_error"),
         source: "har".to_string(),
+        device: String::new(),
         redacted: false,
     };
     if out.error.is_empty() && out.status == 0 {

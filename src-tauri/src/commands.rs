@@ -16,7 +16,7 @@ use crate::stream::DeviceStream;
 use crate::{
     netcapture::{self, AnyCapture, NetworkCapture, ProxyGuard},
     netprobe, network,
-    proxy::ProxyCapture,
+    proxy::{proxy_status, ProxyCapture},
 };
 use std::collections::HashMap;
 use std::fs;
@@ -871,6 +871,7 @@ fn network_info(id: &str, session: &NetworkSession) -> NetworkSessionInfo {
         device: session.device.clone(),
         streaming: session.streaming,
         count: session.requests.len() as u32,
+        device_ip: session.device_ip.clone(),
     }
 }
 
@@ -954,6 +955,7 @@ pub fn start_cdp_capture(
     )?;
     let session = NetworkSession {
         requests: Vec::new(),
+        device_ip: String::new(),
         label: format!("{} · WebView 请求", device_label(&serial)),
         source: "cdp".to_string(),
         device: serial.clone(),
@@ -993,12 +995,21 @@ pub fn start_proxy_capture(
         return Err("请先选择一台已授权的设备".to_string());
     }
     let adb_path = require_adb()?;
-    let port = if options.port == 0 { PROXY_PORT } else { options.port };
-    capture_flow(
-        "capture.start",
-        "请求启动原生采集",
-        &format!("serial={serial} port={port}"),
-    );
+    // The listen port belongs to the proxy feature; a device capture only binds to whatever
+    // endpoint that proxy already publishes. Fail early with a message that names the fix,
+    // so the UI never has to guess why a "start" did nothing.
+    {
+        let runtime = state
+            .proxy_runtime
+            .lock()
+            .map_err(|e| format!("状态锁异常: {e}"))?;
+        if !runtime.running() {
+            return Err(
+                "还没有开启代理。请先在顶栏点「代理」并开启，再回来开始原生接口采集。".to_string(),
+            );
+        }
+    }
+    capture_flow("capture.start", "请求启动原生采集", &format!("serial={serial}"));
 
     // The checks below are check-then-act, and `ProxyCapture::start` does several `adb`
     // round trips afterwards. Two rapid clicks (or two windows) used to be caught by the
@@ -1027,16 +1038,17 @@ pub fn start_proxy_capture(
 
     let id = format!("net-{}", state.next_id());
     let capture = ProxyCapture::start(
-        &state.proxy_hub(),
+        &state.proxy_runtime,
         &adb_path,
         &serial,
-        port,
         netcapture::device_tz_offset(&adb_path, &serial),
         id.clone(),
     )?;
     let endpoint = capture.info().endpoint.clone();
+    let device_ip = capture.info().device_ip;
     let session = NetworkSession {
         requests: Vec::new(),
+        device_ip,
         label: format!("{} · 原生接口", device_label(&serial)),
         source: "proxy".to_string(),
         device: serial.clone(),
@@ -1238,6 +1250,7 @@ pub fn import_network_capture(
     let id = format!("net-{}", state.next_id());
     let session = NetworkSession {
         requests,
+        device_ip: String::new(),
         label: name,
         source: "file".to_string(),
         device: String::new(),
@@ -1351,6 +1364,88 @@ pub fn restore_device_proxy(
         serial,
         ..Default::default()
     })
+}
+
+/* ------------------------------------------------- standalone proxy ------ */
+
+/// Open a local proxy that is not tied to any device.
+///
+/// This is the proxy half on its own: any client that is pointed at the printed endpoint
+/// (another phone, an emulator, an app with a manually configured proxy) is captured,
+/// grouped by source address. No adb is involved, and no device setting is touched —
+/// "start native capture" is the automation that does the configuring.
+#[tauri::command]
+pub fn start_proxy_server(
+    port: u16,
+    state: State<'_, AppState>,
+) -> Result<crate::proxy::ProxyServerStatus, String> {
+    // `0` means "use the default", exactly like `start_proxy_capture`. Passing it straight
+    // through would bind an OS-chosen ephemeral port, so the address a user copies would
+    // change on every restart.
+    let port = if port == 0 { PROXY_PORT } else { port };
+    let mut runtime = state
+        .proxy_runtime
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    // Idempotent: if a device capture already brought the listener up, the same endpoint is
+    // returned instead of failing — and that endpoint is now the *only* one in the process.
+    let endpoint = runtime.ensure_listener(port)?;
+    crate::error_log::record_flow(
+        "proxy.server",
+        "独立代理已开启",
+        &format!("endpoint={endpoint} devices={}", runtime.devices().len()),
+    );
+    Ok(proxy_status(&runtime))
+}
+
+/// Leave the standalone view.
+///
+/// The listener is shared with device captures, so it is only closed when nothing else uses
+/// it: with devices still bound, stopping here just clears the unbound-source groups and the
+/// proxy keeps serving those devices. That is the difference between "close this page" and
+/// "take the phone offline".
+#[tauri::command]
+pub fn stop_proxy_server(state: State<'_, AppState>) -> Result<(), String> {
+    let mut runtime = state
+        .proxy_runtime
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    let devices = runtime.devices().len();
+    runtime.clear_unnamed();
+    if devices == 0 {
+        runtime.shutdown();
+    }
+    crate::error_log::record_flow(
+        "proxy.server",
+        "独立代理已关闭",
+        &format!("devices={devices} listener_stopped={}", devices == 0),
+    );
+    Ok(())
+}
+
+/// Status of the shared proxy, including the endpoint clients must be pointed at and how
+/// many devices are bound to the same listener.
+#[tauri::command]
+pub fn proxy_server_status(
+    state: State<'_, AppState>,
+) -> Result<crate::proxy::ProxyServerStatus, String> {
+    let runtime = state
+        .proxy_runtime
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    Ok(proxy_status(&runtime))
+}
+
+/// Everything captured by sources that are not a bound device, i.e. the standalone page.
+#[tauri::command]
+pub fn poll_proxy_server(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::network::NetworkRequest>, String> {
+    let mut runtime = state
+        .proxy_runtime
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    Ok(runtime.drain_unnamed())
 }
 
 /* --------------------------------------------------- client error log ------ */

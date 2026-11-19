@@ -17,6 +17,7 @@ import type {
   SearchHistoryEntry,
   RuleGroup,
   RulesView,
+  ProxyServerStatus,
   SearchHits,
   StreamStatus
 } from '../types'
@@ -195,6 +196,16 @@ export interface AppState {
    * 甚至让「重新开始」拿旧 serial 去抓（后端报「设备已不在连接列表」）。
    */
   capturePrefs: Record<string, DeviceCaptureOptions>
+  /**
+   * 独立代理面板（不属于任何设备）：本地开一个 HTTP 代理，接收所有把代理指向它的客户端。
+   * 它和设备里的「开始原生采集」分开——后者只是自动帮某台设备设好代理。
+   */
+  proxyPanelOpen: boolean
+  /**
+   * 独立代理的运行状态。放在 store 而不是面板组件里：顶栏要常驻显示它，面板关掉后
+   * 状态也不能丢（面板关掉只是不看了，代理还在跑）。
+   */
+  proxyServer: ProxyServerStatus | null
   // ---- client self-diagnostics (this app's own failures, not analysed logs) ----
   errorLogOpen: boolean
   errorLog: ErrorRecord[]
@@ -243,6 +254,8 @@ export const store = reactive<AppState>({
   devicePicker: false,
   jsonPanel: { open: false, text: '', label: '' },
   capturePrefs: {},
+  proxyPanelOpen: false,
+  proxyServer: null,
   errorLogOpen: false,
   errorLog: [],
   errorLogLoading: false,
@@ -254,6 +267,8 @@ function clone<T>(value: T): T {
 }
 
 let noticeTimer: ReturnType<typeof setTimeout> | null = null
+/** 独立代理运行期间刷新顶栏状态（来源数会变化）；不跑的时候为 null。 */
+let proxyServerTimer: ReturnType<typeof setInterval> | null = null
 export function setNotice(text: string, recordFlow = true): void {
   store.notice = text
   // A notice is a user-visible milestone; persisting it here means every workflow that
@@ -325,6 +340,65 @@ export function closeErrorLog(): void {
   store.errorLogOpen = false
 }
 
+export function openProxyPanel(): void {
+  store.proxyPanelOpen = true
+}
+
+export function closeProxyPanel(): void {
+  store.proxyPanelOpen = false
+  // Closing the panel only hides it: the proxy keeps running, so the top-bar status must
+  // keep tracking it.
+  syncProxyServerTimer()
+}
+
+/**
+ * Mirror the standalone proxy's state into the store. Cheap enough to call on demand, and
+ * the only way the top bar can show it while the panel is closed.
+ */
+export async function refreshProxyServer(): Promise<void> {
+  if (!store.tauriReady) return
+  try {
+    store.proxyServer = await ipc.proxyServerStatus()
+  } catch {
+    // A status probe is decoration; a failure must not surface as an app error.
+    store.proxyServer = null
+  }
+  syncProxyServerTimer()
+}
+
+export async function startProxyServer(): Promise<void> {
+  const status = await ipc.startProxyServer(0)
+  store.proxyServer = status
+  syncProxyServerTimer()
+  reportClientFlow('proxy.server', '独立代理已开启', `endpoint=${status.endpoint}`)
+}
+
+export async function stopProxyServer(): Promise<void> {
+  await ipc.stopProxyServer()
+  store.proxyServer = null
+  syncProxyServerTimer()
+  reportClientFlow('proxy.server', '独立代理已关闭', '')
+}
+
+/** Stop the mirror poll so it does not outlive the window or pile up. */
+export function stopProxyServerTimer(): void {
+  if (proxyServerTimer !== null) {
+    clearInterval(proxyServerTimer)
+    proxyServerTimer = null
+  }
+}
+
+/** Keep polling only while something is actually running. */
+function syncProxyServerTimer(): void {
+  if (store.proxyServer?.running) {
+    if (proxyServerTimer === null) {
+      proxyServerTimer = setInterval(() => void refreshProxyServer(), 2000)
+    }
+  } else {
+    stopProxyServerTimer()
+  }
+}
+
 export async function clearErrorLog(): Promise<void> {
   if (!store.tauriReady) return
   try {
@@ -388,6 +462,8 @@ export async function init(): Promise<void> {
     // active device immediately, so connecting is a one-click affair instead of a detour.
     // Quiet: no adb installed is a normal state for someone who only analyses log files.
     void refreshDevices(true)
+    // The proxy lives in the backend, so it may still be running from before a reload.
+    void refreshProxyServer()
   } catch (e) {
     store.error = errorMessage(e)
   }

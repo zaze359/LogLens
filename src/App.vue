@@ -13,6 +13,7 @@ import LogCaptureTab from './components/device/LogCaptureTab.vue'
 import ImportOverlay from './components/ImportOverlay.vue'
 import ErrorLogPanel from './components/ErrorLogPanel.vue'
 import JsonFormatPanel from './components/JsonFormatPanel.vue'
+import ProxyServerPanel from './components/ProxyServerPanel.vue'
 import { init, loadFile, store } from './stores/session'
 
 let unlistenDrop: (() => void) | null = null
@@ -134,6 +135,9 @@ onBeforeUnmount(() => {
     <ErrorLogPanel v-if="store.errorLogOpen" />
 
     <JsonFormatPanel v-if="store.jsonPanel.open" />
+
+    <!-- 独立代理不属于任何设备，所以挂在应用层，而不是设备工作区里 -->
+    <ProxyServerPanel v-if="store.proxyPanelOpen" />
 
     <Transition name="fade">
       <ImportOverlay v-if="store.importTask?.visible" />

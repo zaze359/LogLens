@@ -985,3 +985,31 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .error-log-path {
   font-size: 10px; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+
+/* ---------- standalone proxy panel ---------- */
+.proxy-modal { width: min(980px, 94vw); }
+.proxy-body { padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.badge.proxy-on { color: var(--ok, #4ade80); border-color: currentColor; }
+.proxy-groups { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
+.proxy-group {
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--bg-2);
+}
+.proxy-group-head {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.proxy-group .net-table { margin: 0; }
+
+/* ---------- home proxy status (nothing opened yet) ---------- */
+.home-proxy {
+  display: inline-flex; align-items: center; gap: 8px; margin-top: 10px;
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-1); color: var(--text-dim); font-size: 12px; line-height: 1.6;
+}
+.home-proxy.live { border-color: rgba(52, 211, 153, .35); }
+.home-proxy b { color: var(--text); font-weight: 600; }
+
+/* ---------- top bar proxy badge ---------- */
+.proxy-entry { display: inline-flex; align-items: center; gap: 6px; }
+.proxy-entry.live { border-color: rgba(52, 211, 153, .45); color: var(--ok); }
+.proxy-entry-addr { font-size: 11px; }

@@ -15,6 +15,20 @@
 //!
 //! Deliberately dependency-free (no TLS stack, no HTTP library): this is a transport
 //! relay, not a man-in-the-middle. A failed CONNECT is still recorded as evidence.
+//!
+//! # One proxy, many consumers
+//!
+//! There is exactly **one** listener in the process ([`ProxyRuntime`]). Two features use it:
+//!
+//! * a device capture **binds a route** (serial + source IP) and, separately, configures the
+//!   phone's proxy through [`ProxyGuard`]. "Start capture" on a device is that configuration
+//!   step, not a second proxy;
+//! * the standalone "代理" page shows the sources that are **not** a bound device.
+//!
+//! Never add a second `bind`: two listeners raced for port 18999 and the loser silently fell
+//! back to an ephemeral port, which showed up as "代理 18999 / 采集端点 52523" and cost a long
+//! debugging session. Routing is strict — an address belongs to a device or to the unnamed
+//! group, never to "whichever device happens to be attached".
 
 use crate::adb;
 use crate::cdp::hms_from_wall_time;
@@ -22,6 +36,7 @@ use crate::netcapture::{NetworkCaptureStatus, ProxyGuard};
 use crate::network::{redact, split_url, HttpHeader, NetworkRequest};
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
@@ -156,17 +171,40 @@ pub fn parse_sni(data: &[u8]) -> Option<String> {
 
 /// UDP `connect` performs no I/O; it only asks the OS which local address would be
 /// used to reach the peer. Pointing it at the device picks the right LAN interface.
+///
+/// With no peer the answer is *not* automatically the LAN address: a VPN / proxy in TUN
+/// mode installs `1/8`, `2/7`, … `128/1` routes through its `utun` device, so "which
+/// source would reach 8.8.8.8" returns the tunnel (e.g. `198.18.0.1`) — an address no
+/// phone on the LAN can dial back. A tunnel address is therefore rejected and the LAN
+/// interface is picked explicitly; see [`lan_address`].
 pub fn local_lan_ip(peer: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    match peer {
+        Some(peer) => route_source(peer),
+        // A tunnel can still be the only usable path for a peer that lives inside it, so
+        // the rejection only applies when the peer is unknown.
+        None => route_source(Ipv4Addr::new(8, 8, 8, 8))
+            .filter(|ip| !is_tunnel_ip(*ip))
+            .or_else(lan_address),
+    }
+}
+
+fn route_source(peer: Ipv4Addr) -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    let target = SocketAddr::V4(SocketAddrV4::new(
-        peer.unwrap_or(Ipv4Addr::new(8, 8, 8, 8)),
-        80,
-    ));
+    let target = SocketAddr::V4(SocketAddrV4::new(peer, 80));
     socket.connect(target).ok()?;
     match socket.local_addr().ok()? {
         SocketAddr::V4(addr) => Some(*addr.ip()),
         _ => None,
     }
+}
+
+/// Addresses a VPN / proxy TUN device binds: `198.18.0.0/15` (benchmark range, used by
+/// Clash/Surge-style TUN), `198.19.0.0/16` and the CGNAT block `100.64.0.0/10`. They are
+/// legitimate local addresses but unreachable from anything outside this machine.
+fn is_tunnel_ip(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 100 && (64..128).contains(&octets[1]))
 }
 
 pub fn parse_device_ip(text: &str) -> Option<Ipv4Addr> {
@@ -184,6 +222,88 @@ fn is_lan_ip(ip: Ipv4Addr) -> bool {
     octets[0] == 10
         || (octets[0] == 172 && (16..32).contains(&octets[1]))
         || (octets[0] == 192 && octets[1] == 168)
+}
+
+/// Pick a LAN address without trusting the default route.
+///
+/// The default route is not evidence of reachability when a VPN / proxy in TUN mode owns
+/// it: it installs `1/8 … 128/1` and then "reaching 8.8.8.8" answers with the tunnel's own
+/// address. What a phone can actually dial back is an address in a LAN subnet on a real
+/// NIC, so those are enumerated and ranked explicitly.
+fn lan_address() -> Option<Ipv4Addr> {
+    let mut candidates: Vec<(u8, Ipv4Addr)> = local_ipv4_addresses()
+        .into_iter()
+        .filter(|ip| is_lan_ip(*ip) && !is_tunnel_ip(*ip) && !ip.is_loopback())
+        .map(|ip| (iface_rank(ip), ip))
+        .collect();
+    // Wi-Fi / Ethernet first, then anything else that looked like a LAN.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.first().map(|(_, ip)| *ip)
+}
+
+/// Rank a LAN address by how likely a device on the same network can reach it.
+///
+/// Without the interface name (which the parsers below do keep where available) the
+/// private ranges are the honest signal: `192.168/16` and `10/8` are overwhelmingly home /
+/// office networks, while a host on an isolated `/30` is almost always a point-to-point
+/// link or a tunnel that slipped through.
+fn iface_rank(ip: Ipv4Addr) -> u8 {
+    let octets = ip.octets();
+    match (octets[0], octets[1]) {
+        (192, 168) => 3,
+        (10, _) => 2,
+        (172, b) if (16..32).contains(&b) => 2,
+        _ => 1,
+    }
+}
+
+/// Every IPv4 address bound on this machine.
+///
+/// Shelling out to the platform tool keeps the app dependency-free (the crate has no
+/// socket-address listing crate) and is only ever used to *suggest* an endpoint the user
+/// can read and override.
+fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
+    #[cfg(target_os = "windows")]
+    let (program, args): (&str, Vec<&str>) = ("ipconfig", vec![]);
+    #[cfg(target_os = "macos")]
+    let (program, args): (&str, Vec<&str>) = ("ifconfig", vec![]);
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let (program, args): (&str, Vec<&str>) = ("ip", vec!["-o", "-f", "inet", "addr", "show"]);
+
+    let Ok(output) = std::process::Command::new(program).args(&args).output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_local_ipv4(&text)
+}
+
+/// Pull IPv4 addresses out of `ifconfig` / `ipconfig` / `ip -o` output.
+///
+/// `ifconfig` writes `inet 172.21.32.185 netmask …`; `ipconfig` writes
+/// `IPv4 Address. . . : 172.21.32.185`; `ip -o` keeps `inet 172.21.32.185/22`. All three
+/// put the address in the token after `inet` / after a `:`.
+fn parse_local_ipv4(text: &str) -> Vec<Ipv4Addr> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let token = if let Some(rest) = trimmed.strip_prefix("IPv4 Address") {
+            rest.rsplit(':').next().map(str::trim)
+        } else {
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            tokens
+                .iter()
+                .position(|t| *t == "inet")
+                .and_then(|at| tokens.get(at + 1).copied())
+        };
+        let Some(raw) = token else { continue };
+        let raw = raw.trim_end_matches(|c| c == '\r');
+        if let Some(ip) = raw.split('/').next().and_then(|v| v.parse::<Ipv4Addr>().ok()) {
+            if !found.contains(&ip) {
+                found.push(ip);
+            }
+        }
+    }
+    found
 }
 
 /// Rank every interface's IPv4 and take the most likely one.
@@ -1143,7 +1263,7 @@ fn bound_endpoint(listener: &TcpListener, lan: Ipv4Addr) -> Result<(u16, String)
 
 /// One device as seen by the shared listener: the address it connects from, the session it
 /// feeds, and the flag that stops its in-flight connections.
-struct Route {
+pub(crate) struct Route {
     serial: String,
     /// `None` when adb could not tell us the address. The binding is then learned from the
     /// first connection rather than guessed — see [`route_for`].
@@ -1155,30 +1275,20 @@ struct Route {
 
 /// Pick the device a connection belongs to.
 ///
-/// The source address is the only thing that separates two phones behind one proxy: every
-/// device is told the same `<lan>:<port>`, and each phone carries its own address. The
-/// binding is used strictly *while it disambiguates something*:
+/// Routing is deliberately **strict**: a connection belongs to a device only when its source
+/// address is one that device was registered with. Anything else is an unnamed source
+/// (the standalone page).
 ///
-/// * exact address match — the normal case;
-/// * exactly one device — the source has nothing to disambiguate, so it is attributed to
-///   that device. This is what keeps a capture working when the phone's address could not
-///   be read, changed after a DHCP renewal, or is reported differently by the ROM;
-/// * several devices — only an address we never learned may claim a connection, and only if
-///   it is the single such device. Anything else is refused rather than guessed.
+/// There used to be an "only one device, so claim every source" fallback, for phones whose
+/// address adb could not read. It is gone on purpose: with a general proxy on the same
+/// listener, that fallback would fold an unrelated client's traffic into the one attached
+/// device's table. A device whose address is unknown now shows its traffic on the standalone
+/// page, which is honest and visible, instead of mixing sources silently.
 fn route_for(routes: &[Route], source: IpAddr) -> Option<&Route> {
-    if let IpAddr::V4(source) = source {
-        if let Some(route) = routes.iter().find(|r| r.ip == Some(source)) {
-            return Some(route);
-        }
-    }
-    if routes.len() == 1 {
-        return routes.first();
-    }
-    let mut unbound = routes.iter().filter(|r| r.ip.is_none());
-    match (unbound.next(), unbound.next()) {
-        (Some(only), None) => Some(only),
-        _ => None,
-    }
+    let IpAddr::V4(source) = source else {
+        return None;
+    };
+    routes.iter().find(|r| r.ip == Some(source))
 }
 
 /// The running socket, kept apart from the routing table so the accept loop never has to
@@ -1197,119 +1307,77 @@ impl Listener {
     }
 }
 
-/// The single proxy listener every device shares.
+/// A client of the shared proxy that is not bound to any device.
 ///
-/// One port instead of one per device: the device is pointed at `<lan>:<port>`, so the only
-/// thing that can distinguish two phones is the source address they already carry. That
-/// removes a whole class of problems — N devices no longer need N ports, a phone that
-/// reconnects cannot collide with a capture still winding down, and a Wi-Fi change only has
-/// to rebuild one socket.
-pub struct ProxyHub {
-    /// Serialises attach/detach, so an idle shutdown can never race a fresh attach.
-    gate: Mutex<()>,
-    slot: Mutex<Option<Listener>>,
-    routes: Arc<Mutex<Vec<Route>>>,
+/// This is what the standalone proxy page shows: every source that connects to the
+/// listener without being a registered device, grouped by address.
+#[derive(Default)]
+pub(crate) struct UnnamedSource {
+    shared: Arc<Mutex<ProxyBuffer>>,
+    stop: Arc<AtomicBool>,
 }
 
-impl Default for ProxyHub {
+/// The proxy: one listener, one routing table, every client.
+///
+/// Before this existed there were two: a per-device `ProxyHub` and a standalone
+/// `ProxyServer`, each with its own `bind`. Whichever started second lost 18999 and fell
+/// back to an ephemeral port, so a device was captured on `:52523` while the proxy page
+/// advertised `:18999`. One listener removes that whole class of drift: a device is now a
+/// *route* on this listener, and configuring a device proxy is a separate concern
+/// (`ProxyGuard`).
+///
+/// Routing is strict: a connection belongs to a device only when its source address is an
+/// address that device was registered with. Everything else is an unnamed source. There is
+/// deliberately no "only one device, so claim it" fallback — it would mix a stranger's
+/// traffic into a device's table.
+pub struct ProxyRuntime {
+    slot: Mutex<Option<Listener>>,
+    /// The shared routing table. The accept thread holds a clone of this `Arc`.
+    routes: Arc<Mutex<Vec<Route>>>,
+    /// Sources that are not a bound device. Shared with the accept thread, which creates a
+    /// buffer the first time an address connects; the UI drains it on the proxy page.
+    unnamed: Arc<Mutex<HashMap<Ipv4Addr, UnnamedSource>>>,
+}
+
+impl Default for ProxyRuntime {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ProxyHub {
+impl ProxyRuntime {
     pub fn new() -> Self {
         Self {
-            gate: Mutex::new(()),
             slot: Mutex::new(None),
             routes: Arc::new(Mutex::new(Vec::new())),
+            unnamed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Register `route` and return the endpoint its device must be pointed at, reusing the
-    /// running listener when there is one.
-    fn attach(
-        &self,
-        route: Route,
-        lan: Ipv4Addr,
-        preferred_port: u16,
-    ) -> Result<String, String> {
-        let _gate = self.gate.lock().unwrap_or_else(|p| p.into_inner());
-        let others_attached = {
-            let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(existing) = routes.iter().find(|r| {
-                r.serial == route.serial || (r.ip.is_some() && r.ip == route.ip)
-            }) {
-                // One address, one device: two phones behind the same NAT would otherwise
-                // interleave their rows into one session with no way to tell them apart.
-                return Err(format!(
-                    "{} 已绑定设备 {}，同一个 IP 只能对应一台设备",
-                    existing.ip.map(|ip| ip.to_string()).unwrap_or_default(),
-                    existing.serial
-                ));
-            }
-            !routes.is_empty()
-        };
-        let endpoint = {
-            let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-            self.ensure_listener(&mut slot, lan, preferred_port, others_attached)?
-        };
-        self.routes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(route);
-        Ok(endpoint)
+    /// Ensure the one listener exists, returning the endpoint clients must be pointed at.
+    ///
+    /// Idempotent and long-lived: once up it stays up (manual stop or process exit only),
+    /// so the address shown in the UI never drifts between captures. `preferred_port` is a
+    /// preference — a taken port falls back to an OS-chosen one, exactly as before.
+    pub fn ensure_listener(&mut self, preferred_port: u16) -> Result<String, String> {
+        self.ensure_listener_on(preferred_port)
     }
 
-    /// Drop `serial` from the routing table. The listener stays up while another device
-    /// still uses it, and closes — releasing the port — as soon as the last one leaves.
-    fn detach(&self, serial: &str) {
-        let _gate = self.gate.lock().unwrap_or_else(|p| p.into_inner());
-        let removed = {
-            let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
-            let before = routes.len();
-            routes.retain(|r| r.serial != serial);
-            before != routes.len()
-        };
-        if !removed {
-            return;
-        }
-        let idle = self
-            .routes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_empty();
-        if !idle {
-            return;
-        }
-        // Nobody left: stop accepting so the port goes back to the OS. The next attach
-        // rebuilds the listener, which is also what picks up a changed LAN address.
+    /// Same as [`Self::ensure_listener`] but binds a specific interface. Used by tests; the
+    /// app always goes through the LAN address so a phone can dial back.
+    fn ensure_listener_on(&mut self, preferred_port: u16) -> Result<String, String> {
+        let lan = local_lan_ip(None).ok_or_else(|| "无法确定本机局域网地址".to_string())?;
+        self.ensure_listener_at(lan, preferred_port)
+    }
+
+    fn ensure_listener_at(&mut self, lan: Ipv4Addr, preferred_port: u16) -> Result<String, String> {
         let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(listener) = slot.take() {
-            listener.shutdown();
-        }
-    }
-
-    fn ensure_listener(
-        &self,
-        slot: &mut Option<Listener>,
-        lan: Ipv4Addr,
-        preferred_port: u16,
-        others_attached: bool,
-    ) -> Result<String, String> {
         if let Some(existing) = slot.as_ref() {
             if existing.lan == lan {
                 return Ok(existing.endpoint.clone());
             }
-            // The LAN address changed (Wi-Fi switch, VPN, a machine with two NICs). The old
-            // socket serves an interface the new device cannot reach — but rebuilding it
-            // would silently black-hole every device already pointed at the old endpoint.
-            if others_attached {
-                return Err(format!(
-                    "本机有多个网段：已有设备正在通过 {} 采集，请先停止其它设备的采集再切换网络",
-                    existing.endpoint
-                ));
-            }
+            // The LAN address changed (Wi-Fi switch, VPN, another NIC). Nobody dials the old
+            // endpoint any more, so rebuild rather than keep serving an unreachable socket.
             if let Some(old) = slot.take() {
                 old.shutdown();
             }
@@ -1322,10 +1390,12 @@ impl ProxyHub {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let routes = Arc::clone(&self.routes);
-        let thread = std::thread::spawn(move || run_listener(listener, routes, thread_stop));
-        crate::error_log::flow_echo(
+        let unnamed = Arc::clone(&self.unnamed);
+        let thread =
+            std::thread::spawn(move || run_listener(listener, routes, unnamed, thread_stop));
+        crate::error_log::record_flow(
             "proxy.listen",
-            "统一监听就绪",
+            "代理监听就绪",
             &format!("endpoint={endpoint} port={port}"),
         );
         *slot = Some(Listener {
@@ -1336,45 +1406,171 @@ impl ProxyHub {
         });
         Ok(endpoint)
     }
+
+    /// Register (or update) a device route. One address, one device: two phones behind the
+    /// same NAT would otherwise interleave their rows with no way to tell them apart.
+    pub fn bind_device(&self, route: Route) -> Result<(), String> {
+        let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = routes.iter().find(|r| r.serial == route.serial) {
+            return Err(format!("设备 {} 已经绑定到本代理", existing.serial));
+        }
+        if let Some(ip) = route.ip {
+            if let Some(existing) = routes.iter().find(|r| r.ip == Some(ip)) {
+                return Err(format!(
+                    "{ip} 已绑定设备 {}，同一个 IP 只能对应一台设备",
+                    existing.serial
+                ));
+            }
+        }
+        routes.push(route);
+        Ok(())
+    }
+
+    /// Remove a device's route. The listener stays up: "stop capturing on this device" must
+    /// not disconnect a phone on another device, or the standalone proxy page.
+    pub fn unbind_device(&self, serial: &str) -> Option<Route> {
+        let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        let index = routes.iter().position(|r| r.serial == serial)?;
+        Some(routes.remove(index))
+    }
+
+    pub fn endpoint(&self) -> Option<String> {
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|listener| listener.endpoint.clone())
+    }
+
+    pub fn lan(&self) -> Option<Ipv4Addr> {
+        self.slot.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|l| l.lan)
+    }
+
+    /// Devices currently bound, as `(serial, ip)`.
+    pub fn devices(&self) -> Vec<(String, Option<Ipv4Addr>)> {
+        self.routes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|r| (r.serial.clone(), r.ip))
+            .collect()
+    }
+
+    pub fn running(&self) -> bool {
+        self.slot.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
+
+    /// Drain everything captured by sources that are not a bound device.
+    pub fn drain_unnamed(&mut self) -> Vec<NetworkRequest> {
+        let mut rows = Vec::new();
+        let unnamed = self.unnamed.lock().unwrap_or_else(|p| p.into_inner());
+        for (ip, source) in unnamed.iter() {
+            let mut buffer = match source.shared.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for mut request in std::mem::take(&mut buffer.pending) {
+                request.device = format!("proxy/{ip}");
+                rows.push(request);
+            }
+        }
+        rows.sort_by_key(|r| r.started_at.clone());
+        rows
+    }
+
+    pub fn unnamed_sources(&self) -> u32 {
+        self.unnamed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len() as u32
+    }
+
+    pub fn clear_unnamed(&mut self) {
+        let mut unnamed = self.unnamed.lock().unwrap_or_else(|p| p.into_inner());
+        for source in unnamed.values() {
+            source.stop.store(true, Ordering::Relaxed);
+        }
+        unnamed.clear();
+    }
+
+    /// Close the listener and forget every route. Used on shutdown and by the manual stop.
+    pub fn shutdown(&mut self) {
+        {
+            let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+            for route in routes.drain(..) {
+                route.stop.store(true, Ordering::Relaxed);
+            }
+        }
+        self.clear_unnamed();
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(listener) = slot.take() {
+            listener.shutdown();
+            crate::error_log::record_flow("proxy.listen", "代理监听已关闭", "");
+        }
+    }
 }
 
-/// Accept loop for the shared listener. One thread, one socket, every device.
-fn run_listener(listener: TcpListener, routes: Arc<Mutex<Vec<Route>>>, stop: Arc<AtomicBool>) {
+/// Return the buffer for an unnamed source, creating it on first contact.
+///
+/// One buffer per address: the proxy page groups by source, and two clients behind one NAT
+/// stay distinguishable because the address they present is already the group key.
+fn unnamed_source(
+    unnamed: &Arc<Mutex<HashMap<Ipv4Addr, UnnamedSource>>>,
+    source: IpAddr,
+) -> (Arc<Mutex<ProxyBuffer>>, Arc<AtomicBool>) {
+    let IpAddr::V4(ip) = source else {
+        // IPv6 clients still get a buffer; they are keyed on the IPv4 form only because the
+        // listener is bound to an IPv4 address in practice.
+        let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
+        return (shared, Arc::new(AtomicBool::new(false)));
+    };
+    let mut table = unnamed.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = table.entry(ip).or_insert_with(|| {
+        crate::error_log::record_flow(
+            "proxy.route",
+            "未绑定来源，归入独立代理",
+            &format!("source={ip}"),
+        );
+        UnnamedSource::default()
+    });
+    (Arc::clone(&entry.shared), Arc::clone(&entry.stop))
+}
+
+/// Accept loop for the shared listener. One thread, one socket, every client.
+///
+/// Dispatch is strict: a bound device owns the addresses it was registered with, and every
+/// other source gets an unnamed buffer created on first contact. Nothing is rejected for
+/// being unknown — that is what made the old per-device hub useless for anything but an
+/// adb-attached phone.
+fn run_listener(
+    listener: TcpListener,
+    routes: Arc<Mutex<Vec<Route>>>,
+    unnamed: Arc<Mutex<HashMap<Ipv4Addr, UnnamedSource>>>,
+    stop: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, peer)) => {
                 let source = peer.ip();
-                let (dispatch, local_offset) = {
+                let (shared, route_stop, offset_secs, serial) = {
                     let table = routes.lock().unwrap_or_else(|p| p.into_inner());
-                    (
-                        route_for(&table, source).map(|route| {
-                            (
-                                Arc::clone(&route.shared),
-                                Arc::clone(&route.stop),
-                                route.offset_secs,
-                                route.serial.clone(),
-                            )
-                        }),
-                        // A rejection has no device of its own; log it in the same clock as
-                        // the devices that are attached, so the lines interleave sensibly.
-                        table.first().map(|route| route.offset_secs).unwrap_or(0),
-                    )
-                };
-                let Some((shared, route_stop, offset_secs, serial)) = dispatch else {
-                    // Never silent: a rejected source is the one thing that explains an
-                    // empty table, so it goes to the file log as well as stderr.
-                    let reason = format!(
-                        "拒绝来源 {source}：没有登记这个 IP 的设备（多设备同时采集时按 IP 区分；IP 变化后请重新开始采集）"
-                    );
-                    crate::error_log::flow_echo("proxy.route", "拒绝未登记来源", &reason);
-                    proxy_log(local_offset, &reason);
-                    let mut stream = stream;
-                    write_error_response(
-                        &mut stream,
-                        "403 Forbidden",
-                        "该代理只服务已登记的 Android 设备",
-                    );
-                    continue;
+                    let offset = table.first().map(|r| r.offset_secs).unwrap_or(0);
+                    let hit = route_for(&table, source).map(|route| {
+                        (
+                            Arc::clone(&route.shared),
+                            Arc::clone(&route.stop),
+                            route.offset_secs,
+                            route.serial.clone(),
+                        )
+                    });
+                    drop(table);
+                    match hit {
+                        Some(d) => d,
+                        None => {
+                            let (shared, flag) = unnamed_source(&unnamed, source);
+                            (shared, flag, offset, format!("proxy/{source}"))
+                        }
+                    }
                 };
                 let stream = match prepare_client(stream) {
                     Ok(stream) => stream,
@@ -1392,8 +1588,7 @@ fn run_listener(listener: TcpListener, routes: Arc<Mutex<Vec<Route>>>, stop: Arc
                 std::thread::sleep(Duration::from_millis(40));
             }
             // A client can vanish between SYN and accept(); that aborts this one
-            // connection, not the capture. Treating it as fatal used to close the listener
-            // while the device proxy stayed behind.
+            // connection, not the capture.
             Err(e)
                 if e.kind() == std::io::ErrorKind::Interrupted
                     || e.kind() == std::io::ErrorKind::ConnectionAborted
@@ -1401,9 +1596,9 @@ fn run_listener(listener: TcpListener, routes: Arc<Mutex<Vec<Route>>>, stop: Arc
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            // The listener is gone, so every route is dead. Mark them finished so every UI
+            // stops polling a table that will never fill again.
             Err(e) => {
-                // The shared listener is gone, so every device on it is dead. Report on each
-                // buffer: otherwise every UI keeps polling a session that never fills again.
                 let table = routes.lock().unwrap_or_else(|p| p.into_inner());
                 for route in table.iter() {
                     if let Ok(mut buffer) = route.shared.lock() {
@@ -1425,8 +1620,14 @@ fn run_listener(listener: TcpListener, routes: Arc<Mutex<Vec<Route>>>, stop: Arc
     }
 }
 
-/// One device's membership in the shared listener. The socket itself belongs to
-/// [`ProxyHub`]; this handle owns the device-side proxy setting and its own request buffer.
+/// One device's membership in the shared proxy.
+///
+/// The socket belongs to [`ProxyRuntime`]; this handle owns two *separate* things:
+///   * a [`Route`] on the shared listener, so that device's traffic is attributed to it;
+///   * a [`ProxyGuard`], which writes and restores the device-side proxy setting.
+///
+/// They are torn down independently on purpose: stopping a capture must restore the phone's
+/// proxy without disconnecting any other device, and the listener outlives every capture.
 pub struct ProxyCapture {
     session_id: String,
     serial: String,
@@ -1434,50 +1635,78 @@ pub struct ProxyCapture {
     shared: Arc<Mutex<ProxyBuffer>>,
     stop: Arc<AtomicBool>,
     guard: Option<ProxyGuard>,
-    hub: Arc<ProxyHub>,
+    runtime: Arc<Mutex<ProxyRuntime>>,
 }
 
 impl ProxyCapture {
-    /// Join the shared listener, then point the device at it. Ordering matters twice: the
-    /// route must exist before the phone is told where to send traffic, and the proxy must
-    /// never be set for a route the hub does not have.
+    /// Ensure the shared listener exists, register this device on it, then point the device
+    /// at that endpoint.
+    ///
+    /// Order matters twice: the route must exist before the phone is told where to send
+    /// traffic, and the device proxy must never be set for an endpoint the runtime does not
+    /// serve. A failure at any step leaves both sides clean.
     pub fn start(
-        hub: &Arc<ProxyHub>,
+        runtime: &Arc<Mutex<ProxyRuntime>>,
         adb_path: &Path,
         serial: &str,
-        port: u16,
         offset_secs: i32,
         session_id: String,
     ) -> Result<Self, String> {
-        // Routing is by source address, but an address we cannot read must not be fatal:
-        // the route simply starts unbound and the first connection claims it. Guessing or
-        // refusing here is what turns "adb could not name the interface" into "no rows".
+        // Routing is by source address, but an address we cannot read is not fatal: the
+        // route starts unbound and that device's traffic is served as an unnamed source
+        // instead of being guessed into another device's table.
         let ip = device_ip(adb_path, serial);
-        let lan = local_lan_ip(ip).ok_or_else(|| "无法确定本机局域网地址".to_string())?;
+        // The proxy is a feature of its own; starting a device capture only configures that
+        // device on top of it. Refusing here (instead of silently opening a listener) is what
+        // makes the UI guide the user to "开启代理" first, so the two features never turn into
+        // two listeners again.
+        let endpoint = {
+            let runtime = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            if !runtime.running() {
+                return Err(
+                    "还没有开启代理。请先在顶栏点「代理」并开启，再回到这里开始原生接口采集。"
+                        .to_string(),
+                );
+            }
+            runtime
+                .endpoint()
+                .ok_or_else(|| "代理没有在监听，请先在顶栏「代理」里重新开启。".to_string())?
+        };
         let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
         let stop = Arc::new(AtomicBool::new(false));
-        let endpoint = hub.attach(
-            Route {
-                serial: serial.to_string(),
-                ip,
-                offset_secs,
-                shared: Arc::clone(&shared),
-                stop: Arc::clone(&stop),
-            },
-            lan,
-            port,
-        )?;
+        let route = Route {
+            serial: serial.to_string(),
+            ip,
+            offset_secs,
+            shared: Arc::clone(&shared),
+            stop: Arc::clone(&stop),
+        };
+        if let Err(e) = runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bind_device(route)
+        {
+            crate::error_log::record_flow(
+                "capture.proxy.start",
+                "设备绑定失败",
+                &format!("id={session_id} serial={serial} error={e}"),
+            );
+            return Err(e);
+        }
         let guard = match ProxyGuard::apply(adb_path, serial, &endpoint) {
             Ok(guard) => guard,
             Err(e) => {
-                // The route exists but the device could not be pointed at it. Leaving it
-                // behind would keep the listener alive for a device that never talks.
+                // The route exists but the phone was not pointed at it. Drop the route, but
+                // keep the listener: it is shared and may serve other clients.
+                runtime
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .unbind_device(serial);
                 crate::error_log::record_flow(
                     "capture.proxy.start",
                     "设备代理设置失败",
                     &format!("id={session_id} serial={serial} endpoint={endpoint} error={e}"),
                 );
-                hub.detach(serial);
                 return Err(e);
             }
         };
@@ -1488,8 +1717,8 @@ impl ProxyCapture {
                 "id={session_id} serial={serial} endpoint={endpoint} device_ip={} source={}",
                 ip.map(|v| v.to_string()).unwrap_or_default(),
                 match ip {
-                    Some(_) => "按来源 IP 分发",
-                    None => "未识别设备 IP",
+                    Some(_) => "按来源 IP 分流到本设备",
+                    None => "未识别设备 IP，请求将显示在独立代理页",
                 }
             ),
         );
@@ -1500,16 +1729,14 @@ impl ProxyCapture {
                 endpoint,
                 device_ip: ip.map(|addr| addr.to_string()).unwrap_or_default(),
                 allowed_sources: match ip {
-                    Some(addr) => format!("{addr}（按来源 IP 分发）"),
-                    // Say it out loud: the capture will still record rows, they are simply
-                    // attributed to this device without an address check.
-                    None => "未识别到设备 IP，按唯一设备归属".to_string(),
+                    Some(addr) => format!("{addr}（按来源 IP 分流）"),
+                    None => "未识别设备 IP：请求会显示在独立代理页".to_string(),
                 },
             },
             shared,
             stop,
             guard: Some(guard),
-            hub: Arc::clone(hub),
+            runtime: Arc::clone(runtime),
         })
     }
 
@@ -1535,7 +1762,7 @@ impl ProxyCapture {
             Err(poisoned) => poisoned.into_inner(),
         };
         let pending = std::mem::take(&mut buffer.pending);
-        let mut status = NetworkCaptureStatus {
+        let status = NetworkCaptureStatus {
             session_id: self.session_id.clone(),
             running: !buffer.finished,
             entry_count: 0,
@@ -1543,59 +1770,80 @@ impl ProxyCapture {
             target: self.info.endpoint.clone(),
             error: buffer.error.clone(),
         };
-        let finished = !status.running;
-        drop(buffer);
-        // The shared listener can die on its own (accept error) without anyone calling
-        // stop(). Leave the routing table and restore here as well: the guard must not
-        // depend on a UI button that may already be disabled because the capture reports
-        // itself as finished.
-        if finished {
-            self.hub.detach(&self.serial);
-            if let Some(mut guard) = self.guard.take() {
-                if let Err(e) = guard.restore() {
-                    let message = if status.error.is_empty() {
-                        e
-                    } else {
-                        format!("{}；{e}", status.error)
-                    };
-                    if let Ok(mut buffer) = self.shared.lock() {
-                        buffer.error = message.clone();
-                    }
-                    status.error = message;
-                }
-            }
-        }
         (pending, status)
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
-        // Stop this device's in-flight connections, then leave the routing table: while the
-        // route exists the hub keeps the listener open and keeps accepting its traffic.
+        // Leave the routing table so this device's traffic is no longer attributed to a
+        // session nobody polls; the shared listener itself stays up.
         self.stop.store(true, Ordering::Relaxed);
-        self.hub.detach(&self.serial);
-        let mut errors = Vec::new();
-        // Restore unconditionally: the route being gone says nothing about whether the
-        // device still points at the proxy.
+        self.runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unbind_device(&self.serial);
+        // Restore unconditionally: leaving the route says nothing about whether the phone
+        // still points at us.
         if let Some(mut guard) = self.guard.take() {
-            if let Err(e) = guard.restore() {
-                errors.push(e);
-            }
+            return guard.restore();
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("；"))
-        }
+        Ok(())
     }
 }
 
 impl Drop for ProxyCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // A dropped capture must leave the routing table too, otherwise the hub keeps a
-        // listener open for a device nothing will ever poll.
-        self.hub.detach(&self.serial);
-        // ProxyGuard::drop restores the original proxy even if stop() was never called.
+        // A dropped capture must leave the routing table too, so a device that is no longer
+        // polled cannot keep receiving attribution. ProxyGuard::drop restores the device proxy
+        // even if stop() was never called.
+        self.runtime
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .unbind_device(&self.serial);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone view of the shared proxy
+// ---------------------------------------------------------------------------
+
+/// Status of the shared proxy, including the endpoint every client is pointed at.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProxyServerStatus {
+    pub running: bool,
+    /// Address clients must be pointed at, e.g. `172.21.32.185:18999`.
+    pub endpoint: String,
+    pub lan: String,
+    pub port: u16,
+    /// Distinct unbound source addresses seen (the standalone page's groups).
+    pub sources: u32,
+    /// Devices currently bound to the same listener.
+    pub devices: u32,
+    pub error: String,
+}
+
+/// Build the status the UI shows for the shared proxy.
+pub fn proxy_status(runtime: &ProxyRuntime) -> ProxyServerStatus {
+    let endpoint = runtime.endpoint().unwrap_or_default();
+    let (lan, port) = match runtime.lan() {
+        Some(lan) => (
+            lan.to_string(),
+            endpoint
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+                .unwrap_or(0),
+        ),
+        None => (String::new(), 0),
+    };
+    ProxyServerStatus {
+        running: runtime.running(),
+        endpoint,
+        lan,
+        port,
+        sources: runtime.unnamed_sources(),
+        devices: runtime.devices().len() as u32,
+        error: String::new(),
     }
 }
 
@@ -1647,84 +1895,217 @@ mod tests {
         }
     }
 
-    fn port_of(endpoint: &str) -> u16 {
-        endpoint
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse().ok())
-            .expect("endpoint 应形如 host:port")
-    }
-
-    /// The whole point of the hub: a second device joins the running listener instead of
-    /// asking the OS for another port.
+    /// R4：严格分流。只有来源地址与绑定设备一致时才归给设备；其它一律是未绑定来源。
+    /// 原实现有「只有一台设备就认领所有来源」的兜底，那会把陌生客户端混进设备表格，
+    /// 与「设备页只显示自己的请求」直接冲突，已按 PRD 决策移除。
     #[test]
-    fn several_devices_share_the_same_listener() {
-        let hub = ProxyHub::new();
-        let lan = Ipv4Addr::LOCALHOST;
-        let first = hub
-            .attach(route("SERIAL-A", [192, 168, 1, 20]), lan, 0)
-            .expect("第一台设备应能启动");
-        let second = hub
-            .attach(route("SERIAL-B", [192, 168, 1, 21]), lan, 0)
-            .expect("第二台设备应复用同一个监听");
-        assert_eq!(first, second, "两台设备必须被指向同一个 endpoint");
-        assert_eq!(hub.routes.lock().unwrap().len(), 2);
-    }
-
-    /// …and the port goes back to the OS once the last device leaves, so a later capture
-    /// (or any other app) can have it again.
-    #[test]
-    fn the_listener_closes_when_the_last_device_leaves() {
-        let hub = ProxyHub::new();
-        let lan = Ipv4Addr::LOCALHOST;
-        let endpoint = hub
-            .attach(route("SERIAL-A", [192, 168, 1, 20]), lan, 0)
-            .unwrap();
-        hub.attach(route("SERIAL-B", [192, 168, 1, 21]), lan, 0).unwrap();
-
-        hub.detach("SERIAL-A");
+    fn routing_is_strict_so_a_stranger_never_lands_in_a_device_table() {
+        let device = Route {
+            serial: "07724S000011".to_string(),
+            ip: Some(Ipv4Addr::new(192, 168, 1, 20)),
+            offset_secs: 0,
+            shared: Arc::new(Mutex::new(ProxyBuffer::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        // 一台设备在场：只有它自己的地址命中，陌生地址不被认领。
+        let only_device = vec![device];
+        assert_eq!(
+            route_for(&only_device, IpAddr::from([192, 168, 1, 20])).map(|r| r.serial.as_str()),
+            Some("07724S000011"),
+            "精确命中的设备必须归给该设备"
+        );
         assert!(
-            hub.slot.lock().unwrap().is_some(),
-            "还有设备在用时监听不能关"
+            route_for(&only_device, IpAddr::from([10, 0, 0, 9])).is_none(),
+            "陌生来源不能被单设备兜底认领，否则会混进设备页"
         );
 
-        hub.detach("SERIAL-B");
-        assert!(hub.slot.lock().unwrap().is_none(), "最后一台设备离开后应关闭监听");
-        TcpListener::bind((Ipv4Addr::LOCALHOST, port_of(&endpoint)))
-            .expect("端口应已释放，可以被再次绑定");
+        // 设备 IP 读不到（路由 ip 为 None）：它的流量同样落到未绑定来源，而不是猜给某台设备。
+        let unbound = vec![unbound_route("07724S000011")];
+        assert!(
+            route_for(&unbound, IpAddr::from([192, 168, 1, 20])).is_none(),
+            "IP 未知的设备不能认领任意来源"
+        );
     }
 
-    /// A machine with two NICs would need a second bind address while the first device is
-    /// still pointed at the old one; refusing is the only answer that keeps that device
-    /// working, so it must be an explicit error rather than a silent rebind.
+    /// End to end: a client the hub has never seen connects to a standalone listener and its
+    /// request lands in a route created on the fly, not in a 403.
     #[test]
-    fn a_second_network_cannot_steal_a_listener_that_is_in_use() {
-        let hub = ProxyHub::new();
-        let endpoint = hub
-            .attach(route("SERIAL-A", [192, 168, 1, 20]), Ipv4Addr::LOCALHOST, 0)
-            .unwrap();
-        let err = hub
-            .attach(
-                route("SERIAL-B", [10, 0, 0, 21]),
-                Ipv4Addr::new(127, 0, 0, 2),
-                0,
-            )
-            .expect_err("已有设备在用旧网段时应拒绝，而不是悄悄改绑");
-        assert!(
-            err.contains(&endpoint),
-            "错误里要说明设备当前指向哪里：{err}"
+    fn a_standalone_listener_enrolls_an_unknown_source() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let mut runtime = ProxyRuntime::new();
+        let endpoint = runtime
+            .ensure_listener_at(Ipv4Addr::LOCALHOST, 0)
+            .expect("应能开启独立代理");
+        let mut client = TcpStream::connect(&endpoint).expect("应能连上独立代理");
+        let request = format!(
+            "GET http://127.0.0.1:{upstream_port}/standalone HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n"
         );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        assert!(
+            String::from_utf8_lossy(&response).contains("200 OK"),
+            "未绑定的来源必须被服务，而不是 403"
+        );
+
+        let mut rows = Vec::new();
+        for _ in 0..100 {
+            rows = runtime.drain_unnamed();
+            if !rows.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(&rows.len(), &1, "独立代理应把这个来源的请求收下来");
+        assert_eq!(rows[0].path, "/standalone");
+        runtime.shutdown();
+        server.join().unwrap();
+    }
+
+    /// A completely external client (the system `curl`) through the shared listener: proves
+    /// the unnamed-source path end to end, not just an in-process socket pair.
+    #[test]
+    fn a_real_curl_client_is_served_by_the_shared_proxy() {
+        if std::process::Command::new("curl").arg("--version").output().is_err() {
+            return;
+        }
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+        });
+
+        let mut runtime = ProxyRuntime::new();
+        let endpoint = runtime.ensure_listener_at(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let output = std::process::Command::new("curl")
+            .arg("-sS")
+            .arg("--max-time")
+            .arg("10")
+            .arg("-x")
+            .arg(&endpoint)
+            .arg(format!("http://127.0.0.1:{upstream_port}/via-curl"))
+            .output()
+            .expect("应能执行 curl");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("true"), "curl 应拿到上游响应，实际: {stdout}");
+
+        let mut rows = Vec::new();
+        for _ in 0..100 {
+            rows = runtime.drain_unnamed();
+            if !rows.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(rows.len(), 1, "curl 的请求应被收下来");
+        assert_eq!(rows[0].path, "/via-curl");
+        runtime.shutdown();
+        server.join().unwrap();
+    }
+
+    /// R1: one listener, period. A device joining does not open a second socket — it adds a
+    /// route — so a device capture and the standalone page always advertise the same address.
+    /// This is the regression behind "代理 18999 / 采集端点 52523".
+    #[test]
+    fn one_listener_is_shared_by_every_device() {
+        let mut runtime = ProxyRuntime::new();
+        let lan = Ipv4Addr::LOCALHOST;
+        let first = runtime.ensure_listener_at(lan, 0).expect("应能开启监听");
+        let second = runtime.ensure_listener_at(lan, 0).expect("应复用同一个监听");
+        assert_eq!(first, second, "第二次必须返回同一个 endpoint，而不是新开一个");
+
+        runtime.bind_device(route("SERIAL-A", [192, 168, 1, 20])).unwrap();
+        runtime
+            .bind_device(route("SERIAL-B", [192, 168, 1, 21]))
+            .unwrap();
+        assert_eq!(runtime.devices().len(), 2);
+        assert_eq!(
+            runtime.endpoint().as_deref(),
+            Some(first.as_str()),
+            "绑定设备不能改变 endpoint"
+        );
+        runtime.shutdown();
+    }
+
+    /// 代理是独立功能：用户还没开代理就点「开始原生采集」时，必须被挡下并引导去开，
+    /// 而不是由设备采集偷偷拉起一个监听（那正是双监听/端口漂移的根源）。
+    #[test]
+    fn a_device_capture_is_refused_until_the_proxy_is_started() {
+        let runtime = Arc::new(Mutex::new(ProxyRuntime::new()));
+        let adb_path = adb::locate().unwrap_or_else(|| std::path::PathBuf::from("/nonexistent/adb"));
+        let err = ProxyCapture::start(&runtime, &adb_path, "NO_SUCH_DEVICE", 0, "test".into())
+            .err()
+            .expect("代理未开启时必须拒绝");
+        assert!(
+            err.contains("代理"),
+            "错误要引导用户先去开启代理，实际: {err}"
+        );
+        assert!(
+            !runtime.lock().unwrap().running(),
+            "被拒绝的尝试不能顺手把监听打开"
+        );
+    }
+
+    /// R3 + PRD「监听器常驻」: closing a device's capture unbinds its route and leaves the
+    /// listener — and every other route — untouched.
+    #[test]
+    fn unbinding_a_device_keeps_the_listener_and_other_devices() {
+        let mut runtime = ProxyRuntime::new();
+        let lan = Ipv4Addr::LOCALHOST;
+        let endpoint = runtime.ensure_listener_at(lan, 0).unwrap();
+        runtime.bind_device(route("SERIAL-A", [192, 168, 1, 20])).unwrap();
+        runtime
+            .bind_device(route("SERIAL-B", [192, 168, 1, 21]))
+            .unwrap();
+
+        runtime.unbind_device("SERIAL-A");
+        assert!(runtime.running(), "关闭一台设备不能关掉共享监听");
+        assert_eq!(runtime.devices().len(), 1, "另一台设备的绑定要保留");
+        assert_eq!(runtime.endpoint().as_deref(), Some(endpoint.as_str()));
+
+        runtime.unbind_device("SERIAL-B");
+        assert!(
+            runtime.running(),
+            "全部设备解除绑定后监听仍然常驻，端口不会漂移"
+        );
+        // 用运行时状态判断，而不是重新 bind：测试并行跑时那个端口可能正被别的用例
+        // 使用或处于 TIME_WAIT，bind 断言会偶发失败（曾出现过一次）。
+        assert!(runtime.running(), "解绑设备后监听必须仍在");
+        runtime.shutdown();
+        assert!(!runtime.running(), "显式 shutdown 后监听应关闭");
+        assert_eq!(runtime.endpoint(), None, "关闭后不再对外宣告端点");
     }
 
     #[test]
     fn one_address_belongs_to_one_device() {
-        let hub = ProxyHub::new();
-        let lan = Ipv4Addr::LOCALHOST;
-        hub.attach(route("SERIAL-A", [192, 168, 1, 20]), lan, 0).unwrap();
+        let mut runtime = ProxyRuntime::new();
+        runtime
+            .ensure_listener_at(Ipv4Addr::LOCALHOST, 0)
+            .unwrap();
+        runtime.bind_device(route("SERIAL-A", [192, 168, 1, 20])).unwrap();
         // Same IP, different serial: the second one could never tell its rows apart.
-        let err = hub
-            .attach(route("SERIAL-B", [192, 168, 1, 20]), lan, 0)
+        let err = runtime
+            .bind_device(route("SERIAL-B", [192, 168, 1, 20]))
             .expect_err("同一个 IP 不能绑定两台设备");
         assert!(err.contains("192.168.1.20"), "错误里应说明是哪个 IP：{err}");
+        runtime.shutdown();
     }
 
     #[test]
@@ -1743,41 +2124,33 @@ mod tests {
         assert!(route_for(&two, IpAddr::V4(Ipv4Addr::LOCALHOST)).is_none());
     }
 
-    /// The regression this guards: an address adb could not read (or that changed after a
-    /// DHCP renew) must not silently stop a capture from recording anything.
+    /// 行为变更（PRD 决策）：设备地址读不到时，它的流量**不再**被兜底认领，而是归入
+    /// 未绑定来源（独立代理页），由 UI 明确提示。原兜底会把陌生客户端混进设备表格。
     #[test]
-    fn one_device_claims_every_source_when_its_address_is_unknown() {
+    fn an_unknown_device_address_never_claims_arbitrary_sources() {
         let unbound = vec![unbound_route("SERIAL-A")];
-        assert_eq!(
-            route_for(&unbound, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99)))
-                .map(|r| r.serial.as_str()),
-            Some("SERIAL-A"),
-            "地址未知时，唯一设备应认领未登记来源"
+        assert!(
+            route_for(&unbound, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))).is_none(),
+            "地址未知的设备不能认领任意来源，否则会串台"
         );
 
-        // A known address but a different source: still the only device, still its traffic.
+        // Known address but a different source: still not this device's traffic.
         let single = vec![route("SERIAL-A", [192, 168, 1, 20])];
-        assert_eq!(
-            route_for(&single, IpAddr::V4(Ipv4Addr::LOCALHOST)).map(|r| r.serial.as_str()),
-            Some("SERIAL-A"),
-            "只有一台设备时，来源没有歧义，本机调试流量也应归属到它"
+        assert!(
+            route_for(&single, IpAddr::V4(Ipv4Addr::LOCALHOST)).is_none(),
+            "只有一台设备时也不能认领非本机地址，严格分流"
         );
 
-        // Several devices: only a device whose address was never learned may claim traffic,
-        // and only when it is the single such device.
+        // Several devices behave the same way: only exact matches are attributed.
         let mixed = vec![
             route("SERIAL-A", [192, 168, 1, 20]),
             unbound_route("SERIAL-B"),
         ];
+        assert!(route_for(&mixed, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))).is_none());
         assert_eq!(
-            route_for(&mixed, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99)))
+            route_for(&mixed, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)))
                 .map(|r| r.serial.as_str()),
-            Some("SERIAL-B")
-        );
-        let two_unbound = vec![unbound_route("SERIAL-A"), unbound_route("SERIAL-B")];
-        assert!(
-            route_for(&two_unbound, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))).is_none(),
-            "两台地址未知的设备无法区分，应拒绝而不是瞎猜"
+            Some("SERIAL-A")
         );
     }
 
@@ -1867,6 +2240,45 @@ mod tests {
     fn lan_ip_is_a_real_non_loopback_address() {
         let ip = local_lan_ip(Some(Ipv4Addr::new(172, 21, 32, 224))).expect("应有本机 LAN 地址");
         assert!(!ip.is_loopback(), "不能把设备代理指向 127.0.0.1");
+    }
+
+    /// The reported bug: with a VPN / proxy running in TUN mode the default route belongs
+    /// to a `utun` device (`198.18.0.1`), so "the address that reaches 8.8.8.8" is a tunnel
+    /// address no phone on the LAN can dial back. Asking for a LAN address must not return
+    /// it.
+    #[test]
+    fn a_tunnel_address_is_never_handed_out_as_the_lan_address() {
+        assert!(local_lan_ip(None).map(|ip| !is_tunnel_ip(ip)).unwrap_or(true));
+        assert!(is_tunnel_ip(Ipv4Addr::new(198, 18, 0, 1)), "Clash / Surge TUN 网段");
+        assert!(is_tunnel_ip(Ipv4Addr::new(198, 19, 0, 1)));
+        assert!(is_tunnel_ip(Ipv4Addr::new(100, 100, 0, 1)), "CGNAT 网段");
+        // Real LAN addresses must keep working.
+        assert!(!is_tunnel_ip(Ipv4Addr::new(172, 21, 32, 185)));
+        assert!(!is_tunnel_ip(Ipv4Addr::new(192, 168, 1, 10)));
+        assert!(!is_tunnel_ip(Ipv4Addr::new(10, 0, 0, 5)));
+    }
+
+    /// Parsing the real `ifconfig` / `ipconfig` / `ip -o` shapes. Without this, an interface
+    /// printer that changes shape silently degrades to "no LAN address at all".
+    #[test]
+    fn local_addresses_are_parsed_from_every_platform_shape() {
+        let macos = "en0: flags=8863<UP,BROADCAST>\n\
+                     \tinet 172.21.32.185 netmask 0xfffffc00 broadcast 172.21.35.255\n\
+                     utun5: flags=8051<UP,POINTOPOINT>\n\
+                     \tinet 198.18.0.1 --> 198.18.0.1 netmask 0xfffffffc\n\
+                     lo0: flags=8049<UP,LOOPBACK>\n\
+                     \tinet 127.0.0.1 netmask 0xff000000\n";
+        let addrs = parse_local_ipv4(macos);
+        assert!(addrs.contains(&Ipv4Addr::new(172, 21, 32, 185)));
+        assert!(addrs.contains(&Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(addrs.contains(&Ipv4Addr::new(127, 0, 0, 1)));
+
+        let linux = "2: wlan0    inet 172.21.33.28/22 brd 172.21.35.255 scope global wlan0\n";
+        assert_eq!(parse_local_ipv4(linux), vec![Ipv4Addr::new(172, 21, 33, 28)]);
+
+        let windows = "   IPv4 Address. . . . . . . . . . . : 192.168.1.20\r\n\
+                       \t  Subnet Mask . . . . . . . . . . . : 255.255.255.0\r\n";
+        assert_eq!(parse_local_ipv4(windows), vec![Ipv4Addr::new(192, 168, 1, 20)]);
     }
 
     #[test]
@@ -1971,9 +2383,28 @@ mod tests {
         assert_eq!(rows[0].source, "proxy");
     }
 
-    /// The path that a real device takes: shared listener → route lookup → per-device
-    /// buffer. `handle_connection` is exercised elsewhere, but a break in the hub (wrong
-    /// route, no listener, buffer not shared) shows up here as "the table stays empty".
+    /// R4 隔离：一台设备只能看到自己 IP 的流量，同网段的另一台设备不能被并入。
+    #[test]
+    fn a_device_attached_on_one_ip_never_sees_another_clients_traffic() {
+        let routes = vec![Route {
+            serial: "07724S000011".to_string(),
+            ip: Some(Ipv4Addr::new(172, 21, 33, 12)),
+            offset_secs: 0,
+            shared: Arc::new(Mutex::new(ProxyBuffer::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+        }];
+        assert!(
+            route_for(&routes, IpAddr::V4(Ipv4Addr::new(172, 21, 33, 100))).is_none(),
+            "同网段的另一台设备不能并入已绑定设备的表格"
+        );
+        assert_eq!(
+            route_for(&routes, IpAddr::V4(Ipv4Addr::new(172, 21, 33, 12)))
+                .map(|r| r.serial.as_str()),
+            Some("07724S000011")
+        );
+    }
+
+    /// The path a real device takes: shared listener → strict route lookup → per-device buffer.
     #[test]
     fn a_request_through_the_shared_listener_lands_in_its_device_buffer() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1987,17 +2418,21 @@ mod tests {
                 .unwrap();
         });
 
-        let hub = ProxyHub::new();
+        let mut runtime = ProxyRuntime::new();
         let shared = Arc::new(Mutex::new(ProxyBuffer::default()));
-        // No address: this is exactly the case that used to route nothing at all.
+        // Bound to the address the test client actually connects from: routing is strict, so
+        // a route without an address would (correctly) receive nothing.
         let route = Route {
             serial: "SERIAL-A".to_string(),
-            ip: None,
+            ip: Some(Ipv4Addr::LOCALHOST),
             offset_secs: 0,
             shared: Arc::clone(&shared),
             stop: Arc::new(AtomicBool::new(false)),
         };
-        let endpoint = hub.attach(route, Ipv4Addr::LOCALHOST, 0).expect("应能启动监听");
+        let endpoint = runtime
+            .ensure_listener_at(Ipv4Addr::LOCALHOST, 0)
+            .expect("应能启动监听");
+        runtime.bind_device(route).expect("设备应能绑定到共享监听");
 
         let mut client = TcpStream::connect(&endpoint).expect("应能连上共享监听");
         let request = format!(
@@ -2020,7 +2455,7 @@ mod tests {
         assert_eq!(rows[0].path, "/hub-probe");
         assert_eq!(rows[0].status, 200);
         server.join().unwrap();
-        hub.detach("SERIAL-A");
+        runtime.shutdown();
     }
 
     /// The mojibake in the detail panel: a gzipped, chunked JSON reply was stored with its
@@ -2325,8 +2760,14 @@ mod tests {
                 .unwrap();
         });
 
-        let hub = Arc::new(ProxyHub::new());
-        let mut capture = ProxyCapture::start(&hub, &adb_path, &serial, 0, 0, "test".into())
+        let runtime = Arc::new(Mutex::new(ProxyRuntime::new()));
+        // 先按「代理」功能的路径开监听：设备采集不再自己拉起监听。
+        runtime
+            .lock()
+            .unwrap()
+            .ensure_listener_at(Ipv4Addr::LOCALHOST, 0)
+            .expect("应能开启代理");
+        let mut capture = ProxyCapture::start(&runtime, &adb_path, &serial, 0, "test".into())
             .expect("应能启动原生接口采集");
         let endpoint = capture.info().endpoint.clone();
         let mut client = TcpStream::connect(&endpoint).expect("应能连上内建代理");

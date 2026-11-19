@@ -252,6 +252,8 @@ export interface NetworkRequest {
   error: string
   /** har | jsonl | cdp */
   source: string
+  /** 产生这条请求的客户端：设备抓包为串号，独立代理为来源 IP，文件导入为空 */
+  device: string
   redacted: boolean
 }
 
@@ -333,6 +335,8 @@ export interface NetworkSessionInfo {
   device: string
   streaming: boolean
   count: number
+  /** 原生采集识别到的设备 IP；空表示没读到，流量会归入独立代理页 */
+  deviceIp: string
 }
 
 export interface NetworkPollResult {
@@ -340,6 +344,20 @@ export interface NetworkPollResult {
   requests: NetworkRequest[]
   status: NetworkCaptureStatus
   added: number
+}
+
+/** 独立代理（本地 HTTP 代理）的状态，不绑定任何设备。 */
+export interface ProxyServerStatus {
+  running: boolean
+  /** 客户端要指向的地址，如 172.21.32.185:18999 */
+  endpoint: string
+  lan: string
+  port: number
+  /** 已经连上来过的不同来源地址数量（独立代理页的分组） */
+  sources: number
+  /** 绑定在同一监听上的设备数量：抓包页与独立代理共用这一个代理 */
+  devices: number
+  error: string
 }
 
 export interface ProxyState {

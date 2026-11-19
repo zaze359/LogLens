@@ -285,6 +285,9 @@ pub struct NetworkSessionInfo {
     pub device: String,
     pub streaming: bool,
     pub count: u32,
+    /// 原生采集绑定时识别到的设备 IP。为空表示没读到 —— 其流量会归入独立代理页，
+    /// UI 据此提示用户，而不是让人对着空表格猜。
+    pub device_ip: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { openJsonPanel } from '../../stores/session'
+import { openJsonPanel, openProxyPanel, refreshProxyServer, store } from '../../stores/session'
 import { toCurl } from '../../lib/curl'
 import { errorMessage, ipc } from '../../lib/ipc'
 import { reportClientFlow } from '../../lib/error-report'
 import type {
   NetworkCaptureStatus,
+  NetworkPollResult,
   NetworkRequest,
   NetworkSessionInfo,
   ProbeReport,
@@ -28,9 +29,23 @@ const busy = ref(false)
 const busyChannel = ref<'cdp' | 'proxy' | ''>('')
 const error = ref('')
 
+/** `NetworkSessionInfo` plus the device the capture was started on, so a stale record can be matched to this tab. */
+type CapturedInfo = NetworkSessionInfo & { serial: string }
 /** WebView and native captures may run together and are merged into one request table. */
-const captures = ref<NetworkSessionInfo[]>([])
+const captures = ref<CapturedInfo[]>([])
 const statuses = ref<Record<string, NetworkCaptureStatus>>({})
+/**
+ * 后端状态确认已经不存在的会话（例如 App 重启后，内存里的 id 指向一条早已不在的记录）。
+ * 这类采集不再算作"运行中"：否则 `running` 一直为真，「开始采集」按钮永远置灰，
+ * 只能关掉整个日志页才能重来。按通道（`proxy` / `cdp`）汇总，行上的「已停止」用它。
+ */
+const staleSources = computed<Record<string, true>>(() => {
+  const stale: Record<string, true> = {}
+  for (const c of captures.value) {
+    if (statuses.value[c.id]?.running === false) stale[c.source] = true
+  }
+  return stale
+})
 const requests = ref<NetworkRequest[]>([])
 const fileMode = ref(false)
 const selected = ref<NetworkRequest | null>(null)
@@ -67,6 +82,8 @@ const curlText = computed(() => (selected.value ? toCurl(selected.value) : ''))
 let timer: ReturnType<typeof setInterval> | null = null
 /** 清空表格时递增：清空之前发出、清空之后才返回的轮询结果必须丢弃，否则历史会被回填。 */
 let clearEpoch = 0
+/** 是否有一次 `pollAll` 还没返回。间隔 800ms 比一次慢轮询短，不拦住就会叠出乱序结果。 */
+let polling = false
 
 /**
  * 抓包流程快照。只记计数与状态，不记 URL / 正文；写入同一个有上限的诊断日志，
@@ -83,13 +100,18 @@ let lastUiHadRows = false
 const cdpSocket = computed(() => report.value?.evidence.devtools[0]?.socket ?? '')
 /** 体检与两条通道的启动都要走 adb；adb 断开后这些操作只会失败，直接禁用并说明。 */
 const canProbe = computed(() => !!props.serial && props.connected && !probing.value)
+/** 只有后端仍认定在跑的通道才算运行中；失效会话不能把「开始采集」一直锁死。 */
 const cdpRunning = computed(() =>
-  captures.value.some((c) => c.source === 'cdp' && statuses.value[c.id]?.running)
+  captures.value.some(
+    (c) => c.source === 'cdp' && !staleSources.value[c.source] && statuses.value[c.id]?.running
+  )
 )
 const proxyRunning = computed(() =>
-  captures.value.some((c) => c.source === 'proxy' && statuses.value[c.id]?.running)
+  captures.value.some(
+    (c) => c.source === 'proxy' && !staleSources.value[c.source] && statuses.value[c.id]?.running
+  )
 )
-const running = computed(() => Object.values(statuses.value).some((s) => s.running))
+const running = computed(() => cdpRunning.value || proxyRunning.value)
 const events = computed(() =>
   Object.values(statuses.value).reduce((sum, s) => sum + s.events, 0)
 )
@@ -99,13 +121,25 @@ const targets = computed(() =>
     .filter(Boolean)
     .join(' · ')
 )
+/**
+ * 已绑定但没有识别出 IP 的原生采集：它的请求会归入未绑定来源（独立代理页），
+ * 本页收不到。不提示的话，用户会以为抓包没生效。
+ */
+const proxyWithoutIp = computed(() =>
+  captures.value
+    .filter((c) => c.source === 'proxy' && !c.deviceIp && statuses.value[c.id]?.running)
+    .map((c) => c.device)
+)
 const canStartCdp = computed(
   () => !!props.serial && props.connected && !!cdpSocket.value && !cdpRunning.value && !busy.value
 )
+/** 「代理」面板里是否已经在监听：原生采集只是往这个代理上绑定设备，不能自己拉起监听。 */
+const proxyLive = computed(() => !!store.proxyServer?.running)
 const canStartProxy = computed(
   () =>
     !!props.serial &&
     props.connected &&
+    proxyLive.value &&
     !proxyRunning.value &&
     !busy.value &&
     !proxyState.value?.active
@@ -147,6 +181,8 @@ const cdpStartHint = computed(() => {
 const proxyStartHint = computed(() => {
   if (!props.serial) return '先选择设备'
   if (!props.connected) return '设备已断开，重连后才能开始新的采集'
+  // 代理是独立功能：没开启时引导用户先去开，而不是替用户偷偷拉起一个监听。
+  if (!proxyLive.value) return '请先在顶栏点「代理」并开启代理，再开始原生接口采集'
   if (proxyState.value?.active) return '设备上已有手动代理，先在下方还原再开始'
   return ''
 })
@@ -172,6 +208,9 @@ function statusClass(row: NetworkRequest): string {
 function sourceLabel(row: NetworkRequest): string {
   if (row.source === 'cdp') return 'H5'
   if (row.source === 'proxy') return '原生'
+  // The capture that produced this row is no longer live: after the last channel stops,
+  // the table keeps showing what was captured and every row honestly reads "已停止".
+  if (row.source && staleSources.value[row.source]) return '已停止'
   return '文件'
 }
 
@@ -430,21 +469,32 @@ async function pollAll(): Promise<void> {
     stopPolling()
     return
   }
+  // One poll at a time. A connection refused by a device that has been unplugged can take
+  // longer than the 800ms cadence, and overlapping polls would then resolve out of order
+  // and let an older snapshot overwrite a newer one.
+  if (polling) return
+  polling = true
   const epoch = clearEpoch
-  const settled = await Promise.allSettled(
-    captures.value.map((c) => ipc.pollNetworkCapture(c.id))
-  )
+  let settled: PromiseSettledResult<NetworkPollResult>[]
+  try {
+    settled = await Promise.allSettled(
+      captures.value.map((c) => ipc.pollNetworkCapture(c.id))
+    )
+  } finally {
+    polling = false
+  }
   // A poll that started before the table was cleared still carries the old history.
   if (epoch !== clearEpoch) return
   const next = { ...statuses.value }
   const merged: NetworkRequest[] = []
+  const pollErrors: string[] = []
   let ok = 0
   settled.forEach((result, i) => {
     if (result.status !== 'fulfilled') {
-      traceFlow('capture.ui.poll.error', '轮询采集失败', {
-        id: captures.value[i]?.id ?? '',
-        error: errorMessage(result.reason)
-      })
+      const id = captures.value[i]?.id ?? ''
+      const reason = errorMessage(result.reason)
+      pollErrors.push(reason)
+      traceFlow('capture.ui.poll.error', '轮询采集失败', { id, error: reason })
       return
     }
     ok += 1
@@ -507,7 +557,23 @@ async function pollAll(): Promise<void> {
     )
     if (fresh) selected.value = fresh
   }
-  if (ok === 0 || Object.values(next).every((s) => !s.running)) stopPolling()
+  // Stop only when a poll actually reached the backend and it says every channel finished.
+  // Timing out once (`ok === 0`) must NOT stop the loop: the capture keeps running in Rust
+  // and nothing restarted the timer, so the table stayed frozen at whatever it held while
+  // requests kept arriving. `watch` on `captures` re-arms the loop if it is ever stopped
+  // while a capture is still live.
+  if (ok > 0 && Object.values(next).every((s) => !s.running)) {
+    stopPolling()
+    // Each channel's own line below the toolbar already says "已停止"; just drop the
+    // transient retry banner so a finished capture does not look broken.
+    if (pollErrors.length === 0) error.value = ''
+    return
+  }
+  // Still capturing: keep retrying, but never silently. A device that dropped off the
+  // network (connection refused / timed out) must show up as text, not as a frozen table.
+  if (ok === 0 && pollErrors.length > 0) {
+    error.value = `读取采集结果失败，正在重试：${pollErrors.join('；')}`
+  }
 }
 
 function beginLive(info: NetworkSessionInfo): void {
@@ -517,7 +583,7 @@ function beginLive(info: NetworkSessionInfo): void {
     resetView()
   }
   fileMode.value = false
-  captures.value = [...captures.value, info]
+  captures.value = [...captures.value, { ...info, serial: props.serial }]
   statuses.value = {
     ...statuses.value,
     [info.id]: {
@@ -529,7 +595,7 @@ function beginLive(info: NetworkSessionInfo): void {
       error: ''
     }
   }
-  if (timer === null) timer = setInterval(() => void pollAll(), 800)
+  ensurePolling()
   traceFlow('capture.ui.start', '开始接收采集', {
     id: info.id,
     source: info.source,
@@ -537,6 +603,30 @@ function beginLive(info: NetworkSessionInfo): void {
     total: captures.value.length
   })
 }
+
+/** 开启（或重新拉起）轮询。开会话和恢复轮询是两件事，这里只管后者。 */
+function ensurePolling(): void {
+  if (timer === null && captures.value.length > 0 && !fileMode.value) {
+    timer = setInterval(() => void pollAll(), 800)
+  }
+}
+
+/**
+ * 轮询是 UI 唯一的取数通道：后端采集还在跑，但定时器一旦被停掉，表格就永远停在停掉
+ * 那一刻，之后抓到的请求一条都不会再出现——看起来和"抓不到包"一模一样。
+ * 这里保证只要还有采集会话，轮询就在跑；停轮询只应发生在没有会话或采集确实结束之后。
+ */
+watch(
+  () => [captures.value.length, fileMode.value] as const,
+  () => {
+    if (timer !== null || captures.value.length === 0 || fileMode.value) return
+    traceFlow('capture.ui.poll', '轮询意外停止，已恢复', {
+      captures: captures.value.length,
+      rows: requests.value.length
+    })
+    ensurePolling()
+  }
+)
 
 /**
  * Starting the first channel (or restarting after a stop) begins a fresh table. Starting
@@ -548,6 +638,22 @@ async function prepareLive(): Promise<void> {
     requests.value = []
     selected.value = null
     resetView()
+  } else {
+    // 面板切到另一台设备时，上一台留下的失效会话还挂在 captures 里；后端已经不认它，
+    // 但同通道的检查会把它当成"运行中"而拒绝启动。清掉它再开新采集。
+    const orphans = captures.value.filter(
+      (c) => staleSources.value[c.source] && c.serial !== props.serial
+    )
+    if (orphans.length > 0) {
+      captures.value = captures.value.filter((c) => !orphans.includes(c))
+      const nextStatuses = { ...statuses.value }
+      for (const c of orphans) {
+        delete nextStatuses[c.id]
+        void ipc.closeNetworkCapture(c.id).catch(() => {})
+      }
+      statuses.value = nextStatuses
+      traceFlow('capture.ui.close', '清理失效采集会话', { count: orphans.length })
+    }
   }
   fileMode.value = false
   boundSerial.value = props.serial
@@ -775,6 +881,8 @@ watch(
   () => [props.serial, props.active, props.connected] as const,
   async ([serial, active, connected], previous) => {
     if (!active) return
+    // 切到抓包工具时确认代理状态：代理可能在别的地方刚开启/关闭，本工具要据此决定能否开始。
+    void refreshProxyServer()
     if (!serial) {
       report.value = null
       return
@@ -900,6 +1008,13 @@ defineExpose({ shutdown, isCapturing: running })
           <span class="muted">{{ countLabel }}</span>
         </div>
 
+        <!-- 未开启代理时，与其让按钮置灰，不如直接给一个能点的引导按钮 -->
+        <p v-if="!proxyLive && !proxyRunning" class="net-start-hint">
+          原生接口采集需要先用代理抓包。请先
+          <button class="btn btn-sm btn-primary" @click="openProxyPanel">开启代理</button>
+          ，再回来开始原生接口采集；开启后设备会连接到代理显示的那个地址。
+        </p>
+
         <!-- 原生代理只影响新进程：已运行的 App 继续直连，是"开启后仍看不到"的常见原因 -->
         <p v-if="proxyRunning" class="net-start-hint">
           原生采集已开启。如果被测 App 在此之前已经在运行，请<b>完全退出并重新打开它</b>；
@@ -1007,7 +1122,16 @@ defineExpose({ shutdown, isCapturing: running })
         <p v-if="h5NoPage" class="empty-hint warn">
           调试通道已就绪，但当前没有打开的 H5 页面。请在 App 里进入一个 WebView 页面，请求会自动出现在这里。
         </p>
-        <p v-if="targets" class="empty-hint mono">采集端点：{{ targets }}</p>
+        <!-- 全应用只有一个代理，这台设备只是它上面的一条路由：说清楚端点是与独立代理共用的，
+             避免再出现「代理是 18999、采集端点是 52523」这种看起来像两个代理的困惑 -->
+        <p v-if="targets" class="empty-hint mono">
+          采集端点：{{ targets }}（与「代理」面板共用同一个监听）
+        </p>
+        <!-- 设备 IP 读不到时它的流量会落到独立代理页；不提示的话，用户会以为抓包没生效 -->
+        <p v-if="proxyWithoutIp.length > 0" class="empty-hint warn">
+          未识别设备 IP（{{ proxyWithoutIp.join('、') }}）：请求会显示在顶栏「代理」面板里，
+          不出现在本页。重新连接设备或重开采集可重新读取。
+        </p>
         <p v-for="c in captures" :key="c.id" class="empty-hint mono">
           {{ c.label }} · {{ statuses[c.id]?.error || (statuses[c.id]?.running ? '运行中' : '已停止') }}
         </p>

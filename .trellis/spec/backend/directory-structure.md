@@ -28,7 +28,7 @@ src-tauri/
     ├── netcapture.rs        # Capture abstraction, proxy journal, stale-proxy self-heal
     ├── network.rs           # NetworkRequest, HAR/JSONL parsing, secret redaction
     ├── cdp.rs               # WebView DevTools Protocol capture
-    └── proxy.rs             # Built-in HTTP/CONNECT proxy capture
+    └── proxy.rs             # The one HTTP/CONNECT proxy: shared listener + routing
 ```
 
 ---

@@ -22,6 +22,7 @@ import type {
   NetworkSessionInfo,
   ProbeReport,
   ProxyCaptureOptions,
+  ProxyServerStatus,
   ProxyState
 } from '../types'
 
@@ -154,6 +155,13 @@ export const ipc = {
     call<ProxyState>('configure_device_proxy', { serial, proxy }),
   restoreDeviceProxy: (serial: string) =>
     call<ProxyState>('restore_device_proxy', { serial }),
+
+  // --- standalone proxy (no device involved) ---
+  startProxyServer: (port: number) =>
+    call<ProxyServerStatus>('start_proxy_server', { port }),
+  stopProxyServer: () => call<void>('stop_proxy_server'),
+  proxyServerStatus: () => call<ProxyServerStatus>('proxy_server_status'),
+  pollProxyServer: () => call<NetworkRequest[]>('poll_proxy_server'),
 
   // --- client self-diagnostics ---
   listErrorLog: () => call<ErrorRecord[]>('list_error_log'),

@@ -7,12 +7,12 @@
 use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult, SearchHits};
 use crate::netcapture::{AnyCapture, ProxyGuard};
 use crate::network::NetworkRequest;
-use crate::proxy::ProxyHub;
+use crate::proxy::ProxyRuntime;
 use crate::rules::{compute_matches, CompiledFilter, TextMatcher};
 use crate::stream::DeviceStream;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const MAX_CACHED_QUERIES: usize = 12;
@@ -179,6 +179,8 @@ impl LogSession {
 /// because the columns are disjoint (method/status/duration vs tag/level/pid).
 pub struct NetworkSession {
     pub requests: Vec<NetworkRequest>,
+    /// 原生采集识别到的设备 IP；空表示没读到（流量会落到独立代理页）。
+    pub device_ip: String,
     pub label: String,
     pub source: String,
     pub device: String,
@@ -199,9 +201,10 @@ pub struct AppState {
     /// two near-simultaneous starts would both install a guard — and the second would
     /// remember the first's endpoint as "the original setting" to restore.
     starting_proxies: Mutex<HashSet<String>>,
-    /// One proxy listener shared by every device. Created on first use so the tests and the
-    /// file-import paths never bind a socket they do not need.
-    proxy_hub: OnceLock<Arc<ProxyHub>>,
+    /// The one proxy listener. Devices are routes on it and the standalone page is its
+    /// unnamed-source view — a single runtime is what keeps the endpoint stable at 18999
+    /// instead of one listener per consumer racing for the port.
+    pub proxy_runtime: Arc<Mutex<ProxyRuntime>>,
     /// Abort flags for in-flight file imports, keyed by the frontend's request id. The flag
     /// is shared with the parsing thread because a cancelled import cannot use the session
     /// lock (it has no session yet).
@@ -218,7 +221,7 @@ impl Default for AppState {
             network_sessions: Mutex::new(HashMap::new()),
             proxy_guards: Mutex::new(HashMap::new()),
             starting_proxies: Mutex::new(HashSet::new()),
-            proxy_hub: OnceLock::new(),
+            proxy_runtime: Arc::new(Mutex::new(ProxyRuntime::new())),
             import_cancels: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
         }
@@ -228,12 +231,6 @@ impl Default for AppState {
 impl AppState {
     pub fn next_id(&self) -> String {
         format!("s{}", self.seq.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// The process-wide proxy listener. Every native capture joins it, so all devices share
-    /// one port and are told apart by source address.
-    pub fn proxy_hub(&self) -> Arc<ProxyHub> {
-        Arc::clone(self.proxy_hub.get_or_init(|| Arc::new(ProxyHub::new())))
     }
 
     /// Claim the right to start a proxy capture for `serial`. `None` means another start
@@ -280,10 +277,20 @@ impl AppState {
         }
         let mut guards = self.proxy_guards.lock().unwrap_or_else(|p| p.into_inner());
         guards.clear(); // ProxyGuard::drop restores the original proxy
+        // The proxy listener outlives every capture while the app runs, so it has to be
+        // closed here explicitly or the port would outlive the window.
+        let proxy_closed = {
+            let mut runtime = self.proxy_runtime.lock().unwrap_or_else(|p| p.into_inner());
+            let was_running = runtime.running();
+            runtime.shutdown();
+            was_running
+        };
         crate::error_log::record_flow(
             "app.shutdown",
             "已停止所有实时采集",
-            &format!("streams={stopped_streams} captures={stopped_captures}"),
+            &format!(
+                "streams={stopped_streams} captures={stopped_captures} proxyClosed={proxy_closed}"
+            ),
         );
     }
 }

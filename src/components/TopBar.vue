@@ -4,11 +4,15 @@ import {
   openDevicePicker,
   openErrorLog,
   openJsonPanel,
+  openProxyPanel,
   pickAndLoadFile,
   store
 } from '../stores/session'
 
 const info = computed(() => store.fileInfo)
+
+/** 独立代理是否在跑。状态来自 store，面板关着也照样更新。 */
+const proxyLive = computed(() => !!store.proxyServer?.running)
 
 const readableSize = computed(() => {
   const bytes = info.value?.sizeBytes ?? 0
@@ -81,6 +85,22 @@ const sourceTitle = computed(() => {
         @click="openDevicePicker"
       >
         设备
+      </button>
+      <!-- 代理状态常驻顶栏：开启后这里直接显示地址和来源数，不用打开面板才知道它在跑 -->
+      <button
+        class="btn btn-sm proxy-entry"
+        :class="{ live: proxyLive }"
+        :title="
+          proxyLive
+            ? `独立代理运行中：客户端把代理指向 ${store.proxyServer?.endpoint}（已接入 ${store.proxyServer?.sources ?? 0} 个来源）。点击查看`
+            : '开启一个本地 HTTP 代理：任何把代理指向它的设备都会被接收，不依赖 adb'
+        "
+        @click="openProxyPanel"
+      >
+        <span v-if="proxyLive" class="live-dot" />
+        代理<template v-if="proxyLive">
+          <span class="mono proxy-entry-addr">{{ store.proxyServer?.endpoint }}</span>
+        </template>
       </button>
       <button
         class="btn btn-sm error-log-entry"
