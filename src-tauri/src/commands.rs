@@ -905,6 +905,47 @@ fn capture_flow(scope: &str, message: &str, detail: &str) {
     crate::error_log::record_flow(scope, message, detail);
 }
 
+/// Remove one channel's captures that an earlier webview left behind on this device.
+///
+/// A webview reload (hot update / manual reload) or a frontend crash drops the ids the UI
+/// used to poll, but the backend still owns the device proxy / `adb forward`. Without this
+/// the next "start" would be refused forever by the "already running" check, with no way to
+/// stop the invisible capture. The panel keeps at most one capture per device and channel,
+/// so replacing the orphan is always the right recovery.
+fn take_over_stale_captures(state: &AppState, serial: &str, proxy: bool) -> Vec<String> {
+    let Ok(mut captures) = state.network_captures.lock() else {
+        return Vec::new();
+    };
+    let stale: Vec<String> = captures
+        .iter()
+        .filter(|(_, capture)| capture.is_proxy() == proxy && capture.serial() == serial)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut stopped = Vec::new();
+    for id in stale {
+        if let Some(mut capture) = captures.remove(&id) {
+            capture_flow(
+                &format!("capture.stop.{id}"),
+                if proxy {
+                    "替换上一次残留的原生采集"
+                } else {
+                    "替换上一次残留的 H5 采集"
+                },
+                &format!("id={id} serial={serial}"),
+            );
+            if let Err(e) = capture.stop() {
+                capture_flow(
+                    &format!("capture.stop.{id}"),
+                    "清理残留采集失败，已交给后台重试",
+                    &e,
+                );
+            }
+            stopped.push(id);
+        }
+    }
+    stopped
+}
+
 #[tauri::command]
 pub fn start_cdp_capture(
     options: CdpCaptureOptions,
@@ -934,13 +975,12 @@ pub fn start_cdp_capture(
     // a second capture would duplicate every row and fight over the same `adb forward`.
     // Comparing by serial rather than by port also keeps this correct now that `start_cdp`
     // may move to a fallback port when the preferred one is taken.
-    {
-        let captures = state
-            .network_captures
-            .lock()
-            .map_err(|e| format!("状态锁异常: {e}"))?;
-        if captures.values().any(|c| c.serial() == serial && !c.is_proxy()) {
-            return Err("该设备已有一个正在运行的 WebView 采集，请先停止它".to_string());
+    let replaced = take_over_stale_captures(&state, &serial, false);
+    if !replaced.is_empty() {
+        if let Ok(mut sessions) = state.network_sessions.lock() {
+            for id in &replaced {
+                sessions.remove(id);
+            }
         }
     }
 
@@ -1019,7 +1059,7 @@ pub fn start_proxy_capture(
         return Err("该设备正在启动原生接口采集，请稍候再试".to_string());
     };
 
-    {
+    let replaced: Vec<String> = {
         let guards = state
             .proxy_guards
             .lock()
@@ -1027,12 +1067,15 @@ pub fn start_proxy_capture(
         if guards.contains_key(&serial) {
             return Err("该设备已有手动设置的代理。请先在「MITM 代理设置」里点「还原」，再开始原生接口采集。".to_string());
         }
-        let captures = state
-            .network_captures
-            .lock()
-            .map_err(|e| format!("状态锁异常: {e}"))?;
-        if captures.values().any(|c| c.serial() == serial && c.is_proxy()) {
-            return Err("该设备的原生接口采集已经在运行".to_string());
+        // 前端刷新 / 崩溃后，这台设备上一轮的原生采集还在后端跑，而前端已经丢了它的 id，
+        // 既停不掉也关不掉。再点开始时直接替换，否则会永远卡在「已经在运行」。
+        take_over_stale_captures(&state, &serial, true)
+    };
+    if !replaced.is_empty() {
+        if let Ok(mut sessions) = state.network_sessions.lock() {
+            for id in &replaced {
+                sessions.remove(id);
+            }
         }
     }
 
