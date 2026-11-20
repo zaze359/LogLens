@@ -197,7 +197,7 @@ git tag v0.1.0 && git push origin v0.1.0
 
 | 平台 | runner | Release 资产 | 包内文件 |
 | --- | --- | --- | --- |
-| macOS（Apple 芯片） | `macos-14` | `LogLens_0.1.0_macos_aarch64.zip` | `.app`、`.dmg`、便携 zip、`安装 LogLens.command`、`使用说明.txt`、`BUILD-INFO.md`、`SHA256SUMS.txt` |
+| macOS（Apple 芯片） | `macos-latest` | `LogLens_0.1.0_macos_aarch64.zip` | `.app`、`.dmg`、便携 zip、`安装 LogLens.command`、`使用说明.txt`、`BUILD-INFO.md`、`SHA256SUMS.txt` |
 | Windows（x64） | `windows-latest` | `LogLens_0.1.0_windows_x64.zip` | `.msi`、`-setup.exe`、`BUILD-INFO.md`、`SHA256SUMS.txt` |
 | Linux（x64） | `ubuntu-22.04` | `LogLens_0.1.0_linux_x64.tar.gz` | `.deb`、`.AppImage`、`BUILD-INFO.md`、`SHA256SUMS.txt` |
 

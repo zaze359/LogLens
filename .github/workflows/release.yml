@@ -34,10 +34,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # GitHub 托管的 Intel Mac runner 已下线，macOS 产物只出 Apple 芯片（aarch64）。
+          # GitHub 托管的 macos-14 镜像已下线，改用 macos-latest（当前为 Apple 芯片 / arm64）。
+          # macOS 产物只出 Apple 芯片（aarch64）。
           # 需要 Intel 包时改用 universal 构建：加 rustup target add x86_64-apple-darwin 后
           # `tauri build --target universal-apple-darwin`（package.sh 目前不透传 --target）。
-          - os: macos-14
+          - os: macos-latest
             label: macOS · Apple Silicon
             platform: macos
             arch: aarch64
