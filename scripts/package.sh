@@ -749,7 +749,9 @@ if [ "${ICON_ARGS[*]-}" != "" ]; then ICON_SUFFIX=" + bundle.icon"; fi
 if [ "$SKIP_BUILD" -eq 1 ]; then
   BUILD_DESC="跳过编译（--skip-build），仅收集已有产物"
 else
-  BUILD_DESC="`npm run tauri build -- --bundles $BUNDLES`$ICON_SUFFIX"
+  # 这里只记录命令文本；早期版本误用了反引号，会在写构建信息时又跑一遍
+  # 不带 bundle.icon 的 tauri build，Linux 上 AppImage 因找不到方形图标直接 abort。
+  BUILD_DESC="npm run tauri build -- --bundles $BUNDLES$ICON_SUFFIX"
 fi
 case "$PLATFORM" in
   macos)
