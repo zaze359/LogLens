@@ -859,13 +859,55 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
   resize: vertical; white-space: pre; overflow: auto; tab-size: 2;
 }
 .jv-edit:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+/* 原文视图：外层负责边框与背景，内层 textarea 透明叠在高亮层上方。
+   两层必须共用字体、行高、内边距与 white-space: pre，逐字对齐，否则高亮会偏。 */
+.jv-edit-wrap {
+  position: relative; display: flex; flex: 1; min-height: 320px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  overflow: hidden; resize: vertical;
+}
+.jv-edit-wrap:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.jv-edit-wrap .jv-edit {
+  flex: 1; min-height: 0; width: 100%;
+  margin: 0; padding: 10px 11px; font-size: 11.5px; line-height: 1.65;
+  background: transparent; border: 0; border-radius: 0; outline: none;
+  white-space: pre; tab-size: 2;
+}
+/* 高亮层只画出底色：文字保持透明，由上面的 textarea 显示，避免重影和输入法问题。 */
+.jv-edit-layer {
+  position: absolute; inset: 0; overflow: hidden; pointer-events: none;
+  color: transparent;
+}
+.jv-edit-layer .jv-hit { color: transparent; }
+/* 原文里没有语法色，当前命中用更强的底色区分，文字颜色保持可读。 */
+.jv-edit-layer .jv-hit.current { background: rgba(245, 158, 11, .55); }
+.jv-edit-input { position: relative; z-index: 1; resize: none; overflow: auto; }
 .jv-view:disabled { opacity: 0.4; cursor: not-allowed; }
+/* 关键字搜索：输入框与命中计数放在工具栏，↑/↓ 复用 .jv-step 的紧凑按钮。 */
+.jv-search {
+  width: 160px; padding: 3px 8px; font-size: 11px;
+  color: var(--text); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 5px; outline: none;
+}
+.jv-search:focus { border-color: var(--accent); }
+.jv-search-count { min-width: 46px; font-size: 11px; color: var(--text-dim); }
+.jv-step {
+  padding: 1px 7px; font-size: 12px; line-height: 18px;
+  color: var(--text-dim); background: transparent;
+  border: 1px solid var(--border); border-radius: 5px;
+}
+.jv-step:hover:not(:disabled) { color: var(--text); background: var(--bg-2); }
+.jv-step:disabled { opacity: 0.4; cursor: not-allowed; }
+/* 命中高亮：普通命中用暖黄底，当前命中反过来用实心强调色，扫一眼就能找到位置。 */
+.jv-hit { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
+.jv-hit.current { background: var(--warning); color: #1c1917; }
 .json-modal { width: min(880px, 92vw); }
 .json-modal-body {
   flex: 1; min-height: 0; display: flex; flex-direction: column;
   padding: 10px 14px; overflow: hidden;
 }
 .json-modal-body > .jv { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.json-modal-body .jv-edit-wrap,
 .json-modal-body .jv-edit,
 .json-modal-body .jv-tree { flex: 1; min-height: 320px; }
 /* 全屏：铺满应用窗口，去掉圆角、边框和暗色遮罩；树区同时放开 420px 的高度上限，
