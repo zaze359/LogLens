@@ -434,9 +434,55 @@ if [ "$NO_RUN" -eq 1 ]; then
   exit 0
 fi
 
+# 上一次没退干净的 dev 服务会占着 1420，让 beforeDevCommand 直接以
+# "Port 1420 is already in use" 失败。启动前只清理属于本项目的进程，
+# 避免误杀同机其它 node 服务。
+stop_previous_dev() {
+  local pids=""
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -nP -iTCP:1420 -sTCP:LISTEN -t 2>/dev/null || true)"
+  fi
+  if command -v pgrep >/dev/null 2>&1; then
+    pids="$pids
+$(pgrep -f "$ROOT/src-tauri/target/debug/log-analyse" 2>/dev/null || true)
+$(pgrep -f "$ROOT/node_modules/.bin/tauri dev" 2>/dev/null || true)"
+  fi
+  pids="$(printf '%s\n' "$pids" | tr -d ' ' | grep -Eo '^[0-9]+$' | sort -u || true)"
+  if [ -z "$pids" ]; then
+    return 0
+  fi
+
+  echo "  发现上一次启动的客户端仍在运行（PID: $(printf '%s' "$pids" | tr '\n' ' ')），先关闭"
+  # shellcheck disable=SC2086
+  kill $pids 2>/dev/null || true
+  local waited=0
+  while [ "$waited" -lt 20 ]; do
+    local alive=0
+    for pid in $pids; do
+      # 用 if 而不是 && 赋值：脚本开了 set -e，已退出的 PID 不能让函数中断。
+      if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+    done
+    [ "$alive" -eq 0 ] && break
+    sleep 0.25
+    waited=$((waited + 1))
+  done
+  # 仍然不退出的（例如卡在编译）强制结束，端口才真正释放。
+  # shellcheck disable=SC2086
+  kill -9 $pids 2>/dev/null || true
+  sleep 0.3
+
+  if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:1420 -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "  ! 端口 1420 仍被占用，请手动关闭后重试："
+    lsof -nP -iTCP:1420 -sTCP:LISTEN | tail -n +2 | sed 's/^/    /'
+    exit 2
+  fi
+  echo "  已关闭，重新启动"
+}
+
 echo
 case "$MODE" in
   dev)
+    stop_previous_dev
     echo "── 启动客户端（Ctrl+C 退出）──"
     exec npm run tauri dev
     ;;

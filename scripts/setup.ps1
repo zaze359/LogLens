@@ -451,9 +451,73 @@ if ($NoRun) {
     exit 0
 }
 
+# 上一次没退干净的 dev 服务会占着 1420，让 beforeDevCommand 直接以
+# "Port 1420 is already in use" 失败。启动前只清理属于本项目的进程，
+# 不碰同机其它 node 服务。
+function Get-Port1420Owners {
+    $owners = @()
+    try {
+        $owners = @(Get-NetTCPConnection -LocalPort 1420 -State Listen -ErrorAction Stop |
+            ForEach-Object { [int]$_.OwningProcess })
+    } catch {
+        try {
+            foreach ($line in (& netstat.exe -ano 2>$null)) {
+                if ($line -match '[:.]1420\s' -and $line -match 'LISTENING\s+(\d+)\s*$') {
+                    $owners += [int]$Matches[1]
+                }
+            }
+        } catch { }
+    }
+    return @($owners | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+}
+
+function Stop-PreviousDev {
+    $targets = New-Object System.Collections.Generic.List[int]
+    foreach ($procId in @(Get-Port1420Owners)) { $targets.Add($procId) }
+    try {
+        $devRoot = Join-Path $Root 'src-tauri\target\'
+        foreach ($proc in Get-CimInstance Win32_Process -ErrorAction Stop) {
+            if ($proc.ProcessId -eq $PID) { continue }
+            $cmd = [string]$proc.CommandLine
+            $exe = [string]$proc.ExecutablePath
+            # dev 编译出的客户端：只认可执行文件落在本项目 target\ 下的那份，
+            # 不误杀用户已安装的正式版。
+            $isDevBinary = $exe -and $exe.StartsWith($devRoot, [System.StringComparison]::OrdinalIgnoreCase)
+            $isTauriCli = $cmd -and
+                $cmd.IndexOf($Root, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                $cmd -match 'tauri(\.cmd)?\s+dev'
+            if ($isDevBinary -or $isTauriCli) { $targets.Add([int]$proc.ProcessId) }
+        }
+    } catch { }
+
+    $pids = @($targets | Where-Object { $_ -gt 0 -and $_ -ne $PID } | Sort-Object -Unique)
+    if ($pids.Count -eq 0) { return }
+
+    Write-Host "  发现上一次启动的客户端仍在运行（PID: $($pids -join ' ')），先关闭"
+    foreach ($procId in $pids) {
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    }
+    # 等端口真正释放：Stop-Process 返回时监听 socket 可能还没回收。
+    for ($i = 0; $i -lt 20; $i++) {
+        if (@(Get-Port1420Owners).Count -eq 0) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    if (@(Get-Port1420Owners).Count -gt 0) {
+        Write-Host '  ! 端口 1420 仍被占用，请手动关闭后重试：' -ForegroundColor Yellow
+        try {
+            Get-NetTCPConnection -LocalPort 1420 -State Listen -ErrorAction Stop |
+                Select-Object LocalAddress, LocalPort, OwningProcess |
+                Format-Table -AutoSize | Out-String | Write-Host
+        } catch { }
+        exit 2
+    }
+    Write-Host '  已关闭，重新启动'
+}
+
 switch ($Mode) {
     'dev' {
         Write-Host ''
+        Stop-PreviousDev
         Write-Host '── 启动客户端（Ctrl+C 退出）──'
         & npm.cmd run tauri dev
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
