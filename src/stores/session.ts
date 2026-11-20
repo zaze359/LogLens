@@ -921,6 +921,13 @@ export async function startDeviceStream(options: DeviceCaptureOptions): Promise<
     setNotice(`设备 ${options.serial} 已经在实时抓取，先停掉再重新开始`)
     return false
   }
+  // 设备日志标签不在标签条上（它属于设备工作区，见 SessionTabs），设备页一次也只显示
+  // 一份日志。上一次停止后留下的标签已经不可达，却仍占着 4 个名额中的一个；反复
+  // 「开始 / 停止」会攒出看不见的标签，用户看到的就是「只有 2 个窗口却显示 4/4」。
+  // 开始新抓取就丢掉这台设备的旧日志，保证一个设备只占一个名额。
+  for (const previous of store.tabs.filter((tab) => tab.info.device === options.serial)) {
+    closeTab(previous.id)
+  }
   if (store.tabs.length >= MAX_TABS) {
     setNotice(`最多同时打开 ${MAX_TABS} 个日志，先关掉一个再开始抓取`)
     return false
