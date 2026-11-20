@@ -208,6 +208,20 @@ git tag v0.1.0 && git push origin v0.1.0
 - GitHub 托管的 Intel Mac runner 已下线，macOS 只出 aarch64 包；需要 Intel 包时改用 `--target universal-apple` 之类的通用二进制构建（`package.sh` 目前不透传 `--target`，需手工执行 `npm run tauri build` 并补 `rustup target add x86_64-apple-darwin`）。
 - Release 说明里写明的签名状况：CI runner 上没有本机证书，macOS 产物是 ad-hoc 签名 / 未公证；Windows、Linux 未签名。想要稳定签名身份时在本地跑 `bash scripts/make-signers.sh` 后自行打包。
 
+**客户端更新（GitHub Release）**：客户端内置 `tauri-plugin-updater`，顶栏的版本号按钮打开更新面板，读取仓库最新 Release 的 `latest.json`；发现更高版本时在应用内下载、安装并重启。启动后会在后台静默检查一次。
+
+- 更新包用 Tauri 的 minisign 密钥签名（与 Apple 签名无关）。公钥写死在 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`，私钥只放 GitHub Secrets，不进仓库。
+- 首次使用前在仓库配置 secret（私钥在本机 `~/.tauri/loglens.key`，**务必备份**：丢了就没法再给已安装的用户发更新）：
+
+```bash
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/loglens.key
+# 私钥带密码时再配置：gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+```
+
+- 本地想产出更新包：`export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/loglens.key)"` 后再跑打包脚本，更新包落在 `release/updater/`；没有设置时脚本会跳过并在日志里说明。
+- Release 里会多出 `LogLens_<版本>_aarch64.app.tar.gz`（macOS）、`LogLens_<版本>_amd64.AppImage`（Linux）、`LogLens_<版本>_x64-setup.exe`（Windows）和 `latest.json`；`.sig` 的正文内嵌进 `latest.json`，不再单独上传。
+- 客户端只比较版本号，所以**发版前必须递增 `src-tauri/tauri.conf.json` 的 version**，否则装在旧版本上的用户看不到更新。
+
 **本地签名证书（macOS，可选）**：`scripts/make-signers.sh` 在本机生成一套自签证书，打包脚本会自动挑用：
 
 ```bash

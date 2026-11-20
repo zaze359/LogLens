@@ -158,16 +158,30 @@ if (-not $SkipBuild) {
 # 不写回 tauri.conf.json：把覆盖配置写到临时文件，用 --config 指向它，避免污染受版本控制的配置。
 # 图标路径必须是绝对路径：--config 指向 %TEMP% 时，相对路径会相对临时目录解析。
 $script:IconArgs = @()
-$IconConfigPath = Join-Path $env:TEMP 'loglens-bundle-icon.json'
-function Set-IconConfig {
-    $icons = Join-Path $Root 'src-tauri\icons'
-    $cfg = @{ bundle = @{ icon = @(
-        (Join-Path $icons '32x32.png'),
-        (Join-Path $icons '128x128.png'),
-        (Join-Path $icons '128x128@2x.png'),
-        (Join-Path $icons 'icon.icns'),
-        (Join-Path $icons 'icon.ico')
-    ) } }
+$IconConfigPath = Join-Path $env:TEMP 'loglens-bundle-config.json'
+
+# ---------- 更新包（tauri-plugin-updater） ----------
+# CI 注入 TAURI_SIGNING_PRIVATE_KEY 后才生成并签名更新包；本机没有私钥时跳过，
+# 否则 tauri build 会因为无法签名直接失败。
+$Updater = -not [string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)
+$UpdaterOut = Join-Path $Root 'release\updater'
+
+function Set-BundleConfig {
+    param([bool]$WithIcons)
+    $bundle = @{}
+    if ($WithIcons) {
+        $icons = Join-Path $Root 'src-tauri\icons'
+        $bundle.icon = @(
+            (Join-Path $icons '32x32.png'),
+            (Join-Path $icons '128x128.png'),
+            (Join-Path $icons '128x128@2x.png'),
+            (Join-Path $icons 'icon.icns'),
+            (Join-Path $icons 'icon.ico')
+        )
+    }
+    if ($Updater) { $bundle.createUpdaterArtifacts = $true }
+    if ($bundle.Count -eq 0) { return }
+    $cfg = @{ bundle = $bundle }
     [IO.File]::WriteAllText($IconConfigPath, ($cfg | ConvertTo-Json -Depth 6), $Utf8NoBom)
     $script:IconArgs = @('--config', $IconConfigPath)
 }
@@ -175,10 +189,11 @@ function Resolve-IconArgs {
     $icons = Join-Path $Root 'src-tauri\icons'
     if ($NoIcons) {
         Write-Warn2 '已指定 -NoIcons，本次打包使用 Tauri 通用占位图标'
+        Set-BundleConfig $false
         return
     }
     if ((Test-Path (Join-Path $icons 'icon.icns')) -and (Test-Path (Join-Path $icons 'icon.ico'))) {
-        Set-IconConfig
+        Set-BundleConfig $true
         Write-Ok '图标齐全，已注入 bundle.icon（不修改 tauri.conf.json）'
         return
     }
@@ -188,7 +203,7 @@ function Resolve-IconArgs {
             Write-Info "发现 $candidate，自动生成图标集"
             & npm.cmd run tauri icon -- $candidate | Out-Host
             if ($LASTEXITCODE -eq 0 -and (Test-Path (Join-Path $icons 'icon.icns')) -and (Test-Path (Join-Path $icons 'icon.ico'))) {
-                Set-IconConfig
+                Set-BundleConfig $true
                 Write-Ok '图标已生成并注入'
             } else {
                 Write-Warn2 "从 $candidate 生成图标失败，继续使用通用占位图标"
@@ -199,6 +214,7 @@ function Resolve-IconArgs {
     if ($script:IconArgs.Count -eq 0) {
         Write-Warn2 '未找到 icon.icns / icon.ico，本次打包不含自定义图标（用 Tauri 通用占位图标）'
         Write-Info '生成方式: 准备 1024x1024 PNG 后执行  npm run tauri icon <png>'
+        Set-BundleConfig $false
     }
 }
 
@@ -264,12 +280,28 @@ foreach ($p in $patterns) {
             continue
         }
         Copy-Item $f.FullName $Target -Force
+        # 更新包的 .sig 与安装包同目录；一起收走，CI 才能拼 latest.json
+        if (Test-Path "$($f.FullName).sig") { Copy-Item "$($f.FullName).sig" $Target -Force }
         Write-Ok $f.Name
         $Collected += $f.Name
     }
 }
 
 if ($Collected.Count -eq 0) { Write-Die "没有收集到任何产物，请检查 $BundleDir" }
+
+# ---------- 2.5 更新包 ----------
+# 客户端通过 NSIS 安装器更新；只把 setup.exe 与签名放进 release\updater\，
+# 不重复放进 release\windows\ 的完整分发包。
+if ($Updater) {
+    Write-Step '归档更新包'
+    New-Item -ItemType Directory -Force -Path $UpdaterOut | Out-Null
+    Get-ChildItem $UpdaterOut -Force | Remove-Item -Force -Recurse
+    foreach ($f in Get-ChildItem $Target -File | Where-Object { $_.Name -like '*setup.exe' }) {
+        Copy-Item $f.FullName $UpdaterOut -Force
+        if (Test-Path "$($f.FullName).sig") { Copy-Item "$($f.FullName).sig" $UpdaterOut -Force }
+    }
+    Write-Ok 'setup.exe 更新包已归档'
+}
 
 # ---------- 3. 构建信息 + 校验和 ----------
 $GitBranch = '-'; $GitCommit = '-'; $GitDirty = ''
@@ -282,8 +314,8 @@ try {
 Write-Step '写入构建信息'
 $files = Get-ChildItem $Target -File | Where-Object { $_.Name -notin @('BUILD-INFO.md', 'SHA256SUMS.txt') }
 $IconNote = ''
-if ($script:IconArgs.Count -gt 0) { $IconNote = ' + bundle.icon' }
-$BuildDesc = if ($SkipBuild) { '跳过编译（-SkipBuild），仅收集已有产物' } else { "``npm run tauri build -- --bundles $BundleList``$IconNote" }
+if (-not $NoIcons -and (Test-Path (Join-Path $Root 'src-tauri\icons\icon.icns'))) { $IconNote = ' + bundle.icon' }
+$BuildDesc = if ($SkipBuild) { '跳过编译（-SkipBuild），仅收集已有产物' } else { "npm run tauri build -- --bundles $BundleList$IconNote" }
 $RustDesc = if ($CargoVersion) { $CargoVersion } else { '未知' }
 $lines = @(
     "# $Product 打包信息",

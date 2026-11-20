@@ -30,6 +30,11 @@ jobs:
   build:
     name: 构建 ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    env:
+      # tauri-plugin-updater 的签名私钥。没有配置时 package.sh / package.ps1 会跳过更新包，
+      # 主安装包照常产出（用来试跑工作流）。
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     strategy:
       fail-fast: false
       matrix:
@@ -140,6 +145,8 @@ jobs:
           # ditto 保留 .app 的资源分叉与符号链接，zip -r 会破坏 .app 结构
           ditto -c -k --sequesterRsrc --keepParent release/macos \
             "out/LogLens_${{ steps.ver.outputs.version }}_macos_${{ matrix.arch }}.zip"
+          # 更新包放在 release/updater/，单独作为资产上传，不重复塞进上面的 zip
+          cp -f release/updater/* out/ 2>/dev/null || true
           ls -lh out
 
       - name: 归档产物（Linux）
@@ -149,6 +156,7 @@ jobs:
           set -euo pipefail
           mkdir -p out
           tar -czf "out/LogLens_${{ steps.ver.outputs.version }}_linux_${{ matrix.arch }}.tar.gz" -C release linux
+          cp -f release/updater/* out/ 2>/dev/null || true
           ls -lh out
 
       - name: 归档产物（Windows）
@@ -158,6 +166,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path out | Out-Null
           Compress-Archive -Path release/windows `
             -DestinationPath "out/LogLens_${{ steps.ver.outputs.version }}_windows_${{ matrix.arch }}.zip" -Force
+          if (Test-Path release/updater) { Copy-Item release/updater/* out/ -Force }
           Get-ChildItem out | Select-Object Name, Length
 
       - name: 上传 workflow 产物
@@ -195,6 +204,20 @@ jobs:
           find assets -type f -exec mv -f {} dist-release/ \;
           ls -lh dist-release
 
+      # 客户端用 releases/latest/download/latest.json 找更新，所以它必须和资产一起发布。
+      # 签名正文直接写进 JSON；单独的 .sig 不再作为资产上传。
+      - name: 生成 latest.json
+        run: |
+          set -euo pipefail
+          node scripts/make-latest-json.mjs \
+            --dir dist-release \
+            --version "${{ steps.ver.outputs.version }}" \
+            --tag "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --notes "LogLens ${{ steps.ver.outputs.version }} 自动构建。macOS 为 ad-hoc 签名、未公证；Windows / Linux 未签名。"
+          rm -f dist-release/*.sig
+          ls -lh dist-release
+
       - name: 发布
         uses: softprops/action-gh-release@v2
         with:
@@ -208,6 +231,10 @@ jobs:
             LogLens ${{ steps.ver.outputs.version }} 由 `.github/workflows/release.yml` 在推送 tag 时自动构建。
 
             每个压缩包内是打包脚本产出的完整目录：安装包、`BUILD-INFO.md`（版本 / 提交 / 工具链）和 `SHA256SUMS.txt`（校验和）。
+
+            ### 客户端更新
+
+            从 v0.1.0 起，客户端顶栏的版本号按钮会读取本 Release 的 `latest.json`，发现新版本时可以直接在应用内下载、安装并重启。更新包经过 Tauri minisign 签名校验，`.app.tar.gz` / `.AppImage` / `-setup.exe` 与签名一一对应。
 
             ### 注意
 

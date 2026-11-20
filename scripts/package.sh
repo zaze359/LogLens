@@ -217,7 +217,17 @@ fi
 
 # ---------- 1. 打包图标 ----------
 # 不写回 tauri.conf.json：用 --config 覆盖，避免污染受版本控制的配置。
-ICON_ARGS=()
+ICON_JSON=""
+CONFIG_ARGS=()
+
+# ---------- 更新包（tauri-plugin-updater） ----------
+# CI 注入 TAURI_SIGNING_PRIVATE_KEY 后才生成并签名更新包；本机没有私钥时跳过，
+# 否则 tauri build 会因为无法签名直接失败。
+UPDATER=0
+UPDATER_OUT="$ROOT/release/updater"
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  UPDATER=1
+fi
 ensure_icons() {
   local icons="$ROOT/src-tauri/icons" src
   if [ "$NO_ICONS" -eq 1 ]; then
@@ -225,7 +235,7 @@ ensure_icons() {
     return 0
   fi
   if [ -f "$icons/icon.icns" ] && [ -f "$icons/icon.ico" ]; then
-    ICON_ARGS=(--config '{"bundle":{"icon":["icons/32x32.png","icons/128x128.png","icons/128x128@2x.png","icons/icon.icns","icons/icon.ico"]}}')
+    ICON_JSON='"icon":["icons/32x32.png","icons/128x128.png","icons/128x128@2x.png","icons/icon.icns","icons/icon.ico"]'
     ok "图标齐全，已注入 bundle.icon（不修改 tauri.conf.json）"
     return 0
   fi
@@ -234,7 +244,7 @@ ensure_icons() {
     if [ -f "$src" ]; then
       info "发现 $(basename "$(dirname "$src")")/$(basename "$src")，自动生成图标集"
       if run npm run tauri icon -- "$src" >/dev/null 2>&1 && [ -f "$icons/icon.icns" ] && [ -f "$icons/icon.ico" ]; then
-        ICON_ARGS=(--config '{"bundle":{"icon":["icons/32x32.png","icons/128x128.png","icons/128x128@2x.png","icons/icon.icns","icons/icon.ico"]}}')
+        ICON_JSON='"icon":["icons/32x32.png","icons/128x128.png","icons/128x128@2x.png","icons/icon.icns","icons/icon.ico"]'
         ok "图标已生成并注入"
         return 0
       fi
@@ -254,11 +264,22 @@ run_build() {
   local bundles="$1"
   echo "  ${DIM}\$ npm run tauri build -- --bundles $bundles${RESET}"
   # ${arr[@]+...} 保证 bash 3.2 + set -u 下空数组安全展开
-  npm run tauri build -- --bundles "$bundles" ${ICON_ARGS[@]+"${ICON_ARGS[@]}"}
+  npm run tauri build -- --bundles "$bundles" ${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"}
 }
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
   ensure_icons
+  # 图标与更新包开关合并成一次 --config：tauri 的 --config 只接受单个参数。
+  CONFIG_PARTS=""
+  [ -n "$ICON_JSON" ] && CONFIG_PARTS="$ICON_JSON"
+  if [ "$UPDATER" -eq 1 ]; then
+    CONFIG_PARTS="${CONFIG_PARTS:+$CONFIG_PARTS,}\"createUpdaterArtifacts\":true"
+  fi
+  if [ -n "$CONFIG_PARTS" ]; then
+    CONFIG_ARGS=(--config "{\"bundle\":{$CONFIG_PARTS}}")
+  else
+    CONFIG_ARGS=()
+  fi
   step "编译客户端（${PRODUCT} ${VERSION}）"
   # 逐个格式打：单种格式失败（如沙箱里 hdiutil 无法挂载）不应丢掉其它已产出的包。
   # 默认 --bundles app,dmg，实际执行顺序见下方 BUNDLE_ORDER。
@@ -644,6 +665,8 @@ collect_versioned() {
     case "$(basename "$f")" in
       *"$VERSION"*)
         cp -f "$f" "$OUT/"
+        # 更新包的 .sig 由 bundler 放在同一目录；一起收走，CI 才能拼 latest.json
+        [ -f "$f.sig" ] && cp -f "$f.sig" "$OUT/"
         ok "$(basename "$f")"
         COLLECTED=$((COLLECTED + 1))
         ;;
@@ -733,6 +756,37 @@ if [ "$DETECTED_PLATFORM" = "macos" ]; then
   fi
 fi
 
+# ---------- 3.5 更新包 ----------
+# 更新包单独放 release/updater/：release/<平台>/ 会被 CI 打成完整分发包，把几十兆的
+# 更新包再塞一份进去没有意义。这里只收「客户端真正会下载的文件」+ 它的 .sig。
+if [ "$UPDATER" -eq 1 ]; then
+  step "归档更新包"
+  mkdir -p "$UPDATER_OUT"
+  rm -rf "${UPDATER_OUT:?}"/*
+  case "$DETECTED_PLATFORM" in
+    macos)
+      UPDATER_FILE="$UPDATER_OUT/${PRODUCT}_${VERSION}_${ARCH_TAG}.app.tar.gz"
+      # tauri 的 .app.tar.gz 是在重签名之前打的，直接用会让更新后的 app 又回到
+      # 「已损坏」状态；这里对 $OUT 里已重签名的 app 重新打包。
+      # COPYFILE_DISABLE 防止 ._ 资源分叉文件混进 tar。
+      if COPYFILE_DISABLE=1 tar -czf "$UPDATER_FILE" -C "$OUT" "$PRODUCT.app" &&
+         npx --no-install tauri signer sign --app-version "$VERSION" "$UPDATER_FILE" >/dev/null 2>&1; then
+        ok "$(basename "$UPDATER_FILE")（含签名）"
+      else
+        die "更新包生成或签名失败，检查 TAURI_SIGNING_PRIVATE_KEY 是否正确"
+      fi
+      ;;
+    linux)
+      for f in "$OUT"/*.AppImage; do
+        [ -e "$f" ] || continue
+        cp -f "$f" "$UPDATER_OUT/"
+        [ -f "$f.sig" ] && cp -f "$f.sig" "$UPDATER_OUT/"
+      done
+      ok "AppImage 更新包已归档"
+      ;;
+  esac
+fi
+
 # ---------- 4. 构建信息 + 校验和 ----------
 GIT_BRANCH="$(git -C "$ROOT" branch --show-current 2>/dev/null || echo '-')"
 GIT_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo '-')"
@@ -745,7 +799,7 @@ TAURI_CLI="$(npx --no-install tauri --version 2>/dev/null | awk '{print $2}' || 
 
 step "写入构建信息"
 ICON_SUFFIX=""
-if [ "${ICON_ARGS[*]-}" != "" ]; then ICON_SUFFIX=" + bundle.icon"; fi
+if [ "${ICON_JSON:-}" != "" ]; then ICON_SUFFIX=" + bundle.icon"; fi
 if [ "$SKIP_BUILD" -eq 1 ]; then
   BUILD_DESC="跳过编译（--skip-build），仅收集已有产物"
 else
@@ -821,7 +875,7 @@ step "完成"
 echo "  输出目录: ${BOLD}${OUT#"$ROOT"/}${RESET}  ($(du -sh "$OUT" | awk '{print $1}'))"
 find "$OUT" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | sed 's/^/    /'
 
-if [ "$PLATFORM" = "macos" ] && [ "$SKIP_BUILD" -eq 0 ] && [ "${ICON_ARGS[*]-}" = "" ]; then
+if [ "$PLATFORM" = "macos" ] && [ "$SKIP_BUILD" -eq 0 ] && [ -z "${ICON_JSON:-}" ]; then
   echo
   warn "本次产物未带自定义应用图标（bundle.icon 为空），正式发布前请生成图标后重跑本脚本"
 fi
