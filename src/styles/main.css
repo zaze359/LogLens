@@ -455,6 +455,22 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .modal-body { padding: 16px; overflow-y: auto; }
 .form-row { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
 .form-label { width: 72px; flex: none; color: var(--text-dim); font-size: 12px; }
+
+/* ---------- update ---------- */
+.version-entry { gap: 6px; }
+.update-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg-1);
+}
+.update-notes { white-space: pre-wrap; max-height: 180px; overflow-y: auto; }
+.update-progress { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; }
+.update-progress-bar {
+  flex: 1; height: 6px; border-radius: 3px; background: var(--bg-2); overflow: hidden;
+}
+.update-progress-bar span {
+  display: block; width: 0; height: 100%; background: var(--accent);
+  transition: width .2s ease;
+}
 .cond-row {
   display: flex; gap: 6px; align-items: center; padding: 8px;
   background: var(--bg-2); border: 1px solid var(--border); border-radius: 7px; margin-bottom: 7px;

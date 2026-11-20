@@ -5,11 +5,19 @@ import {
   openErrorLog,
   openJsonPanel,
   openProxyPanel,
+  openUpdatePanel,
   pickAndLoadFile,
   store
 } from '../stores/session'
 
 const info = computed(() => store.fileInfo)
+
+/** 顶栏版本号按钮的提示：有更新时直接说明新版本号。 */
+const updateTitle = computed<string>(() => {
+  const found = store.update.available
+  if (found) return `发现新版本 ${found.version}，点击查看`
+  return '查看版本并检查更新'
+})
 
 /** 独立代理是否在跑。状态来自 store，面板关着也照样更新。 */
 const proxyLive = computed(() => !!store.proxyServer?.running)
@@ -111,6 +119,11 @@ const sourceTitle = computed(() => {
         诊断日志<span v-if="store.errorLogUnread" class="error-log-badge">{{
           store.errorLogUnread > 99 ? '99+' : store.errorLogUnread
         }}</span>
+      </button>
+      <!-- 版本号也是更新入口：发现新版本时带一个提示点，不额外占一个按钮位置 -->
+      <button class="btn btn-ghost btn-sm version-entry" :title="updateTitle" @click="openUpdatePanel">
+        v{{ store.appVersion || '—' }}
+        <span v-if="store.update.available" class="update-dot" />
       </button>
     </template>
   </header>

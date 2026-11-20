@@ -5,8 +5,11 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:app:allow-version",
     "dialog:allow-open",
     "dialog:allow-save",
-    "dialog:allow-message"
+    "dialog:allow-message",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

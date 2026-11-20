@@ -14,6 +14,7 @@ import ImportOverlay from './components/ImportOverlay.vue'
 import ErrorLogPanel from './components/ErrorLogPanel.vue'
 import JsonFormatPanel from './components/JsonFormatPanel.vue'
 import ProxyServerPanel from './components/ProxyServerPanel.vue'
+import UpdatePanel from './components/UpdatePanel.vue'
 import { init, loadFile, store } from './stores/session'
 
 let unlistenDrop: (() => void) | null = null
@@ -138,6 +139,8 @@ onBeforeUnmount(() => {
 
     <!-- 独立代理不属于任何设备，所以挂在应用层，而不是设备工作区里 -->
     <ProxyServerPanel v-if="store.proxyPanelOpen" />
+
+    <UpdatePanel v-if="store.updateOpen" />
 
     <Transition name="fade">
       <ImportOverlay v-if="store.importTask?.visible" />

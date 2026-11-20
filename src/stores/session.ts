@@ -1,7 +1,11 @@
 import { computed, reactive } from 'vue'
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog'
+import { getVersion } from '@tauri-apps/api/app'
+import { check as checkForUpdate } from '@tauri-apps/plugin-updater'
+import type { Update } from '@tauri-apps/plugin-updater'
+import { relaunch } from '@tauri-apps/plugin-process'
 import { errorMessage, ipc, isTauri } from '../lib/ipc'
-import { reportClientFlow } from '../lib/error-report'
+import { reportClientFlow, reportClientError } from '../lib/error-report'
 import { UNCATEGORIZED } from '../types'
 import type {
   AdbDevice,
@@ -132,8 +136,37 @@ export function emptyFilter(): FilterSpec {
   }
 }
 
+/** 一次更新检查的结果：`available` 非空表示远端有比当前更新的版本。 */
+export interface UpdateInfo {
+  version: string
+  notes: string
+  date: string
+}
+
+/**
+ * 更新检查与安装的进度。`downloaded` / `total` 只服务于下载进度条，`total` 为 0 时
+ * 说明服务器没给 Content-Length，按不确定进度显示。
+ */
+export interface UpdateStatus {
+  checking: boolean
+  /** 至少完成过一次检查：面板打开时据此决定要不要自动再查。 */
+  checked: boolean
+  available: UpdateInfo | null
+  downloading: boolean
+  downloaded: number
+  total: number
+  /** 已下载并安装，等待重启生效。 */
+  installed: boolean
+  error: string
+}
+
 export interface AppState {
   tauriReady: boolean
+  /** 客户端版本号，启动时从 Tauri 读取；浏览器预览里为空。 */
+  appVersion: string
+  /** 更新面板是否打开。 */
+  updateOpen: boolean
+  update: UpdateStatus
   /** Open tabs, in strip order. Empty means "no log open". */
   tabs: SessionTab[]
   /** Session id of the tab whose state the flat mirror fields below currently hold. */
@@ -228,6 +261,18 @@ export interface AppState {
 
 export const store = reactive<AppState>({
   tauriReady: false,
+  appVersion: '',
+  updateOpen: false,
+  update: {
+    checking: false,
+    checked: false,
+    available: null,
+    downloading: false,
+    downloaded: 0,
+    total: 0,
+    installed: false,
+    error: ''
+  },
   tabs: [],
   activeId: '',
   fileInfo: null,
@@ -364,6 +409,84 @@ export function closeProxyPanel(): void {
 }
 
 /**
+ * 插件返回的 Update 带 native 句柄，不能放进 reactive state；面板只读 store 里的纯数据，
+ * 安装时再用这个变量。
+ */
+let pendingUpdate: Update | null = null
+
+export function openUpdatePanel(): void {
+  store.updateOpen = true
+  if (!store.update.checked && !store.update.checking) void checkUpdate(true)
+}
+
+export function closeUpdatePanel(): void {
+  store.updateOpen = false
+}
+
+/**
+ * 检查更新。`manual` 区分「用户点的」和「启动时静默跑的」：手动检查要把结果说清楚
+ * （已是最新 / 失败原因），静默检查只在发现新版本时留下记录。
+ */
+export async function checkUpdate(manual: boolean): Promise<void> {
+  if (!store.tauriReady || store.update.checking || store.update.downloading) return
+  store.update.checking = true
+  store.update.error = ''
+  try {
+    const found = await checkForUpdate()
+    store.update.checked = true
+    if (found) {
+      pendingUpdate = found
+      store.update.available = {
+        version: found.version,
+        notes: found.body ?? '',
+        date: found.date ?? ''
+      }
+      reportClientFlow('app.update.check', `发现新版本 ${found.version}`, '')
+    } else {
+      pendingUpdate = null
+      store.update.available = null
+      if (manual) setNotice('当前已是最新版本')
+    }
+  } catch (e) {
+    // 还没发过 Release、离线、TLS 失败都会走到这里。静默检查不写错误日志：否则每次
+    // 启动都会给诊断日志加一条未读，离线用户会被反复打扰。
+    const message = errorMessage(e)
+    if (manual) {
+      store.update.error = message
+      reportClientError('warn', 'update', 'app.update.check', message)
+    }
+  } finally {
+    store.update.checking = false
+  }
+}
+
+/** 下载并安装挂起的更新，完成后重启客户端使新版本生效。 */
+export async function installUpdate(): Promise<void> {
+  if (!store.tauriReady || !pendingUpdate || store.update.downloading) return
+  store.update.downloading = true
+  store.update.error = ''
+  store.update.downloaded = 0
+  store.update.total = 0
+  try {
+    await pendingUpdate.downloadAndInstall((event) => {
+      if (event.event === 'Started') {
+        store.update.total = event.data.contentLength ?? 0
+      } else if (event.event === 'Progress') {
+        store.update.downloaded += event.data.chunkLength
+      } else {
+        store.update.installed = true
+      }
+    })
+    reportClientFlow('app.update.install', `已安装 ${store.update.available?.version ?? '新版本'}`)
+    await relaunch()
+  } catch (e) {
+    store.update.error = errorMessage(e)
+    store.update.downloading = false
+    reportClientError('error', 'update', 'app.update.install', errorMessage(e))
+  }
+}
+
+/**
  * Mirror the standalone proxy's state into the store. Cheap enough to call on demand, and
  * the only way the top bar can show it while the panel is closed.
  */
@@ -476,6 +599,9 @@ export async function init(): Promise<void> {
     void refreshDevices(true)
     // The proxy lives in the backend, so it may still be running from before a reload.
     void refreshProxyServer()
+    void getVersion().then((v) => (store.appVersion = v)).catch(() => {})
+    // 启动后静默检查一次更新：不阻塞首屏，失败也不打扰（离线、还没发版都算正常）。
+    window.setTimeout(() => void checkUpdate(false), 3000)
   } catch (e) {
     store.error = errorMessage(e)
   }
