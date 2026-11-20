@@ -23,7 +23,8 @@ import type {
   ProbeReport,
   ProxyCaptureOptions,
   ProxyServerStatus,
-  ProxyState
+  ProxyState,
+  TimeTimeline
 } from '../types'
 
 export function isTauri(): boolean {
@@ -101,6 +102,10 @@ export const ipc = {
       offset,
       limit
     }),
+
+  /** 时间轴分布：命中条目在整份日志时间轴上的分桶计数。 */
+  logTimeline: (sessionId: string, filter: FilterSpec, bins: number) =>
+    call<TimeTimeline>('log_timeline', { sessionId, filter: plain(filter), bins }),
 
   closeSession: (sessionId: string) => call<void>('close_session', { sessionId }),
 

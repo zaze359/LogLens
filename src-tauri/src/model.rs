@@ -17,6 +17,10 @@ pub struct LogEntry {
     pub timestamp: String,
     /// Normalised `HH:MM:SS.mmm`, used for time range comparisons.
     pub time_key: String,
+    /// Normalised `YYYY-MM-DD HH:MM:SS.mmm`, used when a range is given with a date.
+    /// Logcat often has no year (`MM-DD`); those rows use `1970` as a placeholder year —
+    /// it keeps same-year ordering and the UI strips it from labels.
+    pub datetime_key: String,
     /// `V D I W E F A S ?` (`?` = line could not be parsed).
     pub level: String,
     pub tag: String,
@@ -249,6 +253,34 @@ pub struct QueryResult {
     /// Top 10 tags of matched entries.
     pub top_tags: Vec<NameCount>,
     pub elapsed_ms: u64,
+}
+
+/// 命中日志在时间轴上的分布：把条目按 `time_key` 均匀分桶。
+///
+/// 轴本身取自整份日志（从第一条到最后一条有时间戳的条目），分桶计数只统计命中结果，
+/// 且统计时会忽略 `time_from` / `time_to` —— 选中一段区间不该让轴上的其他时间段消失，
+/// 否则用户就失去了「区间外还有多少日志」的参照。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TimeTimeline {
+    /// 轴的起点标签。带年份时为 `YYYY-MM-DD HH:MM:SS.mmm`，只有月日时为 `MM-DD HH:MM:SS.mmm`。
+    pub start: String,
+    /// 轴的终点标签，格式同 `start`。
+    pub end: String,
+    /// 轴起点的绝对毫秒（以 1970-01-01 为原点），供前端把像素换算回时间。
+    pub start_ms: u64,
+    /// 轴终点的绝对毫秒。
+    pub end_ms: u64,
+    /// 轴上是否带日期；`false` 表示日志只有时刻，没有可用的日期。
+    pub has_date: bool,
+    /// 日期是否带真实年份；`false` 时年份是占位值，展示与筛选都不该包含它。
+    pub has_year: bool,
+    /// 每个等宽桶内命中的条数；空数组表示这份日志没有可用的时间戳。
+    pub bins: Vec<u32>,
+    /// 命中有时间戳的条目数（= `bins` 之和）。
+    pub total: u32,
+    /// 命中但读不出时间戳的条目数 —— 它们落在轴外，计数里只能单独说明。
+    pub untimed: u32,
 }
 
 // --- Device network capture -------------------------------------------------

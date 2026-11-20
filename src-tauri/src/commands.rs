@@ -8,7 +8,7 @@ use crate::logcat::{self, LogcatParser, ParseOutcome};
 use crate::model::{
     CdpCaptureOptions, DeviceCaptureOptions, FileInfo, FilterSpec, LogEntry, NetworkPollResult,
     NetworkSessionInfo, OpenProgress, ProxyCaptureOptions, ProxyState, QueryResult, Rule,
-    RuleCategory, SearchHistoryEntry, SearchHits, StreamStatus,
+    RuleCategory, SearchHistoryEntry, SearchHits, StreamStatus, TimeTimeline,
 };
 use crate::rules::CompiledFilter;
 use crate::session::{AppState, LogSession, NetworkSession};
@@ -237,7 +237,12 @@ pub async fn open_log_file(
     }
     match outcome {
         ParseOutcome::Cancelled => Err("已取消导入".to_string()),
-        ParseOutcome::Done(parsed) => {
+        ParseOutcome::Done(mut parsed) => {
+            // 日志常只写 `MM-DD`：用文件时间补年份，跨年收集的日志会自动回退一年。
+            logcat::fill_missing_year(
+                &mut parsed.entries,
+                meta.modified().unwrap_or_else(|_| SystemTime::now()),
+            );
             let lines = parsed.total_lines;
             let entries = parsed.entries.len() as u32;
             let unparsed = parsed.unparsed_lines;
@@ -485,6 +490,9 @@ pub fn poll_device_stream(
             .ok_or_else(|| "实时抓取已停止".to_string())?;
         stream.drain()
     };
+    // 实时日志同样只有 `MM-DD`：用当前时间补年份，跨年时按新日期自动落到来年。
+    let mut pending = pending;
+    logcat::fill_missing_year(&mut pending, SystemTime::now());
 
     let mut sessions = state
         .sessions
@@ -607,6 +615,23 @@ pub fn query_logs(
         .get_mut(&session_id)
         .ok_or_else(|| "日志会话已失效，请重新打开文件".to_string())?;
     session.query(&filter, offset, limit)
+}
+
+#[tauri::command]
+pub fn log_timeline(
+    session_id: String,
+    filter: FilterSpec,
+    bins: u32,
+    state: State<'_, AppState>,
+) -> Result<TimeTimeline, String> {
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| "日志会话已失效，请重新打开文件".to_string())?;
+    session.timeline(&filter, bins)
 }
 
 #[tauri::command]

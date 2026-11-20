@@ -31,6 +31,7 @@ pub fn run() {
             commands::stop_device_stream,
             commands::release_device_stream,
             commands::query_logs,
+            commands::log_timeline,
             commands::search_hits,
             commands::close_session,
             commands::export_filtered,

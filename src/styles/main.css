@@ -304,6 +304,46 @@ button { cursor: pointer; }
    the default `stretch` left the text pinned to the top of an empty 23px-tall line box. */
 .top-tags { display: flex; gap: 6px; align-items: center; }
 
+/* ---------- log timeline ---------- */
+/* 命中日志的时间分布：柱高是桶内条数，拖拽出的区间直接写回筛选条件。 */
+.log-timeline {
+  flex: none; padding: 7px 12px 9px;
+  background: var(--bg-1); border-bottom: 1px solid var(--border);
+}
+.log-timeline-head {
+  position: relative;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px; row-gap: 4px;
+  margin-bottom: 5px; font-size: 11px;
+}
+.log-timeline-head .input { height: 24px; }
+/* 带日期的区间值（`2026-11-12 10:23:45.123`）比单纯的时刻长，输入框要跟着放宽。 */
+.log-time-input { width: 200px; }
+.log-time-pick { height: 24px; padding: 0 7px; color: var(--text-dim); }
+/* 时间选择器：原生 date / time 控件，悬浮在头部下方 */
+.log-time-picker {
+  position: absolute; right: 12px; top: calc(100% + 6px); z-index: 30;
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, .5);
+}
+.log-time-picker .input { height: 26px; }
+.log-range-label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); }
+.log-timeline-chart {
+  position: relative; height: 42px; overflow: hidden; cursor: crosshair;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+  touch-action: none; user-select: none;
+}
+.log-tl-bar { position: absolute; bottom: 0; background: rgba(56, 189, 248, .5); }
+.log-tl-bar.empty { background: transparent; }
+.log-tl-bar:hover { background: var(--accent); }
+.log-tl-band {
+  position: absolute; top: 0; bottom: 0; pointer-events: none;
+  background: rgba(56, 189, 248, .14);
+  border-left: 1px solid rgba(56, 189, 248, .7);
+  border-right: 1px solid rgba(56, 189, 248, .7);
+}
+.log-tl-band.dragging { background: rgba(56, 189, 248, .08); border-style: dashed; }
+
 /* ---------- log table ---------- */
 /* The message column is sized from the data (`--msg-w`, set by LogTable from the widest
    first line) instead of `1fr`: lines are single-row by design, so the only way to read a

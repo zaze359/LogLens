@@ -19,10 +19,17 @@ import type {
   RulesView,
   ProxyServerStatus,
   SearchHits,
-  StreamStatus
+  StreamStatus,
+  TimeTimeline
 } from '../types'
 
 export const PAGE_SIZE = 400
+
+/**
+ * 时间轴的分桶数。96 桶在常见宽度下每桶仍有 4px 以上，既够看出密集区，又不用按窗口
+ * 宽度重新请求数据。
+ */
+export const TIMELINE_BINS = 96
 
 /** How often a live capture is polled. Fast enough to feel live, cheap enough to ignore. */
 const STREAM_POLL_MS = 800
@@ -73,6 +80,8 @@ export interface SessionTab {
   filter: FilterSpec
   result: QueryResult | null
   entries: LogEntry[]
+  /** 命中结果当时间轴上的分布；跟着 `result` 一起快照，切回来不会闪一下旧图。 */
+  timeline: TimeTimeline | null
   selected: LogEntry | null
   activeRuleId: string
   testCount: number | null
@@ -134,6 +143,8 @@ export interface AppState {
   filter: FilterSpec
   result: QueryResult | null
   entries: LogEntry[]
+  /** 时间轴分布，与 `entries` 同步刷新；`null` 表示还没有结果或日志没有时间戳。 */
+  timeline: TimeTimeline | null
   activeRuleId: string
   selected: LogEntry | null
   loading: boolean
@@ -223,6 +234,7 @@ export const store = reactive<AppState>({
   filter: emptyFilter(),
   result: null,
   entries: [],
+  timeline: null,
   activeRuleId: '',
   selected: null,
   loading: false,
@@ -484,6 +496,7 @@ function snapshotActive(): void {
   tab.filter = clone(store.filter)
   tab.result = store.result
   tab.entries = store.entries
+  tab.timeline = store.timeline
   tab.selected = store.selected
   tab.activeRuleId = store.activeRuleId
   tab.testCount = store.testCount
@@ -497,6 +510,7 @@ function clearView(): void {
   store.filter = emptyFilter()
   store.result = null
   store.entries = []
+  store.timeline = null
   store.selected = null
   store.activeRuleId = ''
   store.testCount = null
@@ -538,12 +552,14 @@ export function activateTab(id: string): void {
   snapshotActive()
   // Responses still in flight belong to the tab being left; make them unlandable.
   requestSeq++
+  timelineSeq++
   paging = false
 
   store.fileInfo = target.info
   store.filter = clone(target.filter)
   store.result = target.result
   store.entries = target.entries
+  store.timeline = target.timeline
   store.selected = target.selected
   store.activeRuleId = target.activeRuleId
   store.testCount = target.testCount
@@ -617,6 +633,7 @@ async function openTab(info: FileInfo, stream: DeviceStreamInfo | null): Promise
     filter: emptyFilter(),
     result: null,
     entries: [],
+    timeline: null,
     selected: null,
     activeRuleId: '',
     testCount: null,
@@ -1019,6 +1036,9 @@ let paging = false
  *  a tab they no longer belong to. */
 let requestSeq = 0
 
+/** 时间轴有自己的序号：它是一次独立请求，不能借用 `requestSeq` 去改写查询的结果状态。 */
+let timelineSeq = 0
+
 /** Append newly matched entries. New lines always land at the end, so ascending order can
  *  keep the already-loaded page and just continue from `entries.length`. Descending order
  *  puts them on top, where a cheap re-query of page 0 is the correct move. */
@@ -1040,6 +1060,8 @@ async function appendNewMatches(): Promise<void> {
       store.entries = store.entries.concat(result.entries)
     }
     store.result = result
+    // 实时日志会不断往轴上追加，密度图要跟着走。
+    void refreshTimeline()
     // New lines can add hits; keep the counter honest without moving the cursor.
     if (store.filter.searchMode === 'find' && store.filter.search) scheduleFind(false)
   } finally {
@@ -1188,6 +1210,7 @@ export async function refresh(): Promise<void> {
   if (!store.fileInfo) {
     store.result = null
     store.entries = []
+    store.timeline = null
     return
   }
   const seq = ++requestSeq
@@ -1199,6 +1222,8 @@ export async function refresh(): Promise<void> {
     store.result = result
     store.entries = result.entries
     store.error = ''
+    // 表格先出来，时间轴随后补上：两者互不阻塞，图慢半拍也不会让列表空等。
+    void refreshTimeline()
     // 「查找」不改变结果集，但命中位置依赖结果集 —— 换筛选/换规则后必须重算，
     // 否则「3 / 27」会停在上一套条件上。不自动跳转，避免把用户在看的位置拽走。
     if (store.filter.searchMode === 'find' && store.filter.search) scheduleFind(false)
@@ -1207,6 +1232,26 @@ export async function refresh(): Promise<void> {
     store.error = errorMessage(e)
   } finally {
     if (seq === requestSeq) store.loading = false
+  }
+}
+
+/**
+ * 刷新时间轴分布。失败时保留上一张图 —— 它只是导航辅助，不值得为一次失败清空界面，
+ * 也不该把错误横幅推给用户。
+ */
+async function refreshTimeline(): Promise<void> {
+  const info = store.fileInfo
+  if (!info) {
+    store.timeline = null
+    return
+  }
+  const seq = ++timelineSeq
+  try {
+    const timeline = await ipc.logTimeline(info.sessionId, store.filter, TIMELINE_BINS)
+    if (seq !== timelineSeq) return
+    store.timeline = timeline
+  } catch {
+    // 见函数注释：静默保留旧图。
   }
 }
 

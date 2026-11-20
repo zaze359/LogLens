@@ -4,7 +4,7 @@
 //! cached log entry. Compiling up front keeps the hot loop allocation-free and lets us
 //! report invalid regexes to the UI before any work is done.
 
-use crate::logcat::normalize_time_value;
+use crate::logcat::{normalize_datetime_value, normalize_time_value};
 use crate::model::{Condition, FilterSpec, LogEntry, RuleGroup};
 use regex::Regex;
 use std::borrow::Cow;
@@ -236,6 +236,10 @@ struct QuickFilter {
     excludes: Vec<String>,
     time_from: String,
     time_to: String,
+    /// 带日期的区间端点（`YYYY-MM-DD HH:MM:SS.mmm`）。用户输入里没有日期时为空，
+    /// 此时退回只比时刻的 `time_from` / `time_to`。
+    datetime_from: String,
+    datetime_to: String,
 }
 
 impl QuickFilter {
@@ -261,6 +265,8 @@ impl QuickFilter {
             excludes,
             time_from: normalize_time_value(&f.time_from),
             time_to: normalize_time_value(&f.time_to),
+            datetime_from: normalize_datetime_value(&f.time_from),
+            datetime_to: normalize_datetime_value(&f.time_to),
         })
     }
 
@@ -288,12 +294,24 @@ impl QuickFilter {
         if !self.packages.is_empty() && !self.packages.iter().any(|p| p == &e.package) {
             return false;
         }
-        if !self.time_from.is_empty()
+        // 输入带日期就按完整日期比较 —— 只有时刻时保持旧行为，避免把日期条件强加给
+        // 不带日期的日志。
+        if !self.datetime_from.is_empty() {
+            match datetime_cmp(&e.datetime_key, &self.datetime_from) {
+                Some(Ordering::Less) | None => return false,
+                _ => {}
+            }
+        } else if !self.time_from.is_empty()
             && (e.time_key.is_empty() || e.time_key.as_str() < self.time_from.as_str())
         {
             return false;
         }
-        if !self.time_to.is_empty()
+        if !self.datetime_to.is_empty() {
+            match datetime_cmp(&e.datetime_key, &self.datetime_to) {
+                Some(Ordering::Greater) | None => return false,
+                _ => {}
+            }
+        } else if !self.time_to.is_empty()
             && (e.time_key.is_empty() || e.time_key.as_str() > self.time_to.as_str())
         {
             return false;
@@ -324,6 +342,20 @@ impl QuickFilter {
             Some(matcher) => matcher.is_match(&e.raw),
             None => true,
         }
+    }
+}
+
+/// 带日期区间的比较。
+///
+/// 区间只写了月日（归一化后带占位年份 `1970-`）时忽略条目上的年份，让「11-12 10:00」
+/// 在带真实年份的日志上也能按「每年这一天」生效。
+fn datetime_cmp(value: &str, bound: &str) -> Option<Ordering> {
+    if value.is_empty() {
+        return None;
+    }
+    match bound.strip_prefix("1970-") {
+        Some(bound_tail) => value.get(5..).map(|tail| tail.cmp(bound_tail)),
+        None => Some(value.cmp(bound)),
     }
 }
 
@@ -418,6 +450,62 @@ mod tests {
         let compiled = CompiledFilter::compile(&f).unwrap();
         let hits = compute_matches(&entries, &compiled);
         assert_eq!(hits, vec![1]);
+    }
+
+    #[test]
+    fn dated_time_bounds_compare_the_whole_day() {
+        let mut early = entry("I", "T", "first");
+        early.time_key = "09:00:00.000".to_string();
+        early.datetime_key = "2026-11-12 09:00:00.000".to_string();
+        let mut late = entry("I", "T", "second");
+        late.time_key = "09:00:00.000".to_string();
+        late.datetime_key = "2026-11-13 09:00:00.000".to_string();
+
+        // 同一天下午的区间：两天的 09:00 都不在范围内，证明比较的是日期而不是时刻。
+        let f = FilterSpec {
+            time_from: "2026-11-12 12:00".to_string(),
+            time_to: "2026-11-12 23:59".to_string(),
+            ..Default::default()
+        };
+        let compiled = CompiledFilter::compile(&f).unwrap();
+        assert!(compute_matches(&[early, late], &compiled).is_empty());
+    }
+
+    #[test]
+    fn time_only_bounds_still_ignore_dates() {
+        let mut early = entry("I", "T", "first");
+        early.time_key = "09:00:00.000".to_string();
+        early.datetime_key = "2026-11-12 09:00:00.000".to_string();
+        let mut late = entry("I", "T", "second");
+        late.time_key = "09:00:00.000".to_string();
+        late.datetime_key = "2026-11-13 09:00:00.000".to_string();
+
+        let f = FilterSpec {
+            time_from: "08:00".to_string(),
+            time_to: "10:00".to_string(),
+            ..Default::default()
+        };
+        let compiled = CompiledFilter::compile(&f).unwrap();
+        assert_eq!(compute_matches(&[early, late], &compiled), vec![0, 1]);
+    }
+
+    #[test]
+    fn month_day_bounds_match_entries_with_a_real_year() {
+        let mut first = entry("I", "T", "first");
+        first.time_key = "09:00:00.000".to_string();
+        first.datetime_key = "2026-11-12 09:00:00.000".to_string();
+        let mut second = entry("I", "T", "second");
+        second.time_key = "10:00:00.000".to_string();
+        second.datetime_key = "2026-11-13 10:00:00.000".to_string();
+
+        // 手输只给月日：忽略条目年份，按「每年这一天」比较。
+        let f = FilterSpec {
+            time_from: "11-12 00:00".to_string(),
+            time_to: "11-12 23:59".to_string(),
+            ..Default::default()
+        };
+        let compiled = CompiledFilter::compile(&f).unwrap();
+        assert_eq!(compute_matches(&[first, second], &compiled), vec![0]);
     }
 
     #[test]

@@ -5,6 +5,7 @@ import { openJsonPanel, openProxyPanel, refreshProxyServer, store } from '../../
 import { toCurl } from '../../lib/curl'
 import { errorMessage, ipc } from '../../lib/ipc'
 import { reportClientFlow } from '../../lib/error-report'
+import { formatMillis, timeMillis } from '../../lib/time'
 import type {
   NetworkCaptureStatus,
   NetworkPollResult,
@@ -215,22 +216,6 @@ function sourceLabel(row: NetworkRequest): string {
 }
 
 // ---------- 时间轴：请求按时间排布，拖拽选区间过滤 ----------
-
-/** `HH:MM:SS.mmm` → 当日毫秒；解析失败返回 null（不猜日期，采集都是同一天的连续片段）。 */
-function timeMillis(key: string): number | null {
-  const matched = /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$/.exec(key || '')
-  if (!matched) return null
-  const [h, m, s] = [Number(matched[1]), Number(matched[2]), Number(matched[3])]
-  return (h * 3600 + m * 60 + s) * 1000 + Number((matched[4] || '0').padEnd(3, '0'))
-}
-
-function formatMillis(value: number): string {
-  const h = Math.floor(value / 3600000)
-  const m = Math.floor((value % 3600000) / 60000)
-  const s = Math.floor((value % 60000) / 1000)
-  const ms = Math.floor(value % 1000)
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms).padStart(3, '0')}`
-}
 
 /** 轴的跨度永远等于当前全部请求的首尾，过滤只改变表格，不压缩轴本身。 */
 const timeBounds = computed(() => {

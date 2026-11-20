@@ -4,7 +4,8 @@
 //! vector. The matched index list is cached by the serialised filter so paging through a
 //! large result set does not re-evaluate the rules.
 
-use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult, SearchHits};
+use crate::logcat::{civil_from_days, days_from_civil};
+use crate::model::{FilterSpec, LogEntry, NameCount, QueryResult, SearchHits, TimeTimeline};
 use crate::netcapture::{AnyCapture, ProxyGuard};
 use crate::network::NetworkRequest;
 use crate::proxy::ProxyRuntime;
@@ -20,6 +21,8 @@ const MAX_CACHED_QUERIES: usize = 12;
 pub struct LogSession {
     pub entries: Vec<LogEntry>,
     cache: HashMap<String, Vec<u32>>,
+    /// 整份日志的时间轴（绝对毫秒）。只在首次需要时扫描一遍，追加实时日志后失效。
+    time_axis: Option<TimeAxis>,
 }
 
 impl LogSession {
@@ -29,6 +32,7 @@ impl LogSession {
         Self {
             entries,
             cache: HashMap::new(),
+            time_axis: None,
         }
     }
 
@@ -41,6 +45,8 @@ impl LogSession {
         }
         let base = self.entries.len() as u32;
         self.entries.reserve(pending.len());
+        // 新条目可能早于或晚于现有首尾（`adb logcat` 会先回放缓冲区），重新算比扩展更稳。
+        self.time_axis = None;
         for (i, mut entry) in pending.into_iter().enumerate() {
             entry.index = base + i as u32;
             self.entries.push(entry);
@@ -173,6 +179,182 @@ impl LogSession {
             elapsed_ms: started.elapsed().as_millis() as u64,
         })
     }
+
+    /// 时间轴分布：桶只统计命中条目，但轴的范围取自整份日志。
+    ///
+    /// 轴取整份日志而不是当前结果集，是为了让轴在筛选时保持稳定 —— 否则换一次筛选轴就
+    /// 伸缩一次，区间拖拽的位置会跟着漂。`time_from` / `time_to` 在统计前被摘掉，选中
+    /// 一段区间不会让其他时间段从图上消失。
+    pub fn timeline(&mut self, filter: &FilterSpec, bins: u32) -> Result<TimeTimeline, String> {
+        let axis = match self.time_axis {
+            Some(axis) => axis,
+            None => match compute_time_axis(&self.entries) {
+                Some(axis) => {
+                    self.time_axis = Some(axis);
+                    axis
+                }
+                // 整份日志都没有可解析的时间戳：没有轴可画。
+                None => return Ok(TimeTimeline::default()),
+            },
+        };
+
+        let mut base = filter.clone();
+        base.time_from.clear();
+        base.time_to.clear();
+        let compiled = CompiledFilter::compile(&base)?;
+        let indices = self.matched_indices(&base, &compiled);
+
+        let bins = bins.clamp(1, 512) as usize;
+        // 所有条目落在同一毫秒时给一个最小跨度，避免除零。
+        let span = (axis.end - axis.start).max(1);
+        let mut counts = vec![0u32; bins];
+        let mut total: u32 = 0;
+        let mut untimed: u32 = 0;
+        for &i in &indices {
+            let Some(entry) = self.entries.get(i as usize) else {
+                continue;
+            };
+            match entry_time_millis(entry, axis.has_date) {
+                Some(ms) => {
+                    let bucket = (((ms - axis.start) as u128 * bins as u128) / span as u128)
+                        .min(bins as u128 - 1) as usize;
+                    counts[bucket] += 1;
+                    total += 1;
+                }
+                None => untimed += 1,
+            }
+        }
+
+        Ok(TimeTimeline {
+            start: axis_label(axis.start, &axis),
+            end: axis_label(axis.end, &axis),
+            start_ms: axis.start,
+            end_ms: axis.end,
+            has_date: axis.has_date,
+            has_year: axis.has_year,
+            bins: counts,
+            total,
+            untimed,
+        })
+    }
+}
+
+/// 时间轴的跨度与日期信息。轴一旦算好就缓存 —— 每次筛选重扫整份日志没有意义。
+#[derive(Clone, Copy)]
+struct TimeAxis {
+    /// 轴起点，1970-01-01 起的绝对毫秒。
+    start: u64,
+    end: u64,
+    /// 日志是否带日期；`false` 时轴只有时刻，`start` / `end` 只是当日毫秒。
+    has_date: bool,
+    /// 日期是否带真实年份（`MM-DD` 形式的日志用 1970 占位）。
+    has_year: bool,
+}
+
+/// `MM-DD` 这类没有年份的日志使用的占位年份，展示时会去掉。
+const YEAR_PLACEHOLDER: i64 = 1970;
+
+/// 取条目在轴上的毫秒值：有日期的文件按完整日期，否则退回当日时刻。
+fn entry_time_millis(entry: &LogEntry, axis_has_date: bool) -> Option<u64> {
+    if axis_has_date {
+        datetime_key_millis(&entry.datetime_key).map(|(ms, _)| ms)
+    } else {
+        time_key_millis(&entry.time_key)
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS.mmm` → 1970-01-01 起的毫秒，附带年份是否真实。
+fn datetime_key_millis(key: &str) -> Option<(u64, bool)> {
+    let (date, time) = key.trim().split_once(' ')?;
+    let tod = time_key_millis(time)?;
+    let mut parts = date.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let days = days_from_civil(y, m, d);
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64 * 86_400_000 + tod, y != YEAR_PLACEHOLDER))
+}
+
+/// 轴端点标签：带年份 `YYYY-MM-DD HH:MM:SS.mmm`，只有月日 `MM-DD HH:MM:SS.mmm`。
+fn axis_label(ms: u64, axis: &TimeAxis) -> String {
+    let tod = ms % 86_400_000;
+    let time = millis_to_time_key(tod);
+    if !axis.has_date {
+        return time;
+    }
+    let (y, m, d) = civil_from_days((ms / 86_400_000) as i64);
+    if axis.has_year {
+        format!("{y:04}-{m:02}-{d:02} {time}")
+    } else {
+        format!("{m:02}-{d:02} {time}")
+    }
+}
+
+/// `HH:MM:SS.mmm` → 当日毫秒；格式不符返回 `None`（日志时间戳不带日期，不猜跨天）。
+fn time_key_millis(key: &str) -> Option<u64> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let (base, frac) = match key.split_once('.') {
+        Some((base, frac)) => (base, frac),
+        None => (key, ""),
+    };
+    let mut parts = base.split(':');
+    let h: u64 = parts.next()?.parse().ok()?;
+    let m: u64 = parts.next()?.parse().ok()?;
+    let s: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || h > 23 || m > 59 || s > 59 {
+        return None;
+    }
+    let mut millis: String = frac.chars().take(3).collect();
+    while millis.len() < 3 {
+        millis.push('0');
+    }
+    let ms: u64 = millis.parse().ok()?;
+    Some(((h * 60 + m) * 60 + s) * 1000 + ms)
+}
+
+fn millis_to_time_key(value: u64) -> String {
+    let h = value / 3_600_000;
+    let m = (value % 3_600_000) / 60_000;
+    let s = (value % 60_000) / 1000;
+    let ms = value % 1000;
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+fn compute_time_axis(entries: &[LogEntry]) -> Option<TimeAxis> {
+    // 有日期的文件按完整日期建轴；整份日志都没有日期时退回当日时刻。
+    let has_date = entries.iter().any(|entry| !entry.datetime_key.is_empty());
+    let mut start = u64::MAX;
+    let mut end = 0u64;
+    let mut has_year = false;
+    let mut found = false;
+    for entry in entries {
+        let value = if has_date {
+            datetime_key_millis(&entry.datetime_key)
+        } else {
+            time_key_millis(&entry.time_key).map(|ms| (ms, false))
+        };
+        if let Some((ms, year)) = value {
+            found = true;
+            has_year |= year;
+            start = start.min(ms);
+            end = end.max(ms);
+        }
+    }
+    found.then_some(TimeAxis {
+        start,
+        end,
+        has_date,
+        has_year,
+    })
 }
 
 /// A collected set of network requests, keyed by capture id. Kept out of `LogSession`
@@ -414,5 +596,123 @@ mod tests {
     fn find_rejects_an_empty_term() {
         let mut s = session();
         assert!(s.find(&find_filter(""), 10).is_err());
+    }
+
+    fn timed(time_key: &str, level: &str) -> LogEntry {
+        LogEntry {
+            time_key: time_key.to_string(),
+            level: level.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn timeline_axis_covers_the_whole_file_regardless_of_row_order() {
+        let mut s = LogSession::new(vec![
+            timed("10:00:10.000", "I"),
+            timed("10:00:00.000", "I"),
+            timed("10:00:05.000", "I"),
+        ]);
+        let timeline = s.timeline(&FilterSpec::default(), 5).expect("时间轴应成功");
+        assert_eq!(timeline.start, "10:00:00.000");
+        assert_eq!(timeline.end, "10:00:10.000");
+        assert_eq!(timeline.bins.iter().sum::<u32>(), 3);
+        assert_eq!(timeline.total, 3);
+        assert_eq!(timeline.untimed, 0);
+    }
+
+    #[test]
+    fn timeline_ignores_the_selected_range_so_other_periods_stay_visible() {
+        let mut s = LogSession::new(vec![
+            timed("10:00:00.000", "I"),
+            timed("10:00:05.000", "I"),
+            timed("10:00:10.000", "I"),
+        ]);
+        // 只看最后一条：结果集收窄到 1 条，但轴上的分布仍应是三条全貌。
+        let filter = FilterSpec {
+            time_from: "10:00:06".to_string(),
+            time_to: "10:00:12".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(s.query(&filter, 0, 50).expect("查询应成功").matched, 1);
+        let timeline = s.timeline(&filter, 4).expect("时间轴应成功");
+        assert_eq!(timeline.total, 3, "时间轴必须忽略自己的区间条件");
+        assert_eq!(timeline.start, "10:00:00.000");
+        assert_eq!(timeline.end, "10:00:10.000");
+    }
+
+    #[test]
+    fn timeline_counts_entries_without_a_time_key_separately() {
+        let mut s = LogSession::new(vec![timed("10:00:00.000", "I"), timed("", "?")]);
+        let timeline = s.timeline(&FilterSpec::default(), 2).expect("时间轴应成功");
+        assert_eq!(timeline.total, 1);
+        assert_eq!(timeline.untimed, 1, "读不出时间戳的行不该悄悄丢掉");
+        assert_eq!(timeline.bins.iter().sum::<u32>(), 1);
+    }
+
+    #[test]
+    fn timeline_still_applies_other_filters() {
+        let mut s = LogSession::new(vec![
+            timed("10:00:00.000", "E"),
+            timed("10:00:01.000", "I"),
+            timed("10:00:02.000", "E"),
+        ]);
+        let filter = FilterSpec {
+            levels: vec!["E".to_string()],
+            ..Default::default()
+        };
+        let timeline = s.timeline(&filter, 3).expect("时间轴应成功");
+        assert_eq!(timeline.total, 2, "级别筛选必须作用于时间轴");
+    }
+
+    #[test]
+    fn timeline_is_empty_when_no_entry_has_a_timestamp() {
+        let mut s = LogSession::new(vec![entry("no timestamp")]);
+        let timeline = s.timeline(&FilterSpec::default(), 4).expect("时间轴应成功");
+        assert!(timeline.bins.is_empty());
+        assert_eq!(timeline.total, 0);
+    }
+
+    fn dated(datetime_key: &str, time_key: &str) -> LogEntry {
+        LogEntry {
+            datetime_key: datetime_key.to_string(),
+            time_key: time_key.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn timeline_axis_includes_dates_when_the_log_has_them() {
+        let mut s = LogSession::new(vec![
+            dated("2026-11-12 10:00:00.000", "10:00:00.000"),
+            dated("2026-11-12 12:30:00.000", "12:30:00.000"),
+        ]);
+        let timeline = s.timeline(&FilterSpec::default(), 2).expect("时间轴应成功");
+        assert!(timeline.has_date);
+        assert!(timeline.has_year);
+        assert_eq!(timeline.start, "2026-11-12 10:00:00.000");
+        assert_eq!(timeline.end, "2026-11-12 12:30:00.000");
+        assert!(timeline.start_ms < timeline.end_ms);
+    }
+
+    #[test]
+    fn timeline_axis_crosses_midnight() {
+        let mut s = LogSession::new(vec![
+            dated("2026-11-12 23:50:00.000", "23:50:00.000"),
+            dated("2026-11-13 00:10:00.000", "00:10:00.000"),
+        ]);
+        let timeline = s.timeline(&FilterSpec::default(), 4).expect("时间轴应成功");
+        assert_eq!(timeline.start, "2026-11-12 23:50:00.000");
+        assert_eq!(timeline.end, "2026-11-13 00:10:00.000");
+        assert_eq!(timeline.bins.iter().sum::<u32>(), 2, "跨天的两条都要落在轴上");
+    }
+
+    #[test]
+    fn timeline_strips_the_placeholder_year_from_labels() {
+        let mut s = LogSession::new(vec![dated("1970-11-12 10:00:00.000", "10:00:00.000")]);
+        let timeline = s.timeline(&FilterSpec::default(), 2).expect("时间轴应成功");
+        assert!(timeline.has_date);
+        assert!(!timeline.has_year, "占位年份不能被当成真实年份");
+        assert_eq!(timeline.start, "11-12 10:00:00.000");
     }
 }

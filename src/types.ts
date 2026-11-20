@@ -5,6 +5,8 @@ export interface LogEntry {
   raw: string
   timestamp: string
   timeKey: string
+  /** `YYYY-MM-DD HH:MM:SS.mmm`；没有年份的日志用 1970 作占位年份。无日期时为空。 */
+  datetimeKey: string
   level: string
   tag: string
   pid: number
@@ -191,6 +193,33 @@ export interface QueryResult {
   levelCounts: NameCount[]
   topTags: NameCount[]
   elapsedMs: number
+}
+
+/**
+ * 命中日志在时间轴上的分布：把条目按 `timeKey` 均匀分桶。
+ *
+ * 轴的范围取自整份日志（`start` / `end`），桶里只数命中的条目，且统计时忽略
+ * `timeFrom` / `timeTo` —— 选中一段区间不会把轴上的其他时间段抹掉。
+ */
+export interface TimeTimeline {
+  /** 轴的起点标签：带年份时 `YYYY-MM-DD HH:MM:SS.mmm`，只有月日时 `MM-DD HH:MM:SS.mmm`。 */
+  start: string
+  /** 轴的终点标签，格式同 `start`。 */
+  end: string
+  /** 轴起点的绝对毫秒（1970-01-01 为原点），用于像素与时间的换算。 */
+  startMs: number
+  /** 轴终点的绝对毫秒。 */
+  endMs: number
+  /** 日志是否带日期；`false` 时轴上只有时刻。 */
+  hasDate: boolean
+  /** 日期是否带真实年份；`false` 时年份是占位值，展示与筛选都不包含它。 */
+  hasYear: boolean
+  /** 每个等宽桶内的命中条数；空数组表示没有可用的时间戳。 */
+  bins: number[]
+  /** 命中有时间戳的条目数（= `bins` 之和）。 */
+  total: number
+  /** 命中但读不出时间戳的条目数，它们不在轴上。 */
+  untimed: number
 }
 
 export const FIELDS = [

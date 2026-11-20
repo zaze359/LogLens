@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import RuleSidebar from './RuleSidebar.vue'
 import FilterBar from './FilterBar.vue'
+import LogTimeline from './LogTimeline.vue'
 import StatsPanel from './StatsPanel.vue'
 import LogTable from './LogTable.vue'
 import LogDetail from './LogDetail.vue'
@@ -20,6 +21,7 @@ import { store } from '../stores/session'
     <RuleSidebar />
     <div class="main-pane">
       <FilterBar />
+      <LogTimeline />
       <StatsPanel />
       <LogTable />
       <div class="statusbar">

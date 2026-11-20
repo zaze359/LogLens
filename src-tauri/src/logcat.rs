@@ -21,6 +21,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Default)]
 pub struct ParseResult {
@@ -322,6 +323,104 @@ pub fn normalize_time_value(raw: &str) -> String {
     format!("{}.{}", base_fixed, millis)
 }
 
+/// 日志里的日期 + 归一化时刻 → `YYYY-MM-DD HH:MM:SS.mmm`。
+///
+/// 很多 logcat 输出只带 `MM-DD`、没有年份：这里用 `1970` 作为占位年份，保证同一年内的
+/// 先后顺序正确；展示层会把占位年份去掉，不会把 1970 当成真实年份。
+pub fn normalize_datetime_key(date: &str, time_key: &str) -> String {
+    let date = date.trim().replace('T', " ");
+    let date = date.trim();
+    if date.is_empty() || time_key.is_empty() {
+        return String::new();
+    }
+    // `11-12` 补占位年份；`2026-11-12` 原样保留。
+    let full_date = if date.matches('-').count() == 1 {
+        format!("1970-{date}")
+    } else {
+        date.to_string()
+    };
+    format!("{full_date} {time_key}")
+}
+
+/// 归一化用户输入的区间端点：带日期时返回 `YYYY-MM-DD HH:MM:SS.mmm`（无年份用占位年份），
+/// 只给时刻时返回空串，调用方退回「只比时刻」的旧语义。
+pub fn normalize_datetime_value(raw: &str) -> String {
+    let cleaned = raw.trim().replace(',', ".");
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    let (date, time) = match cleaned.split_once(|c: char| c == ' ' || c == 'T') {
+        Some((date, time)) => (date.trim(), time.trim()),
+        // 只给了日期：从当天零点起算。
+        None if cleaned.contains('-') => (cleaned.as_str(), "00:00"),
+        None => return String::new(),
+    };
+    if !date.contains('-') {
+        return String::new();
+    }
+    normalize_datetime_key(date, &normalize_time_value(time))
+}
+
+/// 给只有月日的日志补上推断年份。
+///
+/// 参照时间取文件时间（文件导入）或当前时间（实时抓取）。日志结束日期比参照日期还晚时，
+/// 说明是跨年收集的（12-31 的日志次年 1 月才落盘），年份回退一年；否则直接用参照年份。
+pub fn fill_missing_year(entries: &mut [LogEntry], reference: SystemTime) {
+    let (ref_y, ref_m, ref_d) = civil_from_days(unix_days(reference));
+    let last_md = entries
+        .iter()
+        .rev()
+        .find_map(|entry| month_day(&entry.datetime_key));
+    let year = match last_md {
+        Some((m, d)) if (m, d) > (ref_m, ref_d) => ref_y - 1,
+        _ => ref_y,
+    };
+    for entry in entries.iter_mut() {
+        if let Some(tail) = entry.datetime_key.strip_prefix("1970-") {
+            entry.datetime_key = format!("{year:04}-{tail}");
+        }
+    }
+}
+
+fn unix_days(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+}
+
+fn month_day(key: &str) -> Option<(u32, u32)> {
+    let (date, _) = key.split_once(' ')?;
+    let mut parts = date.split('-');
+    parts.next()?;
+    let m = parts.next()?.parse().ok()?;
+    let d = parts.next()?.parse().ok()?;
+    Some((m, d))
+}
+
+/// Howard Hinnant 的 `days_from_civil`：与 JS `Date.UTC` 同一原点，前后端换算一致。
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 impl LogcatParser {
     pub fn new() -> Result<Self, String> {
         let time = r"\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?";
@@ -455,6 +554,7 @@ impl LogcatParser {
             format!("{} {}", date, time)
         };
         let time_key = normalize_time_value(&time);
+        let datetime_key = normalize_datetime_key(date, &time_key);
 
         let middle = caps.name("middle").map(|m| m.as_str()).unwrap_or("");
         let (mut pid, mut tid, mut package) = self.parse_middle(middle);
@@ -500,6 +600,7 @@ impl LogcatParser {
             raw: line.to_string(),
             timestamp,
             time_key,
+            datetime_key,
             level,
             tag,
             pid,
@@ -555,6 +656,7 @@ impl LogcatParser {
                 raw: line.to_string(),
                 timestamp: String::new(),
                 time_key: String::new(),
+                datetime_key: String::new(),
                 level: "S".to_string(),
                 tag: "logcat".to_string(),
                 pid: 0,
@@ -590,6 +692,7 @@ impl LogcatParser {
             raw: line.to_string(),
             timestamp: String::new(),
             time_key: String::new(),
+            datetime_key: String::new(),
             level: "?".to_string(),
             tag: String::new(),
             pid: 0,
@@ -958,6 +1061,72 @@ mod tests {
         assert_eq!(normalize_time_value("10:23:45.12"), "10:23:45.120");
         assert_eq!(normalize_time_value("10:23"), "10:23:00.000");
         assert_eq!(normalize_time_value("11-12 10:23:45,123"), "10:23:45.123");
+    }
+
+    #[test]
+    fn datetime_key_keeps_full_dates_and_marks_yearless_ones() {
+        assert_eq!(
+            normalize_datetime_key("2026-11-12", "10:23:45.123"),
+            "2026-11-12 10:23:45.123"
+        );
+        assert_eq!(
+            normalize_datetime_key("11-12", "10:23:45.123"),
+            "1970-11-12 10:23:45.123",
+            "没有年份的日志用占位年份，保证同一年内排序正确"
+        );
+        assert_eq!(normalize_datetime_key("", "10:23:45.123"), "", "没有日期就不生成日期键");
+    }
+
+    #[test]
+    fn datetime_values_normalise_user_typed_ranges() {
+        assert_eq!(
+            normalize_datetime_value("2026-11-12 10:23"),
+            "2026-11-12 10:23:00.000"
+        );
+        assert_eq!(
+            normalize_datetime_value("11-12 10:23:45,12"),
+            "1970-11-12 10:23:45.120"
+        );
+        assert_eq!(normalize_datetime_value("10:23"), "", "只给时刻时退回旧语义");
+    }
+
+    fn yearless(datetime_key: &str) -> LogEntry {
+        LogEntry {
+            datetime_key: datetime_key.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fills_the_missing_year_from_the_reference_time() {
+        let mut entries = vec![yearless("1970-11-12 10:00:00.000")];
+        // 2023-11-14：日志结束日期早于参照日期，直接沿用参照年份。
+        fill_missing_year(
+            &mut entries,
+            UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        );
+        assert_eq!(entries[0].datetime_key, "2023-11-12 10:00:00.000");
+    }
+
+    #[test]
+    fn rolls_back_a_year_when_collected_across_new_year() {
+        let mut entries = vec![yearless("1970-12-31 23:00:00.000")];
+        // 2024-01-02：日志结束日期 12-31 比文件时间还晚，说明是 2023 年收集的。
+        fill_missing_year(
+            &mut entries,
+            UNIX_EPOCH + std::time::Duration::from_secs(1_704_153_600),
+        );
+        assert_eq!(entries[0].datetime_key, "2023-12-31 23:00:00.000");
+    }
+
+    #[test]
+    fn keeps_real_years_untouched() {
+        let mut entries = vec![yearless("2022-05-01 08:00:00.000")];
+        fill_missing_year(
+            &mut entries,
+            UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        );
+        assert_eq!(entries[0].datetime_key, "2022-05-01 08:00:00.000");
     }
 
     #[test]

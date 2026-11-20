@@ -20,8 +20,6 @@ import {
 
 const search = ref(store.filter.search)
 const exclude = ref(store.filter.exclude)
-const timeFrom = ref(store.filter.timeFrom)
-const timeTo = ref(store.filter.timeTo)
 const tagChoice = ref('')
 const pidChoice = ref('')
 const packageChoice = ref('')
@@ -87,14 +85,10 @@ function historyTime(ts: number): string {
 // Keep local inputs in sync when a filter is reset or a rule changes the spec.
 watch(() => store.filter.search, (v) => { if (v !== search.value) search.value = v })
 watch(() => store.filter.exclude, (v) => { if (v !== exclude.value) exclude.value = v })
-watch(() => store.filter.timeFrom, (v) => { if (v !== timeFrom.value) timeFrom.value = v })
-watch(() => store.filter.timeTo, (v) => { if (v !== timeTo.value) timeTo.value = v })
 
 // 搜索框走 `updateSearch`：筛选模式下收窄列表，查找模式下只定位。
 watch(search, (v) => updateSearch(v))
 watch(exclude, (v) => updateFilter({ exclude: v }, true))
-watch(timeFrom, (v) => updateFilter({ timeFrom: v }, true))
-watch(timeTo, (v) => updateFilter({ timeTo: v }, true))
 
 function toggleLevel(level: string): void {
   const next = store.filter.levels.includes(level)
@@ -265,12 +259,6 @@ function toggleOrder(): void {
       <div class="divider-v" />
       <span class="filter-label">排除</span>
       <input v-model="exclude" class="input mini-input" placeholder="逗号分隔" />
-
-      <div class="divider-v" />
-      <span class="filter-label">时间</span>
-      <input v-model="timeFrom" class="input mini-input mono" placeholder="HH:MM:SS" />
-      <span class="muted">~</span>
-      <input v-model="timeTo" class="input mini-input mono" placeholder="HH:MM:SS" />
 
       <div class="divider-v" />
       <button class="btn btn-sm" @click="toggleOrder">
