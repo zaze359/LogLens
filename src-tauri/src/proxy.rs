@@ -1624,9 +1624,9 @@ fn run_listener(
 ///
 /// The socket belongs to [`ProxyRuntime`]; this handle owns two *separate* things:
 ///   * a [`Route`] on the shared listener, so that device's traffic is attributed to it;
-///   * a [`ProxyGuard`], which writes and restores the device-side proxy setting.
+///   * a [`ProxyGuard`], which writes and clears the device-side proxy setting.
 ///
-/// They are torn down independently on purpose: stopping a capture must restore the phone's
+/// They are torn down independently on purpose: stopping a capture must clear the phone's
 /// proxy without disconnecting any other device, and the listener outlives every capture.
 pub struct ProxyCapture {
     session_id: String,
@@ -2741,11 +2741,6 @@ mod tests {
             return;
         }
         let script = crate::netprobe::proxy_settings_script();
-        let before = crate::netprobe::parse_proxy_settings(&adb::shell_probe(
-            &adb_path,
-            &serial,
-            &script,
-        ));
 
         // A local upstream keeps the test offline and deterministic.
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2791,13 +2786,16 @@ mod tests {
         }
         capture
             .stop()
-            .expect("停止采集时应能恢复设备代理");
-        let after = crate::netprobe::parse_proxy_settings(&adb::shell_probe(
+            .expect("停止采集时应能清空设备代理");
+        let after = crate::netprobe::proxy_from_settings(&adb::shell_probe(
             &adb_path,
             &serial,
             &script,
         ));
-        assert_eq!(before, after, "AOSP 拆出的 host/port 也必须被清掉");
+        assert!(
+            after.is_empty(),
+            "停止采集必须回到直连，AOSP 拆出的 host/port 也要清掉: {after}"
+        );
         assert!(
             rows.iter().any(|r| r.method == "GET"
                 && r.path == "/native-probe"

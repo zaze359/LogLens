@@ -46,7 +46,7 @@ onBeforeUnmount(() => {
            面板保持挂载，采集状态和会话 id 才不会丢。 -->
       <p v-if="!connected" class="empty-hint warn">
         <template v-if="capturing">
-          adb 连接已断开。设备代理仍在生效，抓包会继续进行；但还原代理需要 adb，请重新连接设备以恢复设备网络。
+          adb 连接已断开。设备代理仍在生效，抓包会继续进行；但清空代理需要 adb，请重新连接设备以恢复设备网络。
         </template>
         <template v-else>
           设备未连接，无法开始抓包。在上方设备栏重新连接后即可开始。

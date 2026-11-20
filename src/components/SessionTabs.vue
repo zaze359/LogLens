@@ -44,7 +44,7 @@ const fileTabs = computed<SessionTab[]>(() => store.tabs.filter((tab) => !tab.in
       </button>
       <button
         class="tab-x"
-        title="关闭设备工作区（连同它的日志一起关闭，并还原代理）"
+        title="关闭设备工作区（连同它的日志一起关闭，并清空设备代理）"
         aria-label="关闭设备工作区"
         @click.stop="closeDeviceWorkspace(serial)"
       >×</button>

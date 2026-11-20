@@ -983,8 +983,8 @@ pub fn start_cdp_capture(
 /// Start the built-in proxy for native (OkHttp / Cronet / system) traffic.
 ///
 /// The device proxy is set only after the listener is ready, and the returned capture
-/// owns the [`ProxyGuard`]: stopping it (or closing the window) restores the original
-/// setting, so a crash cannot leave the phone offline.
+/// owns the [`ProxyGuard`]: stopping it (or closing the window) clears the device proxy,
+/// so a crash cannot leave the phone dialling a dead port.
 #[tauri::command]
 pub fn start_proxy_capture(
     options: ProxyCaptureOptions,
@@ -1270,8 +1270,8 @@ pub fn import_network_capture(
     Ok(info)
 }
 
-/// Set the device-wide HTTP proxy for the MITM route. The previous value is kept in a
-/// guard and restored on `restore_device_proxy`, `close`, or app exit.
+/// Set the device-wide HTTP proxy for the MITM route. The guard is dropped (which clears
+/// the device proxy) on `restore_device_proxy`, `close`, or app exit.
 #[tauri::command]
 pub fn configure_device_proxy(
     serial: String,
@@ -1323,40 +1323,18 @@ pub fn restore_device_proxy(
         });
     }
 
-    // No in-memory guard: this is the "app was killed / crashed / cable pulled"
-    // case. Fall back to the on-disk journal, then to any proxy still pointing at
-    // this machine. Never delete a proxy the user configured on the device.
+    // No in-memory guard: this is the "app was killed / crashed / cable pulled" case.
+    // Clear the device proxy unconditionally — keeping the previous value is what left a
+    // dead endpoint behind in the first place. When the device is gone the restore fails,
+    // and the journal entry must survive so the retry thread / next-start heal can still
+    // finish the job once it is back.
     //
-    // Read the marker without taking it: when the device is gone the restore below
-    // fails, and the entry must survive so the retry thread / next-start heal can
-    // still undo the proxy once it is back.
-    let marker = netcapture::proxy_marker(&serial);
-    let current = adb::shell_probe(&adb_path, &serial, &netprobe::proxy_settings_script());
-    let current_proxy = netprobe::proxy_from_settings(&current);
-    if !current_proxy.is_empty() {
-        let ours = marker
-            .as_ref()
-            .map(|m| m.applied == current_proxy)
-            .unwrap_or(false)
-            || netcapture::proxy_points_to_this_machine(&current_proxy);
-        if !ours {
-            return Err(format!(
-                "设备当前代理 {current_proxy} 不是本应用设置的，未改动。如需清除请在 系统设置 → WLAN 中手动修改。"
-            ));
-        }
-    }
-    // Always run the restore, even when Settings reads clean: on Android 15 the
-    // effective proxy can survive a clean-looking `settings delete`, and only an
-    // explicit `:0` makes the system stop handing it to newly started apps.
-    let applied = marker
-        .as_ref()
-        .map(|m| m.applied.clone())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| current_proxy.clone());
-    let original = marker.map(|m| m.original).unwrap_or_default();
-    if let Err(e) = netcapture::restore_proxy_settings(&adb_path, &serial, &original) {
+    // Run the restore even when Settings reads clean: on Android 15 the effective proxy
+    // can survive a clean-looking `settings delete`, and only an explicit `:0` makes the
+    // system stop handing it to newly started apps.
+    if let Err(e) = netcapture::restore_proxy_settings(&adb_path, &serial) {
         // Journal entry stays; retry once the device is reachable again.
-        netcapture::schedule_proxy_restore_retry(&adb_path, &serial, &original, &applied);
+        netcapture::schedule_proxy_restore_retry(&adb_path, &serial);
         return Err(e);
     }
     netcapture::clear_proxy_marker(&serial);

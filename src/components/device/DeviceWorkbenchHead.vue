@@ -55,7 +55,7 @@ async function reconnect(): Promise<void> {
     </button>
     <button
       class="btn btn-ghost btn-sm"
-      title="关闭设备工作区（连同它的日志一起关闭，并还原代理）"
+      title="关闭设备工作区（连同它的日志一起关闭，并清空设备代理）"
       @click="closeDeviceWorkspace(serial)"
     >×</button>
   </header>

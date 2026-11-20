@@ -756,7 +756,7 @@ async function closeAll(): Promise<void> {
     failures: failures.length
   })
   if (failures.length > 0) {
-    error.value = `关闭采集时未能恢复设备代理：${failures.join('；')}。可在设备代理区域手动恢复。`
+    error.value = `关闭采集时未能清空设备代理：${failures.join('；')}。可在设备代理区域手动清空。`
   }
 }
 
@@ -960,7 +960,7 @@ defineExpose({ shutdown, isCapturing: running })
             v-if="proxyRunning"
             class="btn btn-sm btn-danger-ghost"
             :disabled="busy"
-            title="停止原生接口采集并还原设备代理"
+            title="停止原生接口采集并将设备代理清空为直连"
             @click="stopSource('proxy')"
           >
             {{ busyChannel === 'proxy' ? '停止中…' : '停止原生采集' }}
@@ -1025,7 +1025,7 @@ defineExpose({ shutdown, isCapturing: running })
         <ul class="net-capability">
           <li>
             <b>原生接口</b>（内建代理）：支持 HTTP 明文全文；不支持 HTTPS 解密，
-            只能拿到域名、SNI、耗时与字节数。采集结束会自动还原设备代理。
+            只能拿到域名、SNI、耗时与字节数。采集结束会把设备代理清空为直连。
           </li>
           <li>
             <b>H5 采集</b>（WebView CDP）：支持 WebView 内的 HTTPS 明文；不支持 App 的原生接口请求，
@@ -1187,14 +1187,14 @@ defineExpose({ shutdown, isCapturing: running })
               <span class="form-label">代理</span>
               <input v-model="proxyInput" class="select mono" style="flex: 1" placeholder="例如 10.0.0.2:8080" />
               <button class="btn btn-sm" :disabled="!serial || !proxyInput" @click="configureProxy">设置</button>
-              <button class="btn btn-sm" :disabled="!proxyState?.active" @click="restoreProxy">还原</button>
+              <button class="btn btn-sm" :disabled="!proxyState?.active" @click="restoreProxy">清空</button>
             </div>
             <p class="empty-hint">
-              这里是给 Charles / mitmproxy 等外部工具手动指向设备用的；上面「原生接口采集」会自动设置并还原代理，两者不要同时用。
+              这里是给 Charles / mitmproxy 等外部工具手动指向设备用的；上面「原生接口采集」会自动设置代理，停止时统一清空为直连，两者不要同时用。
               Android 7+ 的 release 包不信任用户 CA，HTTPS 明文仍取决于证书条件。
             </p>
             <p v-if="proxyState?.active" class="empty-hint warn mono">
-              当前生效：{{ proxyState.proxy }}（原值：{{ proxyState.original || '无' }}）
+              当前生效：{{ proxyState.proxy }}（此前设备代理：{{ proxyState.original || '无' }}）
             </p>
           </div>
         </div>
@@ -1202,7 +1202,7 @@ defineExpose({ shutdown, isCapturing: running })
 
       <p class="empty-hint net-foot-note">
         抓包内容按原文保存，含 token / Cookie 等凭据，请勿随意外发导出文件。
-        <span v-if="running">关闭本面板会停止采集并还原设备代理。</span>
+        <span v-if="running">关闭本面板会停止采集并将设备代理清空为直连。</span>
       </p>
     </div>
 

@@ -60,7 +60,7 @@
 │       ├── network.rs            # 网络请求模型、HAR / JSONL 解析、敏感字段脱敏
 │       ├── cdp.rs                # 零依赖 HTTP/1.1 + WebSocket CDP 客户端、Network.* 事件组装
 │       ├── netprobe.rs           # 设备抓包能力体检与四条路线评估
-│       ├── netcapture.rs         # CDP 实时采集线程、代理 ProxyGuard（自动还原）、统一采集抽象 AnyCapture
+│       ├── netcapture.rs         # CDP 实时采集线程、代理 ProxyGuard（停止即清空）、统一采集抽象 AnyCapture
 │       ├── proxy.rs              # 内建 HTTP/CONNECT 代理：明文 HTTP 记录、HTTPS 隧道 + SNI
 │       ├── session.rs            # 日志会话、网络请求会话、分页查询、命中索引缓存
 │       ├── config_store.rs       # 自定义规则持久化
@@ -233,7 +233,7 @@ npm run tauri build
 - 设备工作区左边一条竖排工具栏（`DeviceToolRail.vue`），工具列表在 `components/device/operations.ts` 里只有一份：`日志` / `抓包`。选中是实心蓝块，右侧看内容。
 - 「日志」工具渲染的就是**共用的日志面板**（`LogPane.vue`，全应用只有一份实例，靠 `v-show` 显隐）。本地文件工作区用的是同一个组件 —— 显示逻辑一样，数据来源不同。
 - 日志的归属靠 `info.device`（设备序列号）判断：切到一份设备日志 = 进那台设备工作区 + 选中「日志」工具（`followTabOwner()`），不需要额外记状态。
-- 关掉设备工作区会**连同它的日志一起关闭**（停 `adb logcat` 子进程、释放后端会话）再还原代理。日志属于设备，就不该出现「设备已经没了、日志标签还挂着」的状态。
+- 关掉设备工作区会**连同它的日志一起关闭**（停 `adb logcat` 子进程、释放后端会话）再把设备代理清空为直连。日志属于设备，就不该出现「设备已经没了、日志标签还挂着」的状态。
 - 本地文件没有设备：标签条上的标签点进去直接是日志面板，左侧没有工具栏。
 
 ### 为什么是「工作区标签 + 工具条」，而不是弹窗 / 停靠面板 / 一排功能标签
@@ -242,7 +242,7 @@ npm run tauri build
 
 - 设备工作区**一开就待在标签条里**，工作区之间切换就是点标签；设备内部的东西都在左侧工具栏里，一眼看出「这些都属于这台设备」。
 - 切走工具时**只是隐藏，不卸载** —— 日志面板和抓包页都还在，采集继续跑。
-- 关掉设备工作区标签 = 关掉它的日志 + 停止采集 + 还原设备代理（`closeDeviceWorkspace()`），不是单纯隐藏视图。
+- 关掉设备工作区标签 = 关掉它的日志 + 停止采集 + 将设备代理清空为直连（`closeDeviceWorkspace()`），不是单纯隐藏视图。
 - 一台设备一个工作区：选同一台设备是**聚焦**已有工作区，不会开出重复标签；两台设备就是两个工作区标签，各自有自己的工具选中状态（`store.deviceOps`）。
 
 ### 设备选择只在「创建 / 换设备」时发生
@@ -349,12 +349,12 @@ npm run tauri build
 
 **为什么不解密原生 HTTPS**：Android 7+（targetSdk ≥ 24）默认不信任用户安装的 CA；真机上目标包的 `network_security_config.xml` 只有 `<base-config cleartextTrafficPermitted="true"/>`，**没有 `<debug-overrides>` 放行用户 CA**，且 dex 里能查到 `CertificatePinner` 调用痕迹。设备是 `user` 构建、无 `su`、`adb root` 被拒、系统 CA 位于只读的 APEX conscrypt 内——在「不改 App、不 root、不装 CA」的前提下 MITM 走不通，所以这里明确只做元数据，不把「看见域名」伪装成「看见明文」。反过来，`cleartextTrafficPermitted=true` 让明文 HTTP 能拿到完整内容。
 
-- **代理安全**：绑定本机 LAN IP，只放行配对设备 IP、本机 LAN IP 与回环地址，同网段其他人借不了道；设置前记录原值，停止采集 / 关闭面板 / 退出应用（`ProxyGuard::drop`）都会还原。同一设备只允许一个原生采集（全局代理只有一个），H5 采集可与它并行。
+- **代理安全**：绑定本机 LAN IP，只放行配对设备 IP、本机 LAN IP 与回环地址，同网段其他人借不了道；停止采集 / 关闭面板 / 退出应用（`ProxyGuard::drop`）都会把设备代理**统一清空为直连**，不写回设置前的值——那个值经常是上一次运行留下的死代理（本机 LAN IP 会变），写回后设备会继续连一个已关闭的端口，看起来就像「停止后代理没清掉」。同一设备只允许一个原生采集（全局代理只有一个），H5 采集可与它并行。
 - **代理只影响新进程**：如果被测 App 在「开始原生接口采集」之前已经在运行，它的进程内 `http.proxyHost` 是启动时从 Zygote 继承的，运行中改 `settings` 不会刷新；已有 keep-alive 连接也会继续复用并绕过代理。表现就是**代理已设置、面板在采集、App 继续请求，但表里一条都没有**。开始采集后面板会常驻提示：请完全退出并重新打开被测 App，再触发请求。设置代理时已同步清掉所有旧键、写入 `:0` 触发刷新，并设置 `http_proxy` 与 Android 15 拆分键两份，确保新进程拿到正确代理。
-- **AOSP 拆键陷阱**：`settings put global http_proxy <host>:<port>` 在真机上会被拆成 `global_http_proxy_host` / `global_http_proxy_port` 存储，只 `settings delete global http_proxy` **清不干净**，会残留一个指向已停监听的死代理，让设备断网。因此还原时把 `http_proxy`、`global_http_proxy_host`、`global_http_proxy_port`、`global_http_proxy_exclusion_list`、`global_proxy_pac_url` 全部删除后再恢复原值，体检也读全套键。
+- **AOSP 拆键陷阱**：`settings put global http_proxy <host>:<port>` 在真机上会被拆成 `global_http_proxy_host` / `global_http_proxy_port` 存储，只 `settings delete global http_proxy` **清不干净**，会残留一个指向已停监听的死代理，让设备断网。因此停止时把 `http_proxy`、`global_http_proxy_host`、`global_http_proxy_port`、`global_http_proxy_exclusion_list`、`global_proxy_pac_url` 全部删除后统一写入 `:0`，体检也读全套键。
 - **「看着干净」不等于「真的清了」（Android 15 实测）**：`settings delete global http_proxy` 之后 Settings 里读不到任何代理，但 `ConnectivityService` 持有的 Java 层 `http.proxyHost`（由 Zygote 继承）可能仍下发给**新启动**的 App 进程，表现为 `failed to connect to /172.21.33.28 (port 18999)`；force-stop 后重开 App 也一样。因此还原脚本删完所有键后会**显式写入 Android 标准无代理值 `settings put global http_proxy :0`**，触发真正的刷新，`:0` 也按「无代理」解析。**验证是否恢复要看 App 的实际请求日志，不能只看 `settings` 无输出。**
-- **崩溃安全（关键）**：设备全局代理是**持久设置**，桌面进程却是易失的——Cmd+Q、强杀、崩溃、先拔线再退出都可能跳过全部析构函数，设备会一直指向已停监听的端口，表现为 `failed to connect to /172.21.33.28 (port 18999)`。所以每次设置成功后都会把「设备 serial + adb 路径 + 原值」写入 `~/Library/Application Support/com.zaze.loglens/proxy-state.json`（Windows 为 `%APPDATA%\com.zaze.loglens\`），还原成功才删除；**应用启动和每次环境体检都会读这份记录自动清理残留**（面板会显示「已自动修复设备代理」）。设备离线时保留记录，等重新连上再清；代理若已被其他程序改写则保持原样，绝不误删用户自己配置的代理。
-- **手动兜底**：即使内存里的 guard 已随上次进程消失，面板「还原」仍会按记录恢复原值，并清理仍指向本机的死代理；指向其他主机的代理会明确报错且不改动。
+- **崩溃安全（关键）**：设备全局代理是**持久设置**，桌面进程却是易失的——Cmd+Q、强杀、崩溃、先拔线再退出都可能跳过全部析构函数，设备会一直指向已停监听的端口，表现为 `failed to connect to /172.21.33.28 (port 18999)`。所以每次设置成功后都会把「设备 serial + adb 路径」写入 `~/Library/Application Support/com.zaze.loglens/proxy-state.json`（Windows 为 `%APPDATA%\com.zaze.loglens\`），清空成功才删除；**应用启动和每次环境体检都会读这份记录自动清理残留**（面板会显示「已自动修复设备代理」）。设备离线时保留记录，等重新连上再清；清理是无条件的，设备上无论留着谁写的代理都会被清空为直连。
+- **手动兜底**：即使内存里的 guard 已随上次进程消失，面板「清空」也会无条件把设备代理清空为直连。
 - 部分厂商 ROM 忽略 `settings put global http_proxy`，设置后会读回校验并明确报错，而不是假装成功。
 
 #### 导入第三方工具结果
@@ -372,7 +372,7 @@ LOGLENS_JSONL=~/capture.jsonl mitmdump -s scripts/mitmproxy_jsonl.py -p 8080
 
 - **Android 7+ 的硬门槛**：targetSdk ≥ 24 的 App 默认不信任用户安装的 CA，`DEBUGGABLE` 本身**不**等于放行；有证书固定时即使放行也失败。所以体检不会把 `mitm-debug` 标成「可看明文」。
 - **凭据按原文保存**：`network.rs::REDACT_ENABLED` 默认 `false`，token / Cookie / 密码等不做脱敏，原文会进入会话、缓存与导出文件——仅在本地受信任环境使用；改成 `true` 即在导入 / 采集落地时替换敏感字段（含 URL query 的 token）。
-- **清理**：CDP 的 `adb forward` 由采集线程在停止 / 异常 / 窗口关闭时移除；内建代理停止时同步关闭监听并还原设备代理，不会留下占用端口或死代理。
+- **清理**：CDP 的 `adb forward` 由采集线程在停止 / 异常 / 窗口关闭时移除；内建代理停止时同步关闭监听并清空设备代理，不会留下占用端口或死代理。
 
 ---
 

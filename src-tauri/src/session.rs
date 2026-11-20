@@ -194,12 +194,11 @@ pub struct AppState {
     /// Live CDP captures and their collected requests.
     pub network_captures: Mutex<HashMap<String, AnyCapture>>,
     pub network_sessions: Mutex<HashMap<String, NetworkSession>>,
-    /// One proxy guard per device. Dropping the guard restores the previous setting.
+    /// One proxy guard per device. Dropping the guard clears the device proxy.
     pub proxy_guards: Mutex<HashMap<String, ProxyGuard>>,
     /// Serials whose proxy capture is *currently starting*. The duplicate check and the
     /// actual start are separated by several `adb` round trips, so without a reservation
-    /// two near-simultaneous starts would both install a guard — and the second would
-    /// remember the first's endpoint as "the original setting" to restore.
+    /// two near-simultaneous starts would both install a guard for the same device.
     starting_proxies: Mutex<HashSet<String>>,
     /// The one proxy listener. Devices are routes on it and the standalone page is its
     /// unnamed-source view — a single runtime is what keeps the endpoint stable at 18999
@@ -272,11 +271,11 @@ impl AppState {
             // The device may already be gone; the failure is logged instead of ignored,
             // and the journal entry is kept for `heal_stale_proxies` / the retry thread.
             if let Err(e) = capture.stop() {
-                crate::error_log::record_flow("proxy.restore", "退出时恢复设备代理失败", &e);
+                crate::error_log::record_flow("proxy.restore", "退出时清空设备代理失败", &e);
             }
         }
         let mut guards = self.proxy_guards.lock().unwrap_or_else(|p| p.into_inner());
-        guards.clear(); // ProxyGuard::drop restores the original proxy
+        guards.clear(); // ProxyGuard::drop clears the device proxy
         // The proxy listener outlives every capture while the app runs, so it has to be
         // closed here explicitly or the port would outlive the window.
         let proxy_closed = {
