@@ -1,0 +1,217 @@
+name: 打 tag 自动构建
+
+# 触发方式
+#   1) 推送 v 开头的 tag（如 v0.1.0）→ 构建各平台产物并创建 GitHub Release
+#   2) Actions 页面手动触发 → 只构建并上传 workflow 产物，不创建 Release（用来试跑）
+#
+# 版本号唯一来源是 src-tauri/tauri.conf.json 的 version；tag 必须等于 v<version>，
+# 不一致会在第一步直接失败，避免发出文件名和 tag 对不上的包。
+#
+# 构建逻辑不在这里重写，直接调项目自带的 scripts/package.sh / package.ps1，
+# 所以 CI 产物与本地 `npm run package` 的目录结构、BUILD-INFO.md、SHA256SUMS.txt 完全一致。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub 托管的 Intel Mac runner 已下线，macOS 产物只出 Apple 芯片（aarch64）。
+          # 需要 Intel 包时改用 universal 构建：加 rustup target add x86_64-apple-darwin 后
+          # `tauri build --target universal-apple-darwin`（package.sh 目前不透传 --target）。
+          - os: macos-14
+            label: macOS · Apple Silicon
+            platform: macos
+            arch: aarch64
+            bundles: app,dmg
+          - os: windows-latest
+            label: Windows · x64
+            platform: windows
+            arch: x64
+            bundles: msi,nsi
+          - os: ubuntu-22.04
+            label: Linux · x64
+            platform: linux
+            arch: x64
+            bundles: deb,appimage
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          # 打包脚本要读分支名和提交号写进 BUILD-INFO.md，浅克隆拿不到
+          fetch-depth: 0
+
+      - name: 校验 tag 与版本号
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          pkg_version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tauri.conf.json=$version / package.json=$pkg_version"
+
+          if [ "$version" != "$pkg_version" ]; then
+            echo "::error::版本号不一致：tauri.conf.json=$version，package.json=$pkg_version"
+            exit 1
+          fi
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} 与版本号 v$version 不一致（tag 必须是 v + tauri.conf.json 的 version）"
+              exit 1
+            fi
+            echo "tag ${GITHUB_REF_NAME} 与版本号一致"
+          else
+            echo "非 tag 触发，跳过 tag 校验"
+          fi
+
+      # Tauri v2 在 Ubuntu 上编译需要 webkit2gtk-4.1 等开发包，否则 tauri build 直接报错
+      - name: 安装 Linux 构建依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libfuse2
+
+      - name: 配置 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 配置 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 编译产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 打包（macOS / Linux）
+        if: runner.os != 'Windows'
+        run: bash scripts/package.sh --bundles "${{ matrix.bundles }}" --no-install
+
+      - name: 打包（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/package.ps1 -Bundles "${{ matrix.bundles }}" -NoInstall
+
+      # 整个 release/<平台>/ 目录打成一个压缩包作为发布资产：
+      # 安装包、BUILD-INFO.md、SHA256SUMS.txt、macOS 的一键去隔离脚本都在一起，
+      # 校验和与包一一对应，不会被别的平台同名文件覆盖。
+      - name: 归档产物（macOS）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # ditto 保留 .app 的资源分叉与符号链接，zip -r 会破坏 .app 结构
+          ditto -c -k --sequesterRsrc --keepParent release/macos \
+            "out/LogLens_${{ steps.ver.outputs.version }}_macos_${{ matrix.arch }}.zip"
+          ls -lh out
+
+      - name: 归档产物（Linux）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          tar -czf "out/LogLens_${{ steps.ver.outputs.version }}_linux_${{ matrix.arch }}.tar.gz" -C release linux
+          ls -lh out
+
+      - name: 归档产物（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Compress-Archive -Path release/windows `
+            -DestinationPath "out/LogLens_${{ steps.ver.outputs.version }}_windows_${{ matrix.arch }}.zip" -Force
+          Get-ChildItem out | Select-Object Name, Length
+
+      - name: 上传 workflow 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: LogLens-${{ matrix.platform }}-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: 创建 GitHub Release
+    needs: build
+    # 手动触发时只构建不出包
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 读取版本号
+        id: ver
+        run: echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: 下载各平台产物
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: 整理发布资产
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          find assets -type f -exec mv -f {} dist-release/ \;
+          ls -lh dist-release
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: LogLens ${{ steps.ver.outputs.version }}
+          files: dist-release/*
+          fail_on_unmatched_files: true
+          # 版本号带 - 后缀（如 0.2.0-beta.1）自动标为预发布
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
+          body: |
+            LogLens ${{ steps.ver.outputs.version }} 由 `.github/workflows/release.yml` 在推送 tag 时自动构建。
+
+            每个压缩包内是打包脚本产出的完整目录：安装包、`BUILD-INFO.md`（版本 / 提交 / 工具链）和 `SHA256SUMS.txt`（校验和）。
+
+            ### 注意
+
+            - **macOS 包为 ad-hoc 签名 / 未公证**：CI runner 上没有本机签名证书。首次打开通常提示「无法验证开发者」——右键 → 打开，或到「系统设置 → 隐私与安全性」底部点「仍要打开」即可。若经微信 / QQ / 飞书等 IM 传输后被判「已损坏」，**dmg 卷内自带 `安装 LogLens.command` 与 `使用说明.txt`**（只发 dmg 也能拿到），双击脚本即可：它会清除隔离属性、把 app 拷进「应用程序」并启动。
+            - 想要稳定的签名身份（重装后不必反复确认本地网络 / 通知权限），可在本地执行 `bash scripts/make-signers.sh` 生成自签证书，再用 `bash scripts/package.sh` 打包。
+            - **Windows 包未签名**：SmartScreen 可能提示「未知发布者」。
+            - macOS 产物仅支持 Apple 芯片（aarch64）；Intel Mac 需自行构建 x64 / universal 包。
+            - **Linux 包未签名**：deb / AppImage 未做 GPG 签名。
