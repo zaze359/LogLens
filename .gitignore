@@ -24,6 +24,13 @@ setup-report.md
 __pycache__/
 *.pyc
 
+# ---------- macOS 本机签名证书（scripts/make-signers.sh 生成，含私钥，绝不入库） ----------
+scripts/certs/
+
+# ---------- notarytool 凭据（Developer ID 公证用，勿提交） ----------
+*.p8
+notarytool-credentials
+
 # ---------- 环境变量与本地配置 ----------
 .env
 .env.*

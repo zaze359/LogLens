@@ -141,7 +141,7 @@ npm run tauri dev        # 启动桌面客户端（会先拉起 Vite dev server�
 
 ---
 
-## 5. 打包（macOS / Windows）
+## 5. 打包（macOS / Windows / Linux）
 
 **开发态图标（自动生成，无需操作）**：Tauri 2 的 `generate_context!()` 在编译期会读取 `src-tauri/icons/icon.png` 作为默认窗口图标，**即使 `bundle.icon` 是 `[]` 也一样**。因此 `npm install`（`postinstall`）、`npm run dev`、`npm run build`、`npm run tauri dev/build` 以及一键脚本都会执行 `scripts/gen-icon.cjs`，用纯 Node 标准库生成一张 64×64 占位渐变 PNG（幂等，不会覆盖你已有的图标）。新克隆的仓库可以直接启动，不需要提交二进制图标；`npm install` 之后直接执行 `cd src-tauri && cargo test --lib` 也能编译通过。
 
@@ -153,7 +153,7 @@ npm run tauri dev        # 启动桌面客户端（会先拉起 Vite dev server�
 
 | 系统 | 命令 | 输出目录 |
 | --- | --- | --- |
-| macOS | `bash scripts/package.sh`（或 `npm run package`） | `release/macos/`：`LogLens.app`、`LogLens_0.1.0_aarch64.dmg`、`LogLens_0.1.0_aarch64.zip` |
+| macOS | `bash scripts/package.sh`（或 `npm run package`） | `release/macos/`：`LogLens.app`、`LogLens_0.1.0_aarch64.dmg`（卷内含 app、Applications 链接、`安装 LogLens.command`、`使用说明.txt`，用自签证书并 `--publish` 导出根证书时还会带上 `LogLens-Setup-Root.crt`）、`LogLens_0.1.0_aarch64.zip` |
 | Windows | `powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1`（或 `npm run package:win`） | `release/windows/`：`LogLens_0.1.0_x64_en-US.msi`、`LogLens_0.1.0_x64-setup.exe` |
 
 每个平台目录都会附带 `BUILD-INFO.md`（版本 / 平台 / Git 提交 / 工具链 / 文件清单）和 `SHA256SUMS.txt`（校验和）。`release/` 已在 `.gitignore` 中，不会被误提交。
@@ -164,6 +164,8 @@ npm run tauri dev        # 启动桌面客户端（会先拉起 Vite dev server�
 | 不重新编译，只收集现有产物 | `--skip-build` | `-SkipBuild` | 复用 `src-tauri/target/release/bundle/` |
 | 换输出根目录 | `--out <dir>` | `-Out <dir>` | 默认 `release/`；配合 `--clean` 时仍须位于项目 `release/` 下 |
 | 指定打包格式 | `--bundles app,dmg` | `-Bundles msi,nsi` | 直接透传给 `tauri build --bundles`，逐个格式执行 |
+| 指定 macOS 签名身份 | `--identity <名称或哈希>` | — | 默认自动挑：Apple 开发者证书 → 本机自签「LogLens Development」→ ad-hoc |
+| 跳过重签名 | `--no-identity` | — | 只保留 tauri 的 linker 级签名；Gatekeeper 可能判「已损坏」 |
 | 不注入自定义图标 | `--no-icons` | `-NoIcons` | 使用 Tauri 通用占位图标 |
 | 完成后打开输出目录 | `--open` | `-Open` | Finder / 资源管理器 |
 | 帮助 | `--help` | `-Help` | 列出全部选项 |
@@ -171,12 +173,67 @@ npm run tauri dev        # 启动桌面客户端（会先拉起 Vite dev server�
 脚本的几个约定：
 
 - **某一种格式打包失败不阻断交付**。脚本按 `--bundles` 逐个格式执行，全部失败才报错。DMG 依赖 `hdiutil` 挂载磁盘卷，在无权限 / 沙箱 / CI 环境下会失败；NSIS / AppImage 也可能因缺工具链失败，此时已产出的 `.app` / `zip` / `msi` / `deb` 照常交付并明确告警。
+- **`app` 格式最后打**。`tauri build --bundles dmg` 结束时会删掉为它临时生成的 `bundle/macos/*.app`，所以脚本把 `app` 挪到执行顺序末尾，保证 `.app` 与便携 zip 都能收集到（其余格式顺序仍按 `--bundles`）。
+- **macOS 收尾会签名并重建 dmg**。先按「`--identity` → Apple 开发者证书 → 本机自签证书「LogLens Development」→ ad-hoc」挑一个签名身份，用 `codesign --force --deep` 给 `.app` 完整重签（tauri 默认只给可执行文件做 linker 签名，Gatekeeper 会判「已损坏」）；再用 `hdiutil` 重建 dmg，把 `安装 LogLens.command`（用「LogLens Installer」证书签名）和 `使用说明.txt` 放进卷内；若本机用 `make-signers.sh --publish` 导出过接收方根证书，还会把 `LogLens-Setup-Root.crt` 放进卷内供安装脚本导入。重建时**丢掉 tauri 的 `.DS_Store`**：它只给 `LogLens.app` 和 `Applications` 记了图标坐标和窗口大小，新增的文件没有坐标，Finder 会把它们排在窗口可视区之外（要滚动才看得到，接收方会以为卷里没有）；删掉后 Finder 自动排列，所有条目一眼可见。卷名也带上版本号（`LogLens 0.1.0`），避免 Finder 按卷名继承旧窗口尺寸。任一步失败只告警，不影响已产出的其它文件。
 - **只收集当前版本的产物**。`bundle/` 不会自动清历史版本，而 dmg / msi / deb / AppImage 文件名带版本号；脚本只复制文件名含当前 `version` 的产物，跳过旧版本并告警。
 - **不写回 `tauri.conf.json`**。图标齐全时通过 `tauri build --config` 一次性注入 `bundle.icon`（Windows 上写入临时 JSON 后传路径），受版本控制的配置保持干净；`setup.sh --build` / `setup.ps1 -Build` 也改为直接转调打包脚本。
 - **图标可以偷懒**。把一张 1024×1024 的 `app-icon.png` 丢到项目根目录，脚本会自动执行 `tauri icon` 生成整套图标并注入；没有图标时也能出包，只是使用 Tauri 通用占位图标（并给出告警）。
 - **cargo 不在 PATH 时自动兜底**。从 IDE / GUI 启动的终端可能没加载 `~/.cargo/env`，脚本会尝试 `$HOME/.cargo/bin`、`/opt/homebrew/bin`、`/usr/local/bin`（Windows 为 `%USERPROFILE%\.cargo\bin`）；仍找不到时会提示执行 `source "$HOME/.cargo/env"` 后重试。
-- **产物未签名**。macOS 未签名 / 未公证，首次打开需右键「打开」或 `xattr -dr com.apple.quarantine <app>`；Windows 未签名，SmartScreen 可能提示「未知发布者」。BUILD-INFO 会标注签名状态。
+- **签名状态**。macOS 默认用本机自签证书（`bash scripts/make-signers.sh` 生成）签名，没有证书时回退 ad-hoc；均未做 Apple Developer ID 签名与公证。Windows 未签名（SmartScreen 可能提示「未知发布者」）。BUILD-INFO 会写明本次实际使用的签名身份。macOS 包的接收方指引见下方「分发给他人」。
 - **zip 便携包用 `ditto` 打包**，保留资源分叉，解压后双击即可运行。
+
+**打 tag 自动出包（GitHub Actions）**：推一个 `v` 开头的 tag，GitHub 会跑 `.github/workflows/release.yml`，分别在 macOS / Windows / Linux 上构建，并把三个平台的压缩包挂到对应的 GitHub Release。构建步骤直接调用 `scripts/package.sh` / `scripts/package.ps1`，所以 CI 产物与本地打包的目录结构、`BUILD-INFO.md`、`SHA256SUMS.txt` 完全一致。
+
+```bash
+# 1) 先同步版本号（tauri.conf.json 决定产物文件名和 tag 校验，务必一起改）
+#    src-tauri/tauri.conf.json  version
+#    package.json               version
+#    src-tauri/Cargo.toml       version（只影响二进制元信息，CI 不校验）
+git commit -am "chore(release): 0.1.0"
+
+# 2) 打 tag 并推送（tag 必须是 v + tauri.conf.json 的 version，否则 CI 第一步就失败）
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+| 平台 | runner | Release 资产 | 包内文件 |
+| --- | --- | --- | --- |
+| macOS（Apple 芯片） | `macos-14` | `LogLens_0.1.0_macos_aarch64.zip` | `.app`、`.dmg`、便携 zip、`安装 LogLens.command`、`使用说明.txt`、`BUILD-INFO.md`、`SHA256SUMS.txt` |
+| Windows（x64） | `windows-latest` | `LogLens_0.1.0_windows_x64.zip` | `.msi`、`-setup.exe`、`BUILD-INFO.md`、`SHA256SUMS.txt` |
+| Linux（x64） | `ubuntu-22.04` | `LogLens_0.1.0_linux_x64.tar.gz` | `.deb`、`.AppImage`、`BUILD-INFO.md`、`SHA256SUMS.txt` |
+
+- 每个平台的产物单独打包成一个资产，`SHA256SUMS.txt` 与包内文件一一对应，不会被其它平台的同名文件覆盖。
+- 某一平台失败不会阻断其它平台（`fail-fast: false`）；Release 在所有平台跑完后一次性创建。
+- 版本号带 `-` 后缀（如 `0.2.0-beta.1`）会自动标为 **pre-release**。
+- 在 Actions 页面手动触发（`workflow_dispatch`）只构建、上传 workflow 产物，**不创建 Release**，用来试跑工作流。
+- GitHub 托管的 Intel Mac runner 已下线，macOS 只出 aarch64 包；需要 Intel 包时改用 `--target universal-apple` 之类的通用二进制构建（`package.sh` 目前不透传 `--target`，需手工执行 `npm run tauri build` 并补 `rustup target add x86_64-apple-darwin`）。
+- Release 说明里写明的签名状况：CI runner 上没有本机证书，macOS 产物是 ad-hoc 签名 / 未公证；Windows、Linux 未签名。想要稳定签名身份时在本地跑 `bash scripts/make-signers.sh` 后自行打包。
+
+**本地签名证书（macOS，可选）**：`scripts/make-signers.sh` 在本机生成一套自签证书，打包脚本会自动挑用：
+
+```bash
+bash scripts/make-signers.sh            # 生成根证书 + 「LogLens Development」/「LogLens Installer」签名证书，并导入登录钥匙串
+bash scripts/make-signers.sh --publish  # 额外导出接收方要装的根证书 scripts/certs/dist/LogLens-Setup-Root.crt
+```
+
+- 证书与私钥都落在 `scripts/certs/`（已 gitignore，绝不入库）；`--force` 全部重建、`--dest-dir <dir>` 改输出目录（CI 用）、`--skip-keychain` 只生成不导入。
+- 自签证书让 app 有稳定的签名身份：重装后 TCC 授权（本地网络、通知…）不必重新确认；接收方机器没装根证书时，首次打开仍可能提示一次「无法验证开发者」，右键 → 打开即可。
+
+**分发给他人（macOS 必读）**：产物没有 Apple Developer ID 签名与公证（默认本机自签，没有证书时回退 ad-hoc），打包脚本在收尾阶段专门兜住了这个坑：
+
+- **`.app` 做一次完整重签名**。tauri 默认只给可执行文件做 linker 阶段的 ad-hoc 签名（`codesign` 显示 `Info.plist=not bound`、`spctl` 报 `code has no resources but signature indicates they must be present`），这种签名在 Gatekeeper 眼里是坏的，会直接判「已损坏，无法打开，你应该将它移到废纸篓」，用户连「仍要打开」的入口都没有。重签后错误降级为可覆盖的「无法验证开发者」。
+- **`安装 LogLens.command` 与 `使用说明.txt` 放进 dmg 卷内**。只发 dmg 时接收方也能拿到安装脚本：双击即可清隔离、把 app 拷进「应用程序」并启动，同时导入卷内根证书（有的话）。
+
+接收方操作：
+
+1. **装**：双击 dmg，双击卷内的 `安装 LogLens.command`；也可以把 `LogLens.app` 拖进右侧「应用程序」，再从「应用程序」启动（首次需右键 → 打开）。
+2. **首次打开被拦下**：
+   - 提示「无法验证开发者」→ 右键 `LogLens.app` → 打开；或「系统设置 → 隐私与安全性」底部点「仍要打开」。
+   - 提示「已损坏」→ 多半是 IM 传输带上的隔离标记，文件本身没损坏；双击卷内的 `安装 LogLens.command` 即可。
+3. **手工替代**（对方愿意用终端时）：`xattr -cr /Applications/LogLens.app` 后重新打开。
+
+> 经微信、QQ、飞书等 IM 传输会给文件打上 `com.apple.quarantine` 隔离属性 —— **文件本身没有损坏**。发之前用 zip 分发包里的 `SHA256SUMS.txt` 核对，一致即说明镜像完好。
+
+> 该包为 **aarch64**，只能运行在 Apple 芯片（M 系列）Mac；Intel Mac 需另行构建 x64 包。彻底免除以上步骤需加入 Apple Developer 计划，对产物做 Developer ID 签名 + 公证（notarization）。
 
 **第一步：生成正式打包图标**（可选但推荐）：
 
