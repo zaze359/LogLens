@@ -907,6 +907,17 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .jv-view:hover { color: var(--text); background: var(--bg-2); }
 .jv-view.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .jv-note { font-size: 11px; }
+/* 大文本解析在 worker 中进行，主线程保持可交互；这里给出明确的进行中反馈。 */
+.jv-loading {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-size: 11px; color: var(--accent);
+}
+.jv-spinner {
+  width: 11px; height: 11px; border: 2px solid var(--border);
+  border-top-color: var(--accent); border-radius: 50%;
+  animation: jv-spin .7s linear infinite;
+}
+@keyframes jv-spin { to { transform: rotate(360deg); } }
 .jv-edit {
   display: block; width: 100%; min-height: 320px;
   margin: 0; padding: 10px 11px; font-size: 11.5px; line-height: 1.65;
@@ -1015,6 +1026,22 @@ mark { background: rgba(250, 204, 21, .3); color: #ffe9a3; border-radius: 2px; }
 .net-source { font-size: 10px; padding: 1px 5px; border-radius: 7px; background: var(--bg-3); color: var(--text-dim); }
 .net-source.cdp { color: var(--ok); background: rgba(52, 211, 153, .12); }
 .net-source.proxy { color: var(--accent); background: var(--accent-soft); }
+.net-source.mitm { color: var(--warning); background: rgba(251, 191, 36, .14); }
+
+/* 外部 MITM：环境自检 / CA / 信任条件 / 启停的单入口面板 */
+.net-mitm { margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-2); }
+.net-mitm-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.net-mitm-head b { font-size: 12px; color: var(--text); font-weight: 600; }
+.net-mitm-head .muted { font-size: 11px; }
+.net-mitm-status { display: grid; grid-template-columns: 64px 1fr; gap: 4px 10px; font-size: 11px; line-height: 1.5; margin-bottom: 10px; }
+.net-mitm-status > span:nth-child(odd) { color: var(--text-faint); }
+.net-mitm-status > span:nth-child(even) { overflow-wrap: anywhere; }
+.mitm-ok { color: var(--ok); }
+.mitm-warn { color: var(--warning); }
+.net-mitm-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.net-mitm-trust { margin: 6px 0; }
+.net-mitm-trust .empty-hint { margin: 2px 0; }
+
 
 /* ---------- client error log ---------- */
 .error-log-entry { position: relative; }
