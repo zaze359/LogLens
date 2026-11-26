@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "验收要求：vue-tsc + build 通过、无 scoped 样式、状态面板 v-show、文案中文可操作"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "核对新组件与既有面板生命周期、按钮层级和样式变量的一致性"}

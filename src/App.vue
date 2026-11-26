@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted } from 'vue'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import TopBar from './components/TopBar.vue'
 import SessionTabs from './components/SessionTabs.vue'
+import WelcomePanel from './components/WelcomePanel.vue'
 import LogPane from './components/LogPane.vue'
 import DevicePage from './components/device/DevicePage.vue'
 import DeviceToolRail from './components/device/DeviceToolRail.vue'
@@ -25,11 +26,22 @@ const currentOp = computed<string>(() =>
 )
 
 /**
- * 日志面板什么时候可见：本地文件工作区一直在看它；设备工作区里只有选中「日志」工具、
- * 且这台设备已经有日志时看它。隐藏时只是 `v-show`，实时流与滚动位置都留着。
+ * 没有任何工作区时给一个清爽的入口页，而不是直接摊开空日志面板。导入中要等标签真正建好
+ * 再让位，否则导入卡片延迟出现的那几百毫秒会露出空面板。
+ */
+const welcomeVisible = computed<boolean>(
+  () =>
+    !store.deviceView &&
+    store.tabs.length === 0 &&
+    store.deviceWorkspaces.length === 0
+)
+
+/**
+ * 日志面板什么时候可见：本地文件工作区一直在看它（除了入口页）；设备工作区里只有选中
+ * 「日志」工具、且这台设备已经有日志时看它。隐藏时只是 `v-show`，实时流与滚动位置都留着。
  */
 const logVisible = computed<boolean>(() => {
-  if (!store.deviceView) return true
+  if (!store.deviceView) return !welcomeVisible.value
   return currentOp.value === 'log' && !needCapture.value
 })
 
@@ -110,6 +122,9 @@ onBeforeUnmount(() => {
 
         <!-- 采集状态条：抓取是这台设备的事，状态和停止入口都留在「日志」工具里 -->
         <DeviceCaptureBar v-show="store.deviceView && logVisible" :serial="store.activeSerial" />
+
+        <!-- 冷启动 / 关掉所有工作区：先给入口页；日志面板继续挂载，只是隐藏 -->
+        <WelcomePanel v-if="welcomeVisible" />
 
         <!-- 日志面板只有一份实例，两种来源共用 -->
         <LogPane v-show="logVisible" />

@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/frontend/index.md", "reason": "Vue 3 SFC / 单一 reactive store / 全局样式等技术底座，决定新组件的写法边界"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "面板常驻挂载用 v-show、无 scoped style、按钮层级与 CSS 变量约定"}
+{"file": ".trellis/spec/frontend/directory-structure.md", "reason": "确认新组件应放在 src/components 下以及全局样式文件的位置"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "确认工作区显隐应由 store 的 tabs/deviceWorkspaces/deviceView 派生，而不是新增本地状态"}

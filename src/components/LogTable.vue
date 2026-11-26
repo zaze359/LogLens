@@ -1,10 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { currentHitIndex, loadMore, openProxyPanel, store } from '../stores/session'
+import { currentHitIndex, loadMore, store } from '../stores/session'
 import type { LogEntry } from '../types'
-
-/** 首页（尚未打开日志）也显示代理状态，状态来自 store，面板关着也照样更新。 */
-const proxyLive = computed(() => !!store.proxyServer?.running)
 
 const ROW_H = 26
 /** Cell padding plus a little breathing room, so the last glyph never touches the edge. */
@@ -222,19 +219,6 @@ function segments(entry: LogEntry): Segment[] {
       <template v-if="store.loading">正在解析并筛选日志…</template>
       <template v-else-if="!store.fileInfo">
         尚未打开日志文件。点击右上角「打开日志文件」，或直接把文件拖进窗口。
-        <!-- 首页也直接显示代理状态：不打开日志、不选设备也能看到它在跑、在哪个地址 -->
-        <div class="home-proxy" :class="{ live: proxyLive }">
-          <template v-if="proxyLive">
-            <span class="live-dot" />
-            <span>独立代理运行中 · <b class="mono">{{ store.proxyServer?.endpoint }}</b> ·
-              已接入 {{ store.proxyServer?.sources ?? 0 }} 个来源</span>
-            <button class="btn btn-ghost btn-sm" @click="openProxyPanel">查看请求</button>
-          </template>
-          <template v-else>
-            <span class="muted">独立代理未开启：任何把代理指向本机的设备都能被抓包</span>
-            <button class="btn btn-sm" @click="openProxyPanel">开启代理</button>
-          </template>
-        </div>
       </template>
       <template v-else-if="store.deviceStream">
         实时抓取中，正在等待设备产生日志。在手机上操作一下，新日志会自动出现在这里。

@@ -101,6 +101,12 @@ const restoreTarget = computed(() => boundSerial.value || props.serial)
   capture state alive when switching tools.
 - **Use `v-if` for transient layers**: `DevicePickerDialog`, `ImportOverlay`, the error
   banner and the toast.
+- **Empty-workspace welcome is presentation-only**: `WelcomePanel.vue` is rendered with
+  `v-if` when `!deviceView && tabs.length === 0 && deviceWorkspaces.length === 0`; the
+  `LogPane` beside it stays `v-show`-mounted. Do not swap in a second log table or unmount
+  the log pane to show the welcome screen — live polls and scroll state must survive.
+  Keep action buttons wired to existing store functions (`pickAndLoadFile`,
+  `openDevicePicker`, `openProxyPanel`) instead of adding new orchestration here.
 - Something that leaves state on the device (proxy, port forward) must register teardown:
   `DevicePage.vue` registers `shutdownOperations` through `registerDeviceCleanup`, and also
   calls it in `onBeforeUnmount`.
